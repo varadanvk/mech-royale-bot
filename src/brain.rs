@@ -2,7 +2,7 @@
 use crate::nav::Nav;
 use crate::proto::{Action, Actor, Hello, Obs, Weapon};
 use crate::world::World;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
 
@@ -256,21 +256,21 @@ pub struct Brain {
     fleeing: bool,
     cover: Option<([f32; 2], f32)>,
     scan_yaw: f32,
-    known: HashMap<u32, Known>,
+    known: BTreeMap<u32, Known>,
     /// Mechs that shot us recently: id -> time.
-    attackers: HashMap<u32, f32>,
+    attackers: BTreeMap<u32, f32>,
     /// Drones that shot us recently: id -> time.
-    drone_attackers: HashMap<u32, f32>,
+    drone_attackers: BTreeMap<u32, f32>,
     post: Option<([f32; 2], f32)>,
     wander: Option<[f32; 2]>,
-    dodged_charge: HashMap<u32, f32>,
+    dodged_charge: BTreeMap<u32, f32>,
     nav_goal: Option<[f32; 2]>,
     /// Mech we are concentrating fire on.
     focus: Option<u32>,
     /// Loot seen earlier and not known to be gone: id -> position (crates, cubes) or kind and position (weapons).
-    crates_mem: HashMap<u32, [f32; 3]>,
-    cubes_mem: HashMap<u32, [f32; 3]>,
-    picks_mem: HashMap<u32, (String, [f32; 3])>,
+    crates_mem: BTreeMap<u32, [f32; 3]>,
+    cubes_mem: BTreeMap<u32, [f32; 3]>,
+    picks_mem: BTreeMap<u32, (String, [f32; 3])>,
     healing: bool,
     /// Short name of the current behaviour, for debugging.
     pub label: &'static str,
@@ -313,17 +313,17 @@ impl Brain {
             fleeing: false,
             cover: None,
             scan_yaw: 0.0,
-            known: HashMap::new(),
-            attackers: HashMap::new(),
-            drone_attackers: HashMap::new(),
+            known: BTreeMap::new(),
+            attackers: BTreeMap::new(),
+            drone_attackers: BTreeMap::new(),
             post: None,
             wander: None,
-            dodged_charge: HashMap::new(),
+            dodged_charge: BTreeMap::new(),
             nav_goal: None,
             focus: None,
-            crates_mem: HashMap::new(),
-            cubes_mem: HashMap::new(),
-            picks_mem: HashMap::new(),
+            crates_mem: BTreeMap::new(),
+            cubes_mem: BTreeMap::new(),
+            picks_mem: BTreeMap::new(),
             healing: false,
             label: "",
         }
@@ -798,18 +798,28 @@ impl Brain {
         }
 
         // A laser charging and pointed at us: keep moving across its line until it fires.
+        // Several charging at once: track the nearest (ties broken by id).
         let mut laser_on: Option<[f32; 3]> = None;
         let mut flip_now = false;
+        let mut laser_d = f32::MAX;
+        let mut flips: Vec<u32> = Vec::new();
         for (id, k) in self.known.iter() {
             if let Some(since) = k.charge_since {
-                if o.t - k.seen_t < 0.25 && wrap(k.aim_yaw - yaw_to(&k.pos, &pos)).abs() < 0.2 && d2(&k.pos, &pos) < 300.0 {
-                    laser_on = Some(k.pos);
+                let d = d2(&k.pos, &pos);
+                if o.t - k.seen_t < 0.25 && wrap(k.aim_yaw - yaw_to(&k.pos, &pos)).abs() < 0.2 && d < 300.0 {
+                    if d < laser_d {
+                        laser_d = d;
+                        laser_on = Some(k.pos);
+                    }
                     if o.t - since >= p.dodge_after && !self.dodged_charge.contains_key(id) {
                         flip_now = true;
-                        self.dodged_charge.insert(*id, o.t);
+                        flips.push(*id);
                     }
                 }
             }
+        }
+        for id in flips {
+            self.dodged_charge.insert(id, o.t);
         }
         if laser_on.is_some() {
             // Do not let the random dwell reverse us mid-charge.
