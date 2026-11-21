@@ -101,6 +101,10 @@ pub struct Params {
     pub expose_weight: f32,
     /// Walk over to cubes within this distance even in a fight (0 = off).
     pub cube_grab: f32,
+    /// Step out of sight while the gun reloads, up to this far (0 = off).
+    pub reload_hide: f32,
+    /// Step out of sight of a laser charging at us, up to this far (0 = off).
+    pub laser_hide: f32,
 }
 
 impl Default for Params {
@@ -134,12 +138,14 @@ impl Default for Params {
             memory_s: 12.0,
             retreat_boost_energy: 15.0,
             focus_stick: 50.0,
-            farm_until: 90.0,
+            farm_until: 0.0,
             farm_reach: 160.0,
             heal_lo: 0.8,
             heal_hi: 0.97,
             expose_weight: 1.0,
             cube_grab: 45.0,
+            reload_hide: 16.0,
+            laser_hide: 8.0,
         }
     }
 }
@@ -183,6 +189,8 @@ impl Params {
         p.heal_hi = g("heal_hi", p.heal_hi);
         p.expose_weight = g("expose_weight", p.expose_weight);
         p.cube_grab = g("cube_grab", p.cube_grab);
+        p.reload_hide = g("reload_hide", p.reload_hide);
+        p.laser_hide = g("laser_hide", p.laser_hide);
         p
     }
 
@@ -899,7 +907,23 @@ impl Brain {
             let radial = if off.abs() < p.gun_band && pref > 50.0 { 0.0 } else { (off / 15.0).clamp(-1.0, 1.0) };
             let radial = if laser_on.is_some() { radial * 0.2 } else { radial };
             mv = self.strafe_dir(o, &pos, to, radial, false);
-            if let Some(c) = near_cube.filter(|_| !finishing || dist < 20.0) {
+            let reloading = me.weapons.iter().flatten().any(|w| w.kind == "gun" && (w.reload > 0.4 || w.ammo <= 0.0));
+            let eyes: Vec<[f32; 3]> = self
+                .known
+                .values()
+                .filter(|k| o.t - k.seen_t < 4.0 && d2(&k.pos, &pos) < 200.0)
+                .map(|k| [k.pos[0], k.pos[1], k.pos[2] + 8.0])
+                .collect();
+            let hide = if p.reload_hide > 0.0 && reloading && !(has_arc && dist < 45.0) && !finishing {
+                self.hide_step(&pos, &eyes, p.reload_hide)
+            } else {
+                None
+            };
+            if let Some(h) = hide {
+                label = "reload";
+                mv = h;
+                boost = me.energy > 25.0;
+            } else if let Some(c) = near_cube.filter(|_| !finishing || dist < 20.0) {
                 label = "fcube";
                 let g = self.go(&pos, [c[0], c[1]]);
                 mv = norm2(g[0] + mv[0] * 0.35, g[1] + mv[1] * 0.35);
@@ -925,8 +949,17 @@ impl Brain {
             mv = self.quiet(o, &mut a, &pos, hp_frac, must_rotate, out_next, zone_goal, &threats, &mut label);
         }
 
+        // A laser about to fire at us: duck out of its line if a step away does it.
+        let mut ducked = false;
+        if let (Some(src), true) = (laser_on, p.laser_hide > 0.0 && label != "zone") {
+            if let Some(h) = self.hide_step(&pos, &[[src[0], src[1], src[2] + 7.0]], p.laser_hide) {
+                mv = h;
+                boost = me.energy > 5.0;
+                ducked = true;
+            }
+        }
         // Outside a fight, still weave across the line of the nearest shooter.
-        if let (Some(src), false) = (shooter, label == "zone" || label == "fight" || label == "drone") {
+        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "fight" || label == "drone" || label == "reload") {
             if o.t >= self.strafe_until {
                 self.strafe = if self.rnd() < 0.5 { 1.0 } else { -1.0 };
                 self.strafe_until = o.t + p.strafe_min + self.rnd() * (p.strafe_max - p.strafe_min).max(0.0);
@@ -1008,6 +1041,42 @@ impl Brain {
             }
         }
         best.0
+    }
+
+    /// Direction to the nearest spot within `r` (straight walk) that none of `eyes` can see.
+    fn hide_step(&self, pos: &[f32; 3], eyes: &[[f32; 3]], r: f32) -> Option<[f32; 2]> {
+        if eyes.is_empty() {
+            return None;
+        }
+        let hidden = |c: [f32; 2], z: f32| eyes.iter().all(|e| !self.clear(*e, [c[0], c[1], z + 4.5]) && !self.clear(*e, [c[0], c[1], z + 8.5]));
+        if hidden([pos[0], pos[1]], pos[2]) {
+            return Some([0.0, 0.0]);
+        }
+        let mut ring = 3.5f32;
+        while ring <= r + 0.01 {
+            let mut best: Option<([f32; 2], f32)> = None;
+            for k in 0..12 {
+                let a = k as f32 * TAU / 12.0 + ring * 0.1;
+                let c = [pos[0] + a.cos() * ring, pos[1] + a.sin() * ring];
+                if !self.straight(pos, &c) {
+                    continue;
+                }
+                let z = self.ground(c[0], c[1], pos[2]);
+                if (z - pos[2]).abs() > 1.5 || !hidden(c, z) {
+                    continue;
+                }
+                // Prefer spots further from the nearest eye.
+                let near = eyes.iter().map(|e| d2(e, &c)).fold(f32::MAX, f32::min);
+                if best.map_or(true, |b| near > b.1) {
+                    best = Some((c, near));
+                }
+            }
+            if let Some((c, _)) = best {
+                return Some(norm2(c[0] - pos[0], c[1] - pos[1]));
+            }
+            ring *= 1.6;
+        }
+        None
     }
 
     fn scan(&mut self, a: &mut Action) {
