@@ -241,6 +241,10 @@ pub struct Params {
     pub stand_finish: f32,
     /// Only back off from enemies seen within this many seconds.
     pub stand_mem: f32,
+    /// While backing off, start laser charges (half speed) only when the nearest enemy is at least this far (0 = always).
+    pub stand_charge: f32,
+    /// Backing off comes before fetching weapons and collecting cubes (0 = after).
+    pub stand_first: f32,
 }
 
 impl Default for Params {
@@ -347,6 +351,8 @@ impl Default for Params {
             stand_boost: 30.0,
             stand_finish: 0.25,
             stand_mem: 1.0,
+            stand_charge: 0.0,
+            stand_first: 0.0,
         }
     }
 }
@@ -457,6 +463,8 @@ impl Params {
         p.stand_boost = g("stand_boost", p.stand_boost);
         p.stand_finish = g("stand_finish", p.stand_finish);
         p.stand_mem = g("stand_mem", p.stand_mem);
+        p.stand_charge = g("stand_charge", p.stand_charge);
+        p.stand_first = g("stand_first", p.stand_first);
         p
     }
 
@@ -1794,7 +1802,7 @@ impl Brain {
             label = "zone";
             mv = self.go(&pos, zone_goal);
             boost = !me.in_zone && me.energy > 5.0;
-        } else if let Some(g) = arm_goal {
+        } else if let Some(g) = arm_goal.filter(|_| !(p.stand_first > 0.0 && stand_from.is_some())) {
             label = "arm";
             mv = self.go(&pos, [g[0], g[1]]);
             boost = me.energy > 30.0 && d2(&g, &pos) > 12.0;
@@ -1812,7 +1820,7 @@ impl Brain {
                     boost = pos[2] < g[2] + 2.0;
                 }
             }
-        } else if let Some(c) = collect_goal {
+        } else if let Some(c) = collect_goal.filter(|_| !(p.stand_first > 0.0 && stand_from.is_some())) {
             label = "collect";
             mv = self.go(&pos, [c[0], c[1]]);
             boost = me.energy > 30.0 && d2(&c, &pos) > 10.0;
@@ -1843,6 +1851,13 @@ impl Brain {
             let w = if laser_on.is_some() { 1.5 } else { p.stand_weave };
             let cand = norm2(dir[0] + perp[0] * w, dir[1] + perp[1] * w);
             mv = if self.walkable(pos[0] + cand[0] * 5.0, pos[1] + cand[1] * 5.0) { cand } else { dir };
+            if d2(&near, &pos) < p.stand_charge {
+                for (i, w) in me.weapons.iter().enumerate().take(2) {
+                    if w.as_ref().map_or(false, |w| w.kind == "laser" && w.charge <= 0.0) {
+                        a.fire[i] = false;
+                    }
+                }
+            }
             let charging = me.weapons.iter().flatten().any(|w| w.kind == "laser" && w.charge > 0.0);
             boost = me.energy > p.stand_boost && !charging;
         } else if (self.fleeing || (crowded && p.break_crowd > 0.0)) && threat_live && p.retreat_mode > 0.0 {
