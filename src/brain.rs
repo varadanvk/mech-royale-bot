@@ -261,6 +261,8 @@ pub struct Params {
     pub aim_high: f32,
     /// Start a laser charge on any enemy in sight even without a clear line yet (0 = off).
     pub charge_seen: f32,
+    /// Boost while moving in a fight whenever energy is above this (0 = off).
+    pub fight_boost: f32,
 }
 
 impl Default for Params {
@@ -377,6 +379,7 @@ impl Default for Params {
             peek_crowd: 2.0,
             aim_high: 1.0,
             charge_seen: 1.0,
+            fight_boost: 0.0,
         }
     }
 }
@@ -497,6 +500,7 @@ impl Params {
         p.peek_crowd = g("peek_crowd", p.peek_crowd);
         p.aim_high = g("aim_high", p.aim_high);
         p.charge_seen = g("charge_seen", p.charge_seen);
+        p.fight_boost = g("fight_boost", p.fight_boost);
         p
     }
 
@@ -718,7 +722,7 @@ impl Brain {
             world,
             nav,
             params,
-            rng: hello.seed | 1,
+            rng: (hello.seed ^ 0x9e3779b97f4a7c19) | 1,
             pickup_radius: f("loot", "pickup_radius", 4.0),
             tick_s: 1.0 / f("match", "tick_hz", 20.0).max(1.0),
             strafe: 1.0,
@@ -2119,6 +2123,9 @@ impl Brain {
             }
             mv = [mv[0] * p.fight_speed, mv[1] * p.fight_speed];
             boost = boost || (laser_on.is_some() && me.energy > 10.0);
+            if p.fight_boost > 0.0 && me.energy > p.fight_boost {
+                boost = true;
+            }
         } else if let Some(d) = drone_target {
             label = "drone";
             let dist = d2(&d.pos, &pos);
