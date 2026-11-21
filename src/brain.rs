@@ -87,6 +87,20 @@ pub struct Params {
     pub memory_s: f32,
     /// Boost while retreating if energy is above this.
     pub retreat_boost_energy: f32,
+    /// Keep shooting the current target unless another scores better by this margin (0 = no stickiness).
+    pub focus_stick: f32,
+    /// Before this match time, farm crates, drones and loot from further away.
+    pub farm_until: f32,
+    /// Reach for crates, cubes and drones while farming early.
+    pub farm_reach: f32,
+    /// With no enemy in sight, hide and heal below this HP fraction (0 = off).
+    pub heal_lo: f32,
+    /// Stay hidden until HP is back above this fraction.
+    pub heal_hi: f32,
+    /// Weight against fight positions that other enemies can see (0 = off).
+    pub expose_weight: f32,
+    /// Walk over to cubes within this distance even in a fight (0 = off).
+    pub cube_grab: f32,
 }
 
 impl Default for Params {
@@ -94,8 +108,8 @@ impl Default for Params {
         Params {
             retreat_hp: 0.55,
             reengage_hp: 0.92,
-            gun_range: 110.0,
-            gun_band: 20.0,
+            gun_range: 55.0,
+            gun_band: 15.0,
             arc_range: 30.0,
             arc_min_hp: 0.6,
             crowd_radius: 150.0,
@@ -119,6 +133,13 @@ impl Default for Params {
             wander_radius: 14.0,
             memory_s: 12.0,
             retreat_boost_energy: 15.0,
+            focus_stick: 50.0,
+            farm_until: 90.0,
+            farm_reach: 160.0,
+            heal_lo: 0.8,
+            heal_hi: 0.97,
+            expose_weight: 1.0,
+            cube_grab: 45.0,
         }
     }
 }
@@ -155,6 +176,13 @@ impl Params {
         p.wander_radius = g("wander_radius", p.wander_radius);
         p.memory_s = g("memory_s", p.memory_s);
         p.retreat_boost_energy = g("retreat_boost_energy", p.retreat_boost_energy);
+        p.focus_stick = g("focus_stick", p.focus_stick);
+        p.farm_until = g("farm_until", p.farm_until);
+        p.farm_reach = g("farm_reach", p.farm_reach);
+        p.heal_lo = g("heal_lo", p.heal_lo);
+        p.heal_hi = g("heal_hi", p.heal_hi);
+        p.expose_weight = g("expose_weight", p.expose_weight);
+        p.cube_grab = g("cube_grab", p.cube_grab);
         p
     }
 
@@ -229,6 +257,13 @@ pub struct Brain {
     wander: Option<[f32; 2]>,
     dodged_charge: HashMap<u32, f32>,
     nav_goal: Option<[f32; 2]>,
+    /// Mech we are concentrating fire on.
+    focus: Option<u32>,
+    /// Loot seen earlier and not known to be gone: id -> position (crates, cubes) or kind and position (weapons).
+    crates_mem: HashMap<u32, [f32; 3]>,
+    cubes_mem: HashMap<u32, [f32; 3]>,
+    picks_mem: HashMap<u32, (String, [f32; 3])>,
+    healing: bool,
     /// Short name of the current behaviour, for debugging.
     pub label: &'static str,
 }
@@ -277,6 +312,11 @@ impl Brain {
             wander: None,
             dodged_charge: HashMap::new(),
             nav_goal: None,
+            focus: None,
+            crates_mem: HashMap::new(),
+            cubes_mem: HashMap::new(),
+            picks_mem: HashMap::new(),
+            healing: false,
             label: "",
         }
     }
@@ -535,6 +575,28 @@ impl Brain {
         self.drone_attackers.retain(|_, t| o.t - *t < 6.0);
         self.dodged_charge.retain(|_, t| o.t - *t < 3.0);
 
+        // --- loot memory: remember what we saw, forget what should be in view but is not
+        for c in &o.crates {
+            self.crates_mem.insert(c.id, c.pos);
+        }
+        for c in &o.cubes {
+            self.cubes_mem.insert(c.id, c.pos);
+        }
+        for pk in &o.pickups {
+            self.picks_mem.insert(pk.id, (pk.kind.clone(), pk.pos));
+        }
+        {
+            let eye = [pos[0], pos[1], pos[2] + me.stat("eye_height", 8.0)];
+            let w = self.world.clone();
+            let gone = |q: &[f32; 3], listed: bool| -> bool {
+                let d = d2(q, &pos);
+                d > 400.0 || (!listed && d < 40.0 && w.as_ref().map_or(true, |w| w.clear(eye, [q[0], q[1], q[2] + 1.0])))
+            };
+            self.crates_mem.retain(|id, q| !gone(q, o.crates.iter().any(|c| c.id == *id)));
+            self.cubes_mem.retain(|id, q| !gone(q, o.cubes.iter().any(|c| c.id == *id)));
+            self.picks_mem.retain(|id, q| !gone(&q.1, o.pickups.iter().any(|c| c.id == *id)));
+        }
+
         // --- what hurt us
         for e in &o.events {
             if e.kind == "damaged" {
@@ -564,16 +626,22 @@ impl Brain {
         // --- enemies and target
         let enemies: Vec<&Actor> = o.mechs.iter().filter(|m| m.kind == "mech" && !(m.max_hp > 0.0 && m.hp <= 0.0)).collect();
         let near_enemies = enemies.iter().filter(|m| d2(&m.pos, &pos) < p.crowd_radius).count();
-        let target = enemies
+        let score = |m: &Actor| {
+            let d = d2(&m.pos, &pos);
+            let hpf = if m.max_hp > 0.0 { m.hp / m.max_hp } else { 1.0 };
+            let attacker = self.attackers.get(&m.id).map_or(false, |t| o.t - t < 4.0);
+            d + hpf * p.focus_hp - if attacker { 40.0 } else { 0.0 }
+        };
+        let best = enemies
             .iter()
-            .map(|m| {
-                let d = d2(&m.pos, &pos);
-                let hpf = if m.max_hp > 0.0 { m.hp / m.max_hp } else { 1.0 };
-                let attacker = self.attackers.get(&m.id).map_or(false, |t| o.t - t < 4.0);
-                (m, d + hpf * p.focus_hp - if attacker { 40.0 } else { 0.0 })
-            })
-            .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(m, _)| *m);
+            .map(|m| (*m, score(*m)))
+            .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
+        let target = match (best, self.focus.and_then(|f| enemies.iter().find(|m| m.id == f))) {
+            (Some((_, bs)), Some(f)) if p.focus_stick > 0.0 && score(*f) - p.focus_stick < bs && d2(&f.pos, &pos) < p.open_fire_range => Some(*f),
+            (Some((b, _)), _) => Some(b),
+            _ => None,
+        };
+        self.focus = target.map(|t| t.id);
         if let Some(t) = target {
             self.threat = Some((t.pos, o.t));
         }
@@ -590,10 +658,12 @@ impl Brain {
             .filter(|d| self.drone_attackers.contains_key(&d.id))
             .min_by(|x, y| d2(&x.pos, &pos).partial_cmp(&d2(&y.pos, &pos)).unwrap_or(std::cmp::Ordering::Equal))
             .copied();
-        let farm_drone = if calm && hp_frac > p.farm_hp {
+        let early = o.t < p.farm_until;
+        let drone_reach = if early { p.drone_range.max(p.farm_reach.min(120.0)) } else { p.drone_range };
+        let farm_drone = if calm && hp_frac > p.farm_hp && !self.healing {
             drones
                 .iter()
-                .filter(|d| d2(&d.pos, &pos) < p.drone_range)
+                .filter(|d| d2(&d.pos, &pos) < drone_reach)
                 .min_by(|x, y| d2(&x.pos, &pos).partial_cmp(&d2(&y.pos, &pos)).unwrap_or(std::cmp::Ordering::Equal))
                 .copied()
         } else {
@@ -712,6 +782,12 @@ impl Brain {
             self.fleeing = false;
         }
         let crowded = near_enemies >= p.crowd_count && !finishing;
+        if p.heal_lo > 0.0 && enemies.is_empty() && hp_frac < p.heal_lo && o.t - self.last_mech_hurt_t > 1.0 {
+            self.healing = true;
+        }
+        if hp_frac >= p.heal_hi || p.heal_lo <= 0.0 {
+            self.healing = false;
+        }
 
         // A laser charging and pointed at us: keep moving across its line until it fires.
         let mut laser_on: Option<[f32; 3]> = None;
@@ -737,6 +813,16 @@ impl Brain {
         // The nearest enemy we can see, to move across its line of fire.
         let shooter = laser_on.or_else(|| enemies.iter().filter(|m| d2(&m.pos, &pos) < 200.0).min_by(|x, y| d2(&x.pos, &pos).partial_cmp(&d2(&y.pos, &pos)).unwrap_or(std::cmp::Ordering::Equal)).map(|m| m.pos));
 
+        // Nearest cube on the ground close by: worth stepping over to even mid-fight.
+        let near_cube = if p.cube_grab > 0.0 {
+            self.cubes_mem
+                .values()
+                .filter(|q| d2(*q, &pos) < p.cube_grab && (q[2] - self.ground(q[0], q[1], q[2])).abs() < 3.0 && (q[2] - pos[2]).abs() < 6.0)
+                .min_by(|x, y| d2(*x, &pos).partial_cmp(&d2(*y, &pos)).unwrap_or(std::cmp::Ordering::Equal))
+                .copied()
+        } else {
+            None
+        };
         let mut boost = false;
         let mut mv: [f32; 2];
         let mut label = "idle";
@@ -768,6 +854,25 @@ impl Brain {
                 let th = threats[0];
                 a.aim = [yaw_to(&pos, &th), 0.0];
             }
+        } else if self.healing && enemies.is_empty() && hostile_drone.is_none() && !must_rotate && near_cube.is_none() {
+            // Out of sight and hurt: get out of the lines of anyone we know of, then hold still and heal.
+            label = "mend";
+            if !threats.is_empty() {
+                if self.cover.map_or(true, |(_, until)| o.t > until) {
+                    let c = self.find_cover(o, &threats);
+                    self.cover = Some((c, o.t + 1.5));
+                }
+                let c = self.cover.unwrap().0;
+                mv = self.go(&pos, c);
+                if d2(&pos, &c) < 3.0 {
+                    mv = [0.0, 0.0];
+                }
+                a.aim = [yaw_to(&pos, &threats[0]), 0.0];
+            } else {
+                mv = self.idle_move(o, &pos);
+                mv = [mv[0] * 0.6, mv[1] * 0.6];
+                self.scan(&mut a);
+            }
         } else if self.fleeing {
             // Healing with no known threat: stay near shelter.
             label = "rest";
@@ -794,8 +899,16 @@ impl Brain {
             let radial = if off.abs() < p.gun_band && pref > 50.0 { 0.0 } else { (off / 15.0).clamp(-1.0, 1.0) };
             let radial = if laser_on.is_some() { radial * 0.2 } else { radial };
             mv = self.strafe_dir(o, &pos, to, radial, false);
+            if let Some(c) = near_cube.filter(|_| !finishing || dist < 20.0) {
+                label = "fcube";
+                let g = self.go(&pos, [c[0], c[1]]);
+                mv = norm2(g[0] + mv[0] * 0.35, g[1] + mv[1] * 0.35);
+                boost = me.energy > 30.0;
+            } else if p.expose_weight > 0.0 {
+                mv = self.less_exposed(o, &pos, t, mv, p.expose_weight);
+            }
             mv = [mv[0] * p.fight_speed, mv[1] * p.fight_speed];
-            boost = laser_on.is_some() && me.energy > 10.0;
+            boost = boost || (laser_on.is_some() && me.energy > 10.0);
         } else if let Some(d) = drone_target {
             label = "drone";
             let dist = d2(&d.pos, &pos);
@@ -850,6 +963,9 @@ impl Brain {
             boost = true;
         }
         self.label = label;
+        if std::env::var("TTRACE").is_ok() && o.tick % 20 == 0 {
+            eprintln!("TR {:.0} {} hp {:.0} cubes {} seen_cubes {} mem_cubes {} enemies {} heal {} flee {}", o.t, label, me.hp, me.cubes, o.cubes.len(), self.cubes_mem.len(), enemies.len(), self.healing, self.fleeing);
+        }
         self.last_pos = pos;
         a.mv = if mv.iter().all(|v| v.is_finite()) { mv } else { [0.0, 0.0] };
         a.boost = boost;
@@ -857,6 +973,41 @@ impl Brain {
             a.aim = me.aim;
         }
         a
+    }
+
+    /// Prefer a nearby step from which the target is still in sight but fewer other enemies can see us.
+    fn less_exposed(&self, o: &Obs, pos: &[f32; 3], t: &Actor, mv: [f32; 2], w: f32) -> [f32; 2] {
+        let others: Vec<[f32; 3]> = self
+            .known
+            .iter()
+            .filter(|(id, k)| **id != t.id && o.t - k.seen_t < 6.0 && d2(&k.pos, pos) < 220.0)
+            .map(|(_, k)| [k.pos[0], k.pos[1], k.pos[2] + 8.0])
+            .collect();
+        if others.is_empty() {
+            return mv;
+        }
+        let tc = [t.pos[0], t.pos[1], t.pos[2] + 4.5];
+        let eval = |d: [f32; 2]| -> Option<f32> {
+            let c = [pos[0] + d[0] * 6.0, pos[1] + d[1] * 6.0];
+            if !self.walkable(c[0], c[1]) {
+                return None;
+            }
+            let z = self.ground(c[0], c[1], pos[2]);
+            let seen = others.iter().filter(|e| self.clear(**e, [c[0], c[1], z + 5.0])).count() as f32;
+            let tv = self.clear([c[0], c[1], z + 7.0], tc);
+            Some(-seen * 2.0 * w + if tv { 1.0 } else { 0.0 } + (d[0] * mv[0] + d[1] * mv[1]) * 0.8)
+        };
+        let mut best = (mv, eval(mv).unwrap_or(f32::MIN));
+        for k in 0..8 {
+            let a = k as f32 * TAU / 8.0;
+            let d = [a.cos(), a.sin()];
+            if let Some(s) = eval(d) {
+                if s > best.1 + 0.3 {
+                    best = (d, s);
+                }
+            }
+        }
+        best.0
     }
 
     fn scan(&mut self, a: &mut Action) {
@@ -962,14 +1113,19 @@ impl Brain {
         let held: Vec<&str> = me.weapons.iter().flatten().map(|w| w.kind.as_str()).collect();
         let empty_slot = me.weapons.len() < 2 || me.weapons.iter().take(2).any(|w| w.is_none());
         let worst = me.weapons.iter().take(2).flatten().map(|w| weapon_rank(&w.kind)).filter(|r| *r > 0).min().unwrap_or(0);
-        for pk in &o.pickups {
-            let r = weapon_rank(&pk.kind);
-            if r > 0 && !held.contains(&pk.kind.as_str()) && (empty_slot || r > worst) {
-                consider(&mut goal, &pk.pos, 60.0 + 30.0 * r as f32, 140.0, on_ground(self, &pk.pos));
+        let early = o.t < p.farm_until;
+        let reach = if early { p.farm_reach.max(100.0) } else { 100.0 };
+        let picks: Vec<(String, [f32; 3])> = self.picks_mem.values().cloned().collect();
+        for (kind, q) in &picks {
+            let r = weapon_rank(kind);
+            if r > 0 && !held.contains(&kind.as_str()) && (empty_slot || r > worst) {
+                let v = if empty_slot && early { 120.0 + 30.0 * r as f32 } else { 60.0 + 30.0 * r as f32 };
+                consider(&mut goal, q, v, reach.max(140.0), on_ground(self, q));
             }
         }
-        for c in &o.cubes {
-            consider(&mut goal, &c.pos, 100.0, 100.0, on_ground(self, &c.pos));
+        let cubes: Vec<[f32; 3]> = self.cubes_mem.values().copied().collect();
+        for q in &cubes {
+            consider(&mut goal, q, 100.0, reach, on_ground(self, q));
         }
         // Supply drop: full heal and cubes, if nobody we know of is near it.
         for dr in &o.drops {
@@ -983,15 +1139,18 @@ impl Brain {
                 }
             }
         }
-        let crate_target = o
-            .crates
+        let crates: Vec<[f32; 3]> = self.crates_mem.values().copied().filter(|q| on_ground(self, q) && in_zone(q)).collect();
+        let crate_target = crates
             .iter()
-            .filter(|c| d3(&c.pos, pos) < 100.0 && hp_frac > p.farm_hp)
-            .min_by(|x, y| d3(&x.pos, pos).partial_cmp(&d3(&y.pos, pos)).unwrap_or(std::cmp::Ordering::Equal));
+            .filter(|c| d3(c, pos) < reach && hp_frac > p.farm_hp && !self.healing)
+            .min_by(|x, y| d3(x, pos).partial_cmp(&d3(y, pos)).unwrap_or(std::cmp::Ordering::Equal));
         let mut aimed = false;
         if let Some(c) = crate_target {
             let muzzle = [pos[0], pos[1], pos[2] + me.stat("muzzle_height", 7.0)];
-            let cc = [c.pos[0], c.pos[1], c.pos[2] + 1.2];
+            let cc = [c[0], c[1], c[2] + 1.2];
+            if !self.clear(muzzle, cc) || d2(c, pos) > 90.0 {
+                consider(&mut goal, c, 70.0, reach, true);
+            }
             if self.clear(muzzle, cc) {
                 let want = [yaw_to(&muzzle, &cc), (cc[2] - muzzle[2]).atan2(d2(&cc, &muzzle).max(0.1))];
                 a.aim = want;
@@ -1004,8 +1163,8 @@ impl Brain {
                         a.reload = false;
                     }
                 }
-                if d2(&c.pos, pos) > 35.0 {
-                    consider(&mut goal, &c.pos, 70.0, 100.0, on_ground(self, &c.pos));
+                if d2(c, pos) > 35.0 {
+                    consider(&mut goal, c, 70.0, reach, true);
                 }
             }
         }
