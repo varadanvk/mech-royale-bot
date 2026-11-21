@@ -2,7 +2,7 @@
 use crate::nav::Nav;
 use crate::proto::{Action, Actor, Hello, Obs, Weapon};
 use crate::world::World;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
 
@@ -105,6 +105,10 @@ pub struct Params {
     pub reload_hide: f32,
     /// Step out of sight of a laser charging at us, up to this far (0 = off).
     pub laser_hide: f32,
+    /// Seconds between sending an action and it taking effect, assumed when planning (0 = immediate).
+    pub delay_s: f32,
+    /// Estimate the delay from our own motion and use the estimate once it is clear (0 = off).
+    pub delay_auto: f32,
 }
 
 impl Default for Params {
@@ -146,6 +150,8 @@ impl Default for Params {
             cube_grab: 45.0,
             reload_hide: 16.0,
             laser_hide: 8.0,
+            delay_s: 0.0,
+            delay_auto: 1.0,
         }
     }
 }
@@ -191,6 +197,8 @@ impl Params {
         p.cube_grab = g("cube_grab", p.cube_grab);
         p.reload_hide = g("reload_hide", p.reload_hide);
         p.laser_hide = g("laser_hide", p.laser_hide);
+        p.delay_s = g("delay_s", p.delay_s);
+        p.delay_auto = g("delay_auto", p.delay_auto);
         p
     }
 
@@ -238,6 +246,79 @@ struct Known {
     aim_yaw: f32,
 }
 
+/// An action as sent, as far as motion and aim are concerned.
+#[derive(Clone, Copy)]
+struct Sent {
+    mv: [f32; 2],
+    boost: bool,
+    aim: [f32; 2],
+    fire: [bool; 2],
+}
+
+/// Our own motion state at some decision.
+#[derive(Clone, Copy)]
+struct Motion {
+    pos: [f32; 3],
+    vel: [f32; 3],
+    aim: [f32; 2],
+    grounded: bool,
+    energy: f32,
+    charging: bool,
+    tick: u64,
+}
+
+/// Motion model constants.
+#[derive(Clone, Copy)]
+struct Kin {
+    walk: f32,
+    boost: f32,
+    ground_accel: f32,
+    air_accel: f32,
+    turn: f32,
+    pitch: f32,
+    min_pitch: f32,
+    max_pitch: f32,
+    charge_mult: f32,
+}
+
+impl Kin {
+    /// Advance `m` by one decision (two ticks) under action `s`.
+    fn step(&self, m: &mut Motion, s: &Sent) {
+        let dt = 0.05;
+        for _ in 0..2 {
+            let dy = wrap(s.aim[0] - m.aim[0]);
+            m.aim[0] = wrap(m.aim[0] + dy.clamp(-self.turn * dt, self.turn * dt));
+            let pt = s.aim[1].clamp(self.min_pitch, self.max_pitch);
+            m.aim[1] += (pt - m.aim[1]).clamp(-self.pitch * dt, self.pitch * dt);
+            let mut mv = s.mv;
+            let l = (mv[0] * mv[0] + mv[1] * mv[1]).sqrt();
+            if l > 1.0 {
+                mv = [mv[0] / l, mv[1] / l];
+            }
+            let mut speed = self.walk;
+            if s.boost && m.energy > 0.0 && (!m.grounded || l > 0.05) {
+                speed = self.boost;
+            }
+            if m.charging {
+                speed *= self.charge_mult;
+            }
+            let tv = [mv[0] * speed, mv[1] * speed];
+            let acc = if m.grounded { self.ground_accel } else { self.air_accel } * dt;
+            let dv = [tv[0] - m.vel[0], tv[1] - m.vel[1]];
+            let dl = (dv[0] * dv[0] + dv[1] * dv[1]).sqrt();
+            if dl <= acc {
+                m.vel[0] = tv[0];
+                m.vel[1] = tv[1];
+            } else {
+                m.vel[0] += dv[0] / dl * acc;
+                m.vel[1] += dv[1] / dl * acc;
+            }
+            m.pos[0] += m.vel[0] * dt;
+            m.pos[1] += m.vel[1] * dt;
+        }
+    }
+}
+
 pub struct Brain {
     pub world: Option<Arc<World>>,
     pub nav: Option<Nav>,
@@ -272,6 +353,16 @@ pub struct Brain {
     cubes_mem: BTreeMap<u32, [f32; 3]>,
     picks_mem: BTreeMap<u32, (String, [f32; 3])>,
     healing: bool,
+    kin: Kin,
+    /// Recent actions sent, oldest first.
+    sent: VecDeque<Sent>,
+    /// Our motion at the previous decision.
+    prev_motion: Option<Motion>,
+    /// Accumulated prediction error for each candidate delay (in decisions), and how informative the samples were.
+    delay_err: [f32; 4],
+    delay_info: f32,
+    /// Delay in seconds currently assumed.
+    pub delay_used: f32,
     /// Short name of the current behaviour, for debugging.
     pub label: &'static str,
 }
@@ -325,6 +416,22 @@ impl Brain {
             cubes_mem: BTreeMap::new(),
             picks_mem: BTreeMap::new(),
             healing: false,
+            kin: Kin {
+                walk: f("mech", "walk_speed", 11.7),
+                boost: f("mech", "boost_speed", 19.5),
+                ground_accel: f("mech", "ground_accel", 58.5),
+                air_accel: f("mech", "air_accel", 12.0),
+                turn: f("mech", "turn_rate", 4.0),
+                pitch: f("mech", "pitch_rate", 3.0),
+                min_pitch: f("mech", "min_pitch", -0.6),
+                max_pitch: f("mech", "max_pitch", 1.3),
+                charge_mult: f("laser", "move_mult", 0.5),
+            },
+            sent: VecDeque::new(),
+            prev_motion: None,
+            delay_err: [0.0; 4],
+            delay_info: 0.0,
+            delay_used: 0.0,
             label: "",
         }
     }
@@ -556,6 +663,127 @@ impl Brain {
     }
 
     pub fn act(&mut self, o: &Obs) -> Action {
+        let raw = o.me.pos;
+        let mut kin = self.kin;
+        kin.walk = o.me.stat("walk_speed", kin.walk);
+        kin.boost = o.me.stat("boost_speed", kin.boost);
+        kin.turn = o.me.stat("turn_rate", kin.turn);
+        kin.pitch = o.me.stat("pitch_rate", kin.pitch);
+        kin.min_pitch = o.me.stat("min_pitch", kin.min_pitch);
+        kin.max_pitch = o.me.stat("max_pitch", kin.max_pitch);
+        kin.charge_mult = o.me.stat("charge_move_mult", kin.charge_mult);
+        self.kin = kin;
+        let now = Motion {
+            pos: o.me.pos,
+            vel: o.me.vel,
+            aim: o.me.aim,
+            grounded: o.me.grounded,
+            energy: o.me.energy,
+            charging: o.me.weapons.iter().flatten().any(|w| w.kind == "laser" && w.charge > 0.0),
+            tick: o.tick,
+        };
+        self.estimate_delay(&now);
+        self.prev_motion = Some(now);
+        let delay = self.assumed_delay();
+        self.delay_used = delay;
+        let n = ((delay / 0.1).round() as usize).min(self.sent.len());
+        let a = if n == 0 {
+            self.decide(o, raw)
+        } else {
+            let q = self.predicted(o, now, n, n as f32 * 0.1);
+            self.decide(&q, raw)
+        };
+        self.sent.push_back(Sent { mv: a.mv, boost: a.boost, aim: a.aim, fire: a.fire });
+        while self.sent.len() > 6 {
+            self.sent.pop_front();
+        }
+        a
+    }
+
+    fn assumed_delay(&self) -> f32 {
+        let p = &self.params;
+        let mut d = p.delay_s;
+        if p.delay_auto > 0.0 && self.delay_info >= 8.0 {
+            let (mut bk, mut be) = (0usize, f32::MAX);
+            for (k, e) in self.delay_err.iter().enumerate() {
+                if *e < be {
+                    be = *e;
+                    bk = k;
+                }
+            }
+            d = bk as f32 * 0.1;
+        }
+        d.clamp(0.0, 0.3)
+    }
+
+    /// Compare how we actually moved since the last decision with what each candidate delay predicts.
+    fn estimate_delay(&mut self, now: &Motion) {
+        let Some(prev) = self.prev_motion else { return };
+        if now.tick != prev.tick + 2 || self.sent.is_empty() {
+            return;
+        }
+        let kin = self.kin;
+        let hold = Sent { mv: [0.0, 0.0], boost: false, aim: prev.aim, fire: [false; 2] };
+        let use_vel = prev.grounded && now.grounded && !prev.charging && !now.charging;
+        let mut errs = [0.0f32; 4];
+        for (k, e) in errs.iter_mut().enumerate() {
+            let s = if k < self.sent.len() { self.sent[self.sent.len() - 1 - k] } else { hold };
+            let mut m = prev;
+            kin.step(&mut m, &s);
+            let ya = wrap(m.aim[0] - now.aim[0]).abs() + (m.aim[1] - now.aim[1]).abs();
+            let va = if use_vel { ((m.vel[0] - now.vel[0]).powi(2) + (m.vel[1] - now.vel[1]).powi(2)).sqrt() / 10.0 } else { 0.0 };
+            *e = ya.min(1.0) + va.min(1.0);
+        }
+        let lo = errs.iter().cloned().fold(f32::MAX, f32::min);
+        let hi = errs.iter().cloned().fold(0.0f32, f32::max);
+        // Only samples that tell the candidates apart count.
+        if hi - lo > 0.05 {
+            for k in 0..4 {
+                self.delay_err[k] = self.delay_err[k] * 0.995 + errs[k];
+            }
+            self.delay_info = self.delay_info * 0.995 + 1.0;
+        }
+    }
+
+    /// The observation as it will be when an action sent now takes effect: our own state advanced
+    /// through the `n` actions still pending, other mechs moved on, timers run down.
+    fn predicted(&self, o: &Obs, now: Motion, n: usize, dt: f32) -> Obs {
+        let mut q = o.clone();
+        let mut m = now;
+        let pending: Vec<Sent> = self.sent.iter().rev().take(n).rev().copied().collect();
+        for s in &pending {
+            self.kin.step(&mut m, s);
+        }
+        q.me.pos = m.pos;
+        q.me.vel = m.vel;
+        q.me.aim = m.aim;
+        q.t = o.t + dt;
+        for a in q.mechs.iter_mut() {
+            for k in 0..3 {
+                a.pos[k] += a.vel[k] * dt * if k == 2 { 0.5 } else { 1.0 };
+            }
+        }
+        for d in q.drops.iter_mut() {
+            d.lands_in -= dt;
+        }
+        for (i, w) in q.me.weapons.iter_mut().enumerate() {
+            let Some(w) = w else { continue };
+            let held = pending.iter().all(|s| s.fire.get(i).copied().unwrap_or(false));
+            w.cooldown = (w.cooldown - dt).max(0.0);
+            w.reload = (w.reload - dt).max(0.0);
+            if w.kind == "laser" && w.charge > 0.0 {
+                if held {
+                    w.charge = (w.charge + dt).min(w.stat("charge", 0.75));
+                } else {
+                    w.charge = 0.0;
+                    w.cooldown = w.stat("cooldown", 1.65);
+                }
+            }
+        }
+        q
+    }
+
+    fn decide(&mut self, o: &Obs, raw: [f32; 3]) -> Action {
         let me = o.me.clone();
         let pos = me.pos;
         let p = self.params.clone();
@@ -990,7 +1218,7 @@ impl Brain {
 
         // --- stuck: wanting to move but not moving means a ledge or a wall; hop and jet over it
         let wants = mv[0].abs() + mv[1].abs() > 0.1;
-        if wants && d2(&pos, &self.last_pos) < 0.15 {
+        if wants && d2(&raw, &self.last_pos) < 0.15 {
             self.stuck += 1;
         } else {
             self.stuck = 0;
@@ -1006,10 +1234,13 @@ impl Brain {
             boost = true;
         }
         self.label = label;
+        if std::env::var("TTRACE_DELAY").is_ok() && o.tick % 200 == 0 {
+            eprintln!("DL t {:.0} used {:.2} info {:.1} err {:?}", o.t, self.delay_used, self.delay_info, self.delay_err);
+        }
         if std::env::var("TTRACE").is_ok() && o.tick % 20 == 0 {
             eprintln!("TR {:.0} {} hp {:.0} cubes {} seen_cubes {} mem_cubes {} enemies {} heal {} flee {}", o.t, label, me.hp, me.cubes, o.cubes.len(), self.cubes_mem.len(), enemies.len(), self.healing, self.fleeing);
         }
-        self.last_pos = pos;
+        self.last_pos = raw;
         a.mv = if mv.iter().all(|v| v.is_finite()) { mv } else { [0.0, 0.0] };
         a.boost = boost;
         if !a.aim.iter().all(|v| v.is_finite()) {
