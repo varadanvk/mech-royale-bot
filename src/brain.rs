@@ -225,6 +225,12 @@ pub struct Params {
     pub collect_seen: f32,
     /// Metres of preference for the weapon pickup we are already walking to.
     pub arm_keep: f32,
+    /// From this match time, stop roaming and fights: hold a spot that few approaches can see (0 = off).
+    pub wall_t: f32,
+    /// Or once the zone radius is at most this.
+    pub wall_r: f32,
+    /// 1 = hold a low-exposure spot inside the next circle; 2 = keep away from the known enemies inside the zone.
+    pub wall_mode: f32,
 }
 
 impl Default for Params {
@@ -323,6 +329,9 @@ impl Default for Params {
             collect_hp: 0.3,
             collect_seen: 2.0,
             arm_keep: 0.0,
+            wall_t: 0.0,
+            wall_r: 290.0,
+            wall_mode: 1.0,
         }
     }
 }
@@ -425,6 +434,9 @@ impl Params {
         p.collect_hp = g("collect_hp", p.collect_hp);
         p.collect_seen = g("collect_seen", p.collect_seen);
         p.arm_keep = g("arm_keep", p.arm_keep);
+        p.wall_t = g("wall_t", p.wall_t);
+        p.wall_r = g("wall_r", p.wall_r);
+        p.wall_mode = g("wall_mode", p.wall_mode);
         p
     }
 
@@ -614,6 +626,8 @@ pub struct Brain {
     arm_pick: Option<u32>,
     /// Where and when we last killed a mech (its cubes drop there).
     kill_spot: Option<([f32; 3], f32)>,
+    /// Spot held late in the match, and when it was chosen.
+    hold: Option<([f32; 2], f32)>,
 }
 
 impl Brain {
@@ -688,6 +702,7 @@ impl Brain {
             looked: Vec::new(),
             arm_pick: None,
             kill_spot: None,
+            hold: None,
         }
     }
 
@@ -1089,6 +1104,75 @@ impl Brain {
                 let s = hid as f32 * 100.0 + if hid == threats.len() { 300.0 } else { 0.0 } - path * 2.0 - self.zone_penalty(o, &c)
                     + (a.cos() * away[0] + a.sin() * away[1]) * 15.0
                     - (40.0 - near).max(0.0) * 3.0;
+                if s > best.1 {
+                    best = (c, s);
+                }
+            }
+        }
+        best.0
+    }
+
+    fn in_next(&self, o: &Obs, c: &[f32; 2], margin: f32) -> bool {
+        let z = &o.zone;
+        (c[0] - z.next_center[0]).hypot(c[1] - z.next_center[1]) < z.next_radius - margin && (c[0] - z.center[0]).hypot(c[1] - z.center[1]) < z.radius - margin
+    }
+
+    /// A walkable spot near us inside the next circle that as little of the surrounding ground as
+    /// possible can see (attackers come into view one or two at a time), but that sees out a little.
+    fn hold_spot(&self, o: &Obs, pos: &[f32; 3]) -> [f32; 2] {
+        let mut best = ([pos[0], pos[1]], f32::MAX);
+        for ring in [0.0f32, 20.0, 45.0, 75.0, 110.0] {
+            let nk = if ring == 0.0 { 1 } else { 12 };
+            for k in 0..nk {
+                let a = k as f32 * TAU / nk as f32 + ring * 0.013;
+                let c = [pos[0] + a.cos() * ring, pos[1] + a.sin() * ring];
+                if !self.walkable(c[0], c[1]) || !self.in_next(o, &c, 15.0) {
+                    continue;
+                }
+                let z = self.ground(c[0], c[1], pos[2]);
+                let eye = [c[0], c[1], z + 7.0];
+                let mut seen = 0;
+                let mut tot = 0;
+                for j in 0..16 {
+                    let b = j as f32 * TAU / 16.0;
+                    for r in [35.0f32, 80.0, 140.0] {
+                        let q = [c[0] + b.cos() * r, c[1] + b.sin() * r];
+                        if !self.walkable(q[0], q[1]) {
+                            continue;
+                        }
+                        tot += 1;
+                        let qz = self.ground(q[0], q[1], z);
+                        if self.clear(eye, [q[0], q[1], qz + 7.0]) {
+                            seen += 1;
+                        }
+                    }
+                }
+                if tot == 0 || seen == 0 {
+                    continue;
+                }
+                let s = seen as f32 / tot as f32 * 100.0 + ring * 0.15;
+                if s < best.1 {
+                    best = (c, s);
+                }
+            }
+        }
+        best.0
+    }
+
+    /// The spot inside the next circle furthest from `from` (or the circle's centre when nothing is known).
+    fn far_spot(&self, o: &Obs, pos: &[f32; 3], from: Option<[f32; 2]>) -> [f32; 2] {
+        let z = &o.zone;
+        let Some(f) = from else { return z.next_center };
+        let mut best = ([pos[0], pos[1]], f32::MIN);
+        for k in 0..24 {
+            let a = k as f32 * TAU / 24.0;
+            for fr in [0.3f32, 0.6, 0.85] {
+                let r = (z.next_radius - 15.0).max(0.0) * fr;
+                let c = [z.next_center[0] + a.cos() * r, z.next_center[1] + a.sin() * r];
+                if !self.walkable(c[0], c[1]) {
+                    continue;
+                }
+                let s = (c[0] - f[0]).hypot(c[1] - f[1]) - 0.3 * (c[0] - pos[0]).hypot(c[1] - pos[1]);
                 if s > best.1 {
                     best = (c, s);
                 }
@@ -1665,6 +1749,7 @@ impl Brain {
             }
             _ => None,
         };
+        let late = (p.wall_t > 0.0 && o.t >= p.wall_t) || (p.wall_t > 0.0 && o.zone.radius <= p.wall_r);
         let mut boost = false;
         let mut mv: [f32; 2];
         let mut label = "idle";
@@ -1739,6 +1824,43 @@ impl Brain {
             if shoot_at.is_none() {
                 if let Some(th) = all.first() {
                     a.aim = [yaw_to(&pos, th), 0.0];
+                }
+            }
+        } else if late && !self.fleeing {
+            if p.wall_mode >= 2.0 {
+                // Keep away from the enemies we know of, inside the zone.
+                label = "evade";
+                let all = self.threats_all(o);
+                let refp = if all.is_empty() { None } else {
+                    let n = all.len() as f32;
+                    Some(all.iter().fold([0.0f32, 0.0f32], |a, t| [a[0] + t[0] / n, a[1] + t[1] / n]))
+                };
+                let g = self.far_spot(o, &pos, refp);
+                mv = self.go(&pos, g);
+                if d2(&pos, &g) < 3.0 {
+                    mv = [0.0, 0.0];
+                }
+                boost = me.energy > 60.0 && d2(&pos, &g) > 20.0;
+            } else {
+                label = "hold";
+                let stale = self.hold.map_or(true, |(h, t0)| o.t - t0 > 20.0 || !self.in_next(o, &h, 10.0));
+                if stale {
+                    let h = self.hold_spot(o, &pos);
+                    self.hold = Some((h, o.t));
+                }
+                let h = self.hold.unwrap().0;
+                let dh = d2(&pos, &h);
+                mv = self.go(&pos, h);
+                if dh < 2.5 {
+                    mv = [0.0, 0.0];
+                }
+                boost = me.energy > 60.0 && dh > 25.0;
+            }
+            if shoot_at.is_none() {
+                if let Some(th) = threats.first() {
+                    a.aim = [yaw_to(&pos, th), 0.0];
+                } else {
+                    self.scan(&mut a);
                 }
             }
         } else if let (Some(t), true) = (target, (self.fleeing || crowded) && p.kite > 0.0 && threat_live) {
@@ -1902,7 +2024,7 @@ impl Brain {
             }
         }
         // Outside a fight, still weave across the line of the nearest shooter.
-        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "fight" || label == "rush" || label == "climb" || label == "drone" || label == "reload") {
+        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "fight" || label == "rush" || label == "climb" || label == "hold" || label == "drone" || label == "reload") {
             if o.t >= self.strafe_until {
                 self.next_strafe(o.t);
             }
