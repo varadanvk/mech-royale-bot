@@ -268,8 +268,8 @@ impl Default for Params {
         Params {
             retreat_hp: 0.55,
             reengage_hp: 0.92,
-            gun_range: 55.0,
-            gun_band: 15.0,
+            gun_range: 40.0,
+            gun_band: 10.0,
             arc_range: 30.0,
             arc_min_hp: 0.6,
             crowd_radius: 150.0,
@@ -345,7 +345,7 @@ impl Default for Params {
             roof_energy: 55.0,
             loot_target: 0.0,
             mortar_over_arc: 0.0,
-            laser_finish: 0.0,
+            laser_finish: 1.0,
             laser_lead: 0.0,
             reload_early: 0.0,
             reload_laser: 1.0,
@@ -375,8 +375,8 @@ impl Default for Params {
             peek: 0.0,
             peek_s: 5.0,
             peek_crowd: 2.0,
-            aim_high: 0.0,
-            charge_seen: 0.0,
+            aim_high: 1.0,
+            charge_seen: 1.0,
         }
     }
 }
