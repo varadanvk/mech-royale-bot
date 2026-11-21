@@ -270,7 +270,7 @@ impl Default for Params {
         Params {
             retreat_hp: 0.3,
             reengage_hp: 0.6,
-            gun_range: 40.0,
+            gun_range: 25.0,
             gun_band: 10.0,
             arc_range: 30.0,
             arc_min_hp: 0.6,
@@ -282,9 +282,9 @@ impl Default for Params {
             strafe_alt: 1.0,
             dodge_after: 9.0,
             evade_weight: 0.8,
-            focus_hp: 120.0,
+            focus_hp: 400.0,
             kite: 1.0,
-            finish_hp: 0.3,
+            finish_hp: 0.5,
             finish_range: 45.0,
             fight_speed: 1.0,
             farm_hp: 0.7,
@@ -301,9 +301,9 @@ impl Default for Params {
             farm_reach: 160.0,
             heal_lo: 0.5,
             heal_hi: 0.7,
-            expose_weight: 1.0,
+            expose_weight: 0.0,
             cube_grab: 45.0,
-            reload_hide: 16.0,
+            reload_hide: 0.0,
             laser_hide: 8.0,
             delay_s: 0.0,
             delay_auto: 1.0,
@@ -379,7 +379,7 @@ impl Default for Params {
             peek_crowd: 2.0,
             aim_high: 1.0,
             charge_seen: 1.0,
-            fight_boost: 0.0,
+            fight_boost: 35.0,
         }
     }
 }
