@@ -305,7 +305,7 @@ impl Default for Params {
             memory_s: 12.0,
             retreat_boost_energy: 15.0,
             focus_stick: 50.0,
-            farm_until: 0.0,
+            farm_until: 30.0,
             farm_reach: 160.0,
             heal_lo: 0.0,
             heal_hi: 0.7,
