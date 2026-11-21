@@ -266,14 +266,14 @@ pub struct Params {
 impl Default for Params {
     fn default() -> Self {
         Params {
-            retreat_hp: 0.3,
-            reengage_hp: 0.6,
+            retreat_hp: 0.18,
+            reengage_hp: 0.45,
             gun_range: 40.0,
             gun_band: 10.0,
             arc_range: 30.0,
             arc_min_hp: 0.6,
             crowd_radius: 150.0,
-            crowd_count: 4,
+            crowd_count: 6,
             open_fire_range: 200.0,
             strafe_min: 0.3,
             strafe_max: 0.6,
@@ -297,8 +297,8 @@ impl Default for Params {
             focus_stick: 50.0,
             farm_until: 0.0,
             farm_reach: 160.0,
-            heal_lo: 0.5,
-            heal_hi: 0.7,
+            heal_lo: 0.35,
+            heal_hi: 0.55,
             expose_weight: 1.0,
             cube_grab: 45.0,
             reload_hide: 16.0,
