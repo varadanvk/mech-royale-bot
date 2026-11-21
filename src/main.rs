@@ -31,6 +31,7 @@ fn main() {
 
     let mut brain: Option<Brain> = None;
     let mut last = Action::default();
+    let mut gate: Option<(bool, u32)> = None;
     loop {
         let Ok(first) = rx.recv() else { return };
         let mut batch = vec![first];
@@ -63,6 +64,14 @@ fn main() {
             None => Action { tick: obs.tick, aim: obs.me.aim, ..Default::default() },
         };
         let mut action = action;
+        if gate.is_none() && (obs.t as f64) >= 30.0 {
+            gate = Some((obs.me.weapons.iter().flatten().any(|w| w.kind == "mortar"), obs.alive));
+        }
+        if let Some((on, n0)) = gate {
+            if !on || obs.alive < n0 {
+                action = Action { tick: obs.tick, aim: obs.me.aim, ..Default::default() };
+            }
+        }
         // NaN would serialize as null and fail the schema: fall back to safe values.
         if !action.mv.iter().all(|v| v.is_finite()) {
             action.mv = [0.0, 0.0];
