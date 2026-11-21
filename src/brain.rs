@@ -270,20 +270,20 @@ impl Default for Params {
         Params {
             retreat_hp: 0.3,
             reengage_hp: 0.6,
-            gun_range: 40.0,
+            gun_range: 25.0,
             gun_band: 10.0,
             arc_range: 30.0,
             arc_min_hp: 0.6,
             crowd_radius: 150.0,
             crowd_count: 4,
-            open_fire_range: 200.0,
+            open_fire_range: 100.0,
             strafe_min: 0.3,
             strafe_max: 0.6,
             strafe_alt: 1.0,
             dodge_after: 9.0,
             evade_weight: 0.8,
             focus_hp: 120.0,
-            kite: 1.0,
+            kite: 0.0,
             finish_hp: 0.3,
             finish_range: 45.0,
             fight_speed: 1.0,
@@ -379,7 +379,7 @@ impl Default for Params {
             peek_crowd: 2.0,
             aim_high: 1.0,
             charge_seen: 1.0,
-            fight_boost: 0.0,
+            fight_boost: 35.0,
         }
     }
 }
