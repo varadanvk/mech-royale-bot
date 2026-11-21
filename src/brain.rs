@@ -271,6 +271,23 @@ pub struct Params {
     pub solo_hp: f32,
     /// Boost toward the target in a fight while further than the preferred distance by 15 m and energy is above this (0 = off).
     pub close_boost: f32,
+    /// Sweep the torso through directions not looked at recently whenever no weapon has a shot coming (0 = off).
+    pub sweep: f32,
+    /// A direction counts as stale once it has been out of the view wedge this many seconds.
+    pub sweep_stale: f32,
+    /// Start a sweep only when the next shot is at least this many seconds away.
+    pub sweep_window: f32,
+    /// Idle scanning turns at full rate toward directions not looked at recently (0 = fixed slow turn).
+    pub scan_fast: f32,
+    /// While idle, a direction counts as stale after this many seconds.
+    pub scan_stale: f32,
+    /// When backing off or hiding, move away from / hide from every enemy we track, not only the nearest few (0 = off).
+    pub aware_flee: f32,
+    /// An enemy aiming within this many degrees of us (or charging) outside our front arc: turn so it and the target
+    /// are both in front while no shot is ready (0 = off).
+    pub face_rear: f32,
+    /// Look toward a heard gun or laser charge with no known mech in that direction, for this many seconds (0 = off).
+    pub sound_look: f32,
 }
 
 impl Default for Params {
@@ -392,6 +409,14 @@ impl Default for Params {
             hunt_any: 0.0,
             solo_hp: 0.0,
             close_boost: 30.0,
+            sweep: 1.0,
+            sweep_stale: 4.0,
+            sweep_window: 0.5,
+            scan_fast: 1.0,
+            scan_stale: 2.0,
+            aware_flee: 1.0,
+            face_rear: 15.0,
+            sound_look: 3.0,
         }
     }
 }
@@ -517,6 +542,14 @@ impl Params {
         p.hunt_any = g("hunt_any", p.hunt_any);
         p.solo_hp = g("solo_hp", p.solo_hp);
         p.close_boost = g("close_boost", p.close_boost);
+        p.sweep = g("sweep", p.sweep);
+        p.sweep_stale = g("sweep_stale", p.sweep_stale);
+        p.sweep_window = g("sweep_window", p.sweep_window);
+        p.scan_fast = g("scan_fast", p.scan_fast);
+        p.scan_stale = g("scan_stale", p.scan_stale);
+        p.aware_flee = g("aware_flee", p.aware_flee);
+        p.face_rear = g("face_rear", p.face_rear);
+        p.sound_look = g("sound_look", p.sound_look);
         p
     }
 
@@ -712,7 +745,22 @@ pub struct Brain {
     kill_spot: Option<([f32; 3], f32)>,
     /// Spot held late in the match, and when it was chosen.
     hold: Option<([f32; 2], f32)>,
+    /// Width of the view wedge (radians).
+    fov: f32,
+    /// Per yaw sector (world frame, starting at -PI): last time the whole sector was inside the view wedge.
+    sector_seen: [f32; SECTORS],
+    /// Per yaw sector: last time a gun or laser charge was heard there with no known mech in that direction.
+    sector_heard: [f32; SECTORS],
+    /// Torso yaw at the previous observation.
+    prev_yaw: Option<f32>,
+    /// A sweep is in progress.
+    sweeping: bool,
+    /// The idle scan already chose the aim this decision.
+    scanned: bool,
 }
+
+/// Number of yaw sectors used to track where we have looked.
+const SECTORS: usize = 12;
 
 impl Brain {
     pub fn new(hello: &Hello) -> Brain {
@@ -790,6 +838,12 @@ impl Brain {
             arm_pick: None,
             kill_spot: None,
             hold: None,
+            fov: f("vision", "fov_deg", 120.0).to_radians(),
+            sector_seen: [-100.0; SECTORS],
+            sector_heard: [-100.0; SECTORS],
+            prev_yaw: None,
+            sweeping: false,
+            scanned: false,
         }
     }
 
@@ -1341,6 +1395,8 @@ impl Brain {
         let delay = self.assumed_delay();
         self.delay_used = delay;
         let n = ((delay / 0.1).round() as usize).min(self.sent.len());
+        // Times are kept on the clock of the observation `decide` sees.
+        self.note_view(o, o.t + n as f32 * 0.1);
         let a = if n == 0 {
             self.decide(o, raw)
         } else {
@@ -1444,6 +1500,7 @@ impl Brain {
         let mut a = Action { tick: o.tick, aim: me.aim, ..Default::default() };
         let hp_frac = me.hp / me.max_hp.max(1.0);
         let walk_speed = me.stat("walk_speed", 11.7);
+        self.scanned = false;
 
         // --- memory of mechs
         for m in o.mechs.iter().filter(|m| m.kind == "mech" && !(m.max_hp > 0.0 && m.hp <= 0.0)) {
@@ -1999,7 +2056,7 @@ impl Brain {
                 if let Some(th) = threats.first() {
                     a.aim = [yaw_to(&pos, th), 0.0];
                 } else {
-                    self.scan(&mut a);
+                    self.scan(o, &mut a);
                 }
             }
         } else if let (Some(t), true) = (target, (self.fleeing || crowded) && p.kite > 0.0 && threat_live) {
@@ -2008,7 +2065,10 @@ impl Brain {
             let to = norm2(t.pos[0] - pos[0], t.pos[1] - pos[1]);
             let radial = if laser_on.is_some() { -0.2 } else { -p.kite };
             mv = self.strafe_dir(o, &pos, to, radial, false);
-            if p.kite_away > 0.0 && laser_on.is_none() {
+            // Someone else on the far side: backing straight away from the target would walk toward it.
+            let flanked = p.aware_flee > 0.0
+                && enemies.iter().any(|m| m.id != t.id && d2(&m.pos, &pos) < p.crowd_radius && (m.pos[0] - pos[0]) * to[0] + (m.pos[1] - pos[1]) * to[1] < 0.0);
+            if (p.kite_away > 0.0 || flanked) && laser_on.is_none() {
                 let dir = self.away_dir(o, &pos, 3.0, None);
                 let perp = [-to[1] * self.strafe, to[0] * self.strafe];
                 let cand = norm2(dir[0] + perp[0] * p.stand_weave, dir[1] + perp[1] * p.stand_weave);
@@ -2018,7 +2078,8 @@ impl Brain {
         } else if (self.fleeing || crowded) && threat_live {
             label = if self.fleeing { "heal" } else { "crowd" };
             if self.cover.map_or(true, |(_, until)| o.t > until) {
-                let c = self.find_cover(o, &threats);
+                let from = if p.aware_flee > 0.0 { self.threats_all(o) } else { threats.clone() };
+                let c = self.find_cover(o, &from);
                 self.cover = Some((c, o.t + 1.0));
             }
             let c = self.cover.unwrap().0;
@@ -2037,7 +2098,8 @@ impl Brain {
             label = "mend";
             if !threats.is_empty() {
                 if self.cover.map_or(true, |(_, until)| o.t > until) {
-                    let c = self.find_cover(o, &threats);
+                    let from = if p.aware_flee > 0.0 { self.threats_all(o) } else { threats.clone() };
+                    let c = self.find_cover(o, &from);
                     self.cover = Some((c, o.t + 1.5));
                 }
                 let c = self.cover.unwrap().0;
@@ -2049,14 +2111,14 @@ impl Brain {
             } else {
                 mv = self.idle_move(o, &pos);
                 mv = [mv[0] * 0.6, mv[1] * 0.6];
-                self.scan(&mut a);
+                self.scan(o, &mut a);
             }
         } else if self.fleeing {
             // Healing with no known threat: stay near shelter.
             label = "rest";
             mv = if p.retreat_mode > 0.0 { [0.0, 0.0] } else { self.idle_move(o, &pos) };
             if shoot_at.is_none() {
-                self.scan(&mut a);
+                self.scan(o, &mut a);
             }
         } else if let Some((spot, tk)) = peek_wait {
             // Out of sight: charge the laser, then step back to where we fired from.
@@ -2165,7 +2227,7 @@ impl Brain {
                 if let Some(g) = self.unexplored(o, &pos) {
                     label = "seek";
                     mv = self.go(&pos, g);
-                    self.scan(&mut a);
+                    self.scan(o, &mut a);
                 }
             }
             let armed = p.hunt_any > 0.0 || me.weapons.iter().flatten().any(|w| w.kind == "laser");
@@ -2226,6 +2288,9 @@ impl Brain {
                 boost = true;
             }
         }
+
+        // --- awareness: between shots, face enemies aiming at our back or look where we have not looked lately
+        self.aware(o, &mut a, shoot_at, &enemies);
 
         // --- stuck: wanting to move but not moving means a ledge or a wall; hop and jet over it
         let wants = mv[0].abs() + mv[1].abs() > 0.1;
@@ -2400,9 +2465,188 @@ impl Brain {
         None
     }
 
-    fn scan(&mut self, a: &mut Action) {
-        self.scan_yaw = wrap(self.scan_yaw + 0.16);
+    /// Look around while nothing needs the aim: at full turn rate toward directions not looked at lately
+    /// (or a slow steady turn with `scan_fast` off).
+    fn scan(&mut self, o: &Obs, a: &mut Action) {
+        self.scanned = true;
+        if self.params.scan_fast <= 0.0 {
+            self.scan_yaw = wrap(self.scan_yaw + 0.16);
+            a.aim = [self.scan_yaw, 0.0];
+            return;
+        }
+        let y0 = o.me.aim[0];
+        let need = self.stale_sectors(o.t, self.params.scan_stale);
+        self.scan_yaw = match self.sweep_plan(y0, None, &need) {
+            Some(leg) => wrap(y0 + leg.signum() * leg.abs().min(2.5)),
+            None => y0,
+        };
         a.aim = [self.scan_yaw, 0.0];
+    }
+
+    /// Centre yaw of sector `i`.
+    fn sector_yaw(i: usize) -> f32 {
+        -PI + (i as f32 + 0.5) * TAU / SECTORS as f32
+    }
+
+    fn sector_of(yaw: f32) -> usize {
+        (((wrap(yaw) + PI) / TAU * SECTORS as f32) as usize).min(SECTORS - 1)
+    }
+
+    /// How far the aim may be from a sector's centre with the whole sector still inside the view wedge.
+    fn sector_reach(&self) -> f32 {
+        (self.fov * 0.5 - PI / SECTORS as f32).max(0.05)
+    }
+
+    /// Record the sectors the view wedge covered since the previous observation, and heard shots that no mech
+    /// we know of explains.
+    fn note_view(&mut self, o: &Obs, now: f32) {
+        let y1 = o.me.aim[0];
+        let y0 = self.prev_yaw.unwrap_or(y1);
+        self.prev_yaw = Some(y1);
+        let s = wrap(y1 - y0);
+        let h = self.sector_reach();
+        for i in 0..SECTORS {
+            let d = wrap(Self::sector_yaw(i) - y0);
+            let inside = if s >= 0.0 { d >= -h && d <= s + h } else { d <= h && d >= s - h };
+            if inside {
+                self.sector_seen[i] = now;
+            }
+        }
+        if self.params.sound_look > 0.0 {
+            for sd in o.sounds.iter().filter(|sd| matches!(sd.kind.as_str(), "gun" | "laser_charge")) {
+                let explained = o.mechs.iter().any(|m| m.kind == "mech" && wrap(yaw_to(&o.me.pos, &m.pos) - sd.bearing).abs() < 0.35);
+                if !explained {
+                    let i = Self::sector_of(sd.bearing);
+                    self.sector_heard[i] = self.sector_heard[i].max(now - sd.age);
+                }
+            }
+        }
+    }
+
+    /// Sectors worth a look: those with an unexplained shot heard since we last looked there, or else those
+    /// not looked at for `stale` seconds.
+    fn stale_sectors(&self, now: f32, stale: f32) -> [bool; SECTORS] {
+        let look = self.params.sound_look;
+        let heard: [bool; SECTORS] = std::array::from_fn(|i| look > 0.0 && self.sector_heard[i] > self.sector_seen[i] && now - self.sector_heard[i] < look);
+        if heard.iter().any(|h| *h) {
+            return heard;
+        }
+        std::array::from_fn(|i| now - self.sector_seen[i] > stale)
+    }
+
+    /// The least torso rotation that brings every flagged sector wholly inside the view wedge, ending facing
+    /// `back` if given. Returns the signed rotation of its first leg, or None when no turn is needed.
+    fn sweep_plan(&self, y0: f32, back: Option<f32>, need: &[bool; SECTORS]) -> Option<f32> {
+        let h = self.sector_reach();
+        // Offsets of the flagged sector centres, counterclockwise from the aim, in [0, TAU).
+        let offs: Vec<f32> = (0..SECTORS).filter(|i| need[*i]).map(|i| wrap(Self::sector_yaw(i) - y0).rem_euclid(TAU)).collect();
+        // Turning counterclockwise by `ccw` and clockwise by `cw` (in either order) covers [-cw - h, ccw + h].
+        let covered = |ccw: f32, cw: f32| offs.iter().all(|&r| r <= ccw + h || TAU - r <= cw + h);
+        if covered(0.0, 0.0) {
+            return None;
+        }
+        let mut ccws = vec![0.0f32];
+        let mut cws = vec![0.0f32];
+        for &r in &offs {
+            ccws.push((r - h + 0.02).max(0.0));
+            cws.push((TAU - r - h + 0.02).max(0.0));
+        }
+        let back_cost = |y: f32| back.map_or(0.0, |b| wrap(b - y).abs());
+        let mut best: Option<(f32, f32)> = None;
+        let mut take = |cost: f32, leg: f32| {
+            if best.map_or(true, |b| cost < b.0) {
+                best = Some((cost, leg));
+            }
+        };
+        for &ccw in &ccws {
+            for &cw in &cws {
+                if !covered(ccw, cw) {
+                    continue;
+                }
+                if cw == 0.0 {
+                    take(ccw + back_cost(y0 + ccw), ccw);
+                } else if ccw == 0.0 {
+                    take(cw + back_cost(y0 - cw), -cw);
+                } else {
+                    take(2.0 * ccw + cw + back_cost(y0 - cw), ccw);
+                    take(2.0 * cw + ccw + back_cost(y0 + ccw), -cw);
+                }
+            }
+        }
+        best.map(|b| b.1).filter(|l| l.abs() > 1e-3)
+    }
+
+    /// Seconds until a weapon has a shot it would take: at `t` with a firing solution, with lightning at any
+    /// enemy in arc range, or whatever the trigger is held for this decision. f32::MAX when none is coming.
+    fn shot_ready_in(&self, o: &Obs, t: Option<&Actor>, enemies: &[&Actor], a: &Action) -> f32 {
+        let me = &o.me;
+        let mut ready = f32::MAX;
+        for (i, slot) in me.weapons.iter().enumerate().take(2) {
+            let Some(w) = slot else { continue };
+            let wait = match w.kind.as_str() {
+                "gun" if w.reload > 0.0 => w.reload,
+                "gun" if w.ammo <= 0.0 => w.stat("reload", 2.4),
+                "laser" if w.charge > 0.0 => (w.stat("charge", 0.75) - w.charge).max(0.0),
+                _ => w.cooldown,
+            };
+            let loaded = w.kind != "gun" || (w.reload <= 0.0 && w.ammo > 0.0);
+            let held = a.fire.get(i).copied().unwrap_or(false) && loaded;
+            let arc = w.kind == "lightning" && me.energy > w.stat("energy", 3.0) && enemies.iter().any(|m| d2(&m.pos, &me.pos) < w.stat("range", 45.0) + 5.0);
+            if held || arc || t.map_or(false, |t| self.solve(o, w, t).ok) {
+                ready = ready.min(wait);
+            }
+        }
+        ready
+    }
+
+    /// Use the aim while no shot is coming: turn so an enemy aiming at our back and the target are both in front,
+    /// otherwise sweep through stale directions and come back before the next shot.
+    fn aware(&mut self, o: &Obs, a: &mut Action, t: Option<&Actor>, enemies: &[&Actor]) {
+        let p = &self.params;
+        if self.scanned || (p.sweep <= 0.0 && p.face_rear <= 0.0) {
+            self.sweeping = false;
+            return;
+        }
+        let me = &o.me;
+        let pos = me.pos;
+        let turn = me.stat("turn_rate", 4.0).max(0.1);
+        let lag = self.delay_used + 0.1;
+        let ready = self.shot_ready_in(o, t, enemies, a);
+        let yt = a.aim[0];
+        if let (Some(t), true) = (t, p.face_rear > 0.0) {
+            let tol = p.face_rear.to_radians();
+            // Keep both this far inside the edge of the front arc.
+            let edge = PI / 2.0 - 0.25;
+            let rear = enemies
+                .iter()
+                .filter(|m| m.id != t.id && d2(&m.pos, &pos) < 200.0)
+                .filter(|m| m.charging || wrap(m.aim[0] - yaw_to(&m.pos, &pos)).abs() < tol)
+                .map(|m| (wrap(yaw_to(&pos, &m.pos) - yt), d2(&m.pos, &pos)))
+                .filter(|(d, _)| d.abs() > edge)
+                .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some((d, _)) = rear.filter(|(d, _)| d.abs() <= 2.0 * edge) {
+                let y = wrap(yt + d.signum() * (d.abs() - edge));
+                if ready > wrap(yt - y).abs() / turn + lag {
+                    a.aim[0] = y;
+                    self.sweeping = false;
+                    return;
+                }
+            }
+        }
+        if p.sweep > 0.0 && (self.sweeping || ready > p.sweep_window) {
+            let y0 = me.aim[0];
+            let need = self.stale_sectors(o.t, p.sweep_stale);
+            if let Some(leg) = self.sweep_plan(y0, Some(yt), &need) {
+                // Only while we can still turn back to the target before the next shot.
+                let y1 = y0 + leg.signum() * leg.abs().min(turn * 0.1);
+                if ready > wrap(yt - y1).abs() / turn + lag {
+                    a.aim[0] = wrap(y0 + leg.signum() * leg.abs().min(2.5));
+                    self.sweeping = true;
+                    return;
+                }
+            }
+        }
+        self.sweeping = false;
     }
 
     /// Sideways movement relative to `to` (unit vector toward the opponent) with random dwell.
@@ -2582,7 +2826,7 @@ impl Brain {
             if let Some(th) = threats.first() {
                 a.aim = [yaw_to(pos, th), 0.0];
             } else {
-                self.scan(a);
+                self.scan(o, a);
             }
         }
         mv
