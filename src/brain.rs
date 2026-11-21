@@ -315,7 +315,7 @@ impl Default for Params {
             rush_boost: 50.0,
             laser_first: 1.0,
             arm: 1.0,
-            arm_reach: 160.0,
+            arm_reach: 300.0,
             arm_hp: 0.35,
             arm_rank: 25.0,
             arm_better: 60.0,
@@ -329,10 +329,10 @@ impl Default for Params {
             hunt: 0.0,
             hunt_hp: 0.8,
             no_mortar: 0.0,
-            laser_seek: 0.0,
+            laser_seek: 300.0,
             explore: 0.0,
             explore_r: 110.0,
-            roof: 0.0,
+            roof: 1.0,
             roof_cost: 40.0,
             roof_energy: 55.0,
             loot_target: 0.0,
@@ -363,7 +363,7 @@ impl Default for Params {
             roof_dist: 0.3,
             isolate: 0.0,
             isolate_kite: 0.0,
-            spin: 0.0,
+            spin: 6.0,
         }
     }
 }
