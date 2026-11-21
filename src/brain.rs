@@ -278,8 +278,8 @@ impl Default for Params {
         Params {
             retreat_hp: 0.3,
             reengage_hp: 0.6,
-            gun_range: 40.0,
-            gun_band: 10.0,
+            gun_range: 75.0,
+            gun_band: 15.0,
             arc_range: 30.0,
             arc_min_hp: 0.6,
             crowd_radius: 150.0,
