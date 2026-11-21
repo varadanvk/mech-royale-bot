@@ -111,6 +111,8 @@ pub struct Params {
     pub hunt_hp: f32,
     /// Do not go looking before this match time.
     pub hunt_after: f32,
+    /// Choose idle posts on the side of the safe area away from where enemies were heard or seen (0 = off).
+    pub post_away: f32,
 }
 
 impl Default for Params {
@@ -140,7 +142,7 @@ impl Default for Params {
             drop_enemy_clear: 70.0,
             zone_lead: 10.0,
             zone_lead_mult: 1.6,
-            wander_radius: 14.0,
+            wander_radius: 0.0,
             memory_s: 12.0,
             retreat_boost_energy: 15.0,
             focus_stick: 50.0,
@@ -153,8 +155,9 @@ impl Default for Params {
             reload_hide: 16.0,
             laser_hide: 8.0,
             crowd_mem: 6.0,
-            hunt_hp: 0.85,
+            hunt_hp: 0.0,
             hunt_after: 0.0,
+            post_away: 1.0,
         }
     }
 }
@@ -203,6 +206,7 @@ impl Params {
         p.crowd_mem = g("crowd_mem", p.crowd_mem);
         p.hunt_hp = g("hunt_hp", p.hunt_hp);
         p.hunt_after = g("hunt_after", p.hunt_after);
+        p.post_away = g("post_away", p.post_away);
         p
     }
 
@@ -288,6 +292,8 @@ pub struct Brain {
     leads: Vec<([f32; 2], f32)>,
     /// Exploration waypoint when there are no leads.
     roam: Option<([f32; 2], f32)>,
+    /// Slow-moving average of where enemies have been.
+    enemy_c: Option<[f32; 2]>,
     /// Short name of the current behaviour, for debugging.
     pub label: &'static str,
 }
@@ -343,6 +349,7 @@ impl Brain {
             healing: false,
             leads: Vec::new(),
             roam: None,
+            enemy_c: None,
             label: "",
         }
     }
@@ -549,7 +556,13 @@ impl Brain {
         let r_next = (z.next_radius * 0.7).max(0.0);
         let to_me = norm2(me.pos[0] - z.next_center[0], me.pos[1] - z.next_center[1]);
         let d_me = d2(&me.pos, &z.next_center);
-        let anchor = if d_me > r_next {
+        let anchor = if let (Some(c), true) = (self.enemy_c, self.params.post_away > 0.0) {
+            // Far side of the next circle from the enemies' centre of mass.
+            let away = norm2(z.next_center[0] - c[0], z.next_center[1] - c[1]);
+            let away = if away == [0.0, 0.0] { to_me } else { away };
+            let r = r_next * 0.85;
+            [z.next_center[0] + away[0] * r, z.next_center[1] + away[1] * r]
+        } else if d_me > r_next {
             [z.next_center[0] + to_me[0] * r_next, z.next_center[1] + to_me[1] * r_next]
         } else {
             [me.pos[0], me.pos[1]]
@@ -638,6 +651,14 @@ impl Brain {
             self.leads.push(([m.pos[0], m.pos[1]], o.t));
         }
         self.leads.retain(|(_, t)| o.t - t < 15.0);
+        if !self.leads.is_empty() {
+            let n = self.leads.len() as f32;
+            let c = self.leads.iter().fold([0.0f32, 0.0], |a, (q, _)| [a[0] + q[0] / n, a[1] + q[1] / n]);
+            self.enemy_c = Some(match self.enemy_c {
+                Some(e) => [e[0] * 0.98 + c[0] * 0.02, e[1] * 0.98 + c[1] * 0.02],
+                None => c,
+            });
+        }
         if self.leads.len() > 64 {
             let n = self.leads.len() - 64;
             self.leads.drain(0..n);
