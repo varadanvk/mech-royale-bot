@@ -652,7 +652,7 @@ pub struct Brain {
     pub world: Option<Arc<World>>,
     pub nav: Option<Nav>,
     pub params: Params,
-    rng: (hello.seed ^ 0x5bd1e995a4c7f311) | 1,
+    rng: u64,
     pickup_radius: f32,
     /// Seconds per simulation tick.
     tick_s: f32,
