@@ -718,7 +718,7 @@ impl Brain {
             world,
             nav,
             params,
-            rng: hello.seed | 1,
+            rng: (hello.seed ^ 0x9e3779b97f4a7c17) | 1,
             pickup_radius: f("loot", "pickup_radius", 4.0),
             tick_s: 1.0 / f("match", "tick_hz", 20.0).max(1.0),
             strafe: 1.0,
