@@ -55,6 +55,8 @@ pub struct Params {
     /// Strafe direction dwell, random in [min, max] seconds.
     pub strafe_min: f32,
     pub strafe_max: f32,
+    /// Chance that each new strafe dwell reverses direction (0.5 = random direction, 1 = always alternate).
+    pub strafe_alt: f32,
     /// Seconds after an aimed laser charge is first seen at which we reverse direction (large = never).
     pub dodge_after: f32,
     /// Weight of the sideways weave (relative to the travel direction) when an enemy is in sight outside a fight.
@@ -109,6 +111,18 @@ pub struct Params {
     pub delay_s: f32,
     /// Estimate the delay from our own motion and use the estimate once it is clear (0 = off).
     pub delay_auto: f32,
+    /// Gun lead: fraction of a grounded target's horizontal velocity to lead by.
+    pub lead_ground: f32,
+    /// Gun lead: fraction of an airborne target's horizontal velocity to lead by.
+    pub lead_air: f32,
+    /// Seconds added to the bullet flight time when leading.
+    pub lead_latency: f32,
+    /// Predict an airborne target's height with gravity or jet thrust, stopping at the surface below it
+    /// (0 = lead by half its vertical speed).
+    pub lead_ballistic: f32,
+    /// Pull the gun trigger when the aim is within this many ticks of torso turn of the solution
+    /// (the torso turns before the shot leaves; 0 = only when already on target).
+    pub aim_slack: f32,
 }
 
 impl Default for Params {
@@ -123,8 +137,9 @@ impl Default for Params {
             crowd_radius: 150.0,
             crowd_count: 2,
             open_fire_range: 200.0,
-            strafe_min: 0.35,
-            strafe_max: 0.9,
+            strafe_min: 0.3,
+            strafe_max: 0.6,
+            strafe_alt: 1.0,
             dodge_after: 9.0,
             evade_weight: 0.8,
             focus_hp: 120.0,
@@ -152,6 +167,11 @@ impl Default for Params {
             laser_hide: 8.0,
             delay_s: 0.0,
             delay_auto: 1.0,
+            lead_ground: 0.9,
+            lead_air: 1.0,
+            lead_latency: 0.025,
+            lead_ballistic: 1.0,
+            aim_slack: 1.0,
         }
     }
 }
@@ -172,6 +192,7 @@ impl Params {
         p.open_fire_range = g("open_fire_range", p.open_fire_range);
         p.strafe_min = g("strafe_min", p.strafe_min);
         p.strafe_max = g("strafe_max", p.strafe_max);
+        p.strafe_alt = g("strafe_alt", p.strafe_alt);
         p.dodge_after = g("dodge_after", p.dodge_after);
         p.evade_weight = g("evade_weight", p.evade_weight);
         p.focus_hp = g("focus_hp", p.focus_hp);
@@ -199,6 +220,11 @@ impl Params {
         p.laser_hide = g("laser_hide", p.laser_hide);
         p.delay_s = g("delay_s", p.delay_s);
         p.delay_auto = g("delay_auto", p.delay_auto);
+        p.lead_ground = g("lead_ground", p.lead_ground);
+        p.lead_air = g("lead_air", p.lead_air);
+        p.lead_latency = g("lead_latency", p.lead_latency);
+        p.lead_ballistic = g("lead_ballistic", p.lead_ballistic);
+        p.aim_slack = g("aim_slack", p.aim_slack);
         p
     }
 
@@ -241,6 +267,8 @@ struct Known {
     pos: [f32; 3],
     vel: [f32; 3],
     seen_t: f32,
+    /// Velocity and time of the observation before `seen_t`.
+    prev_vel: Option<([f32; 3], f32)>,
     /// When we first saw its current laser charge (None if not charging).
     charge_since: Option<f32>,
     aim_yaw: f32,
@@ -325,6 +353,8 @@ pub struct Brain {
     pub params: Params,
     rng: u64,
     pickup_radius: f32,
+    /// Seconds per simulation tick.
+    tick_s: f32,
     strafe: f32,
     strafe_until: f32,
     last_pos: [f32; 3],
@@ -393,6 +423,7 @@ impl Brain {
             params,
             rng: hello.seed | 1,
             pickup_radius: f("loot", "pickup_radius", 4.0),
+            tick_s: 1.0 / f("match", "tick_hz", 20.0).max(1.0),
             strafe: 1.0,
             strafe_until: 0.0,
             last_pos: [0.0; 3],
@@ -505,15 +536,43 @@ impl Brain {
         match w.kind.as_str() {
             "gun" => {
                 let speed = w.stat("speed", 252.0);
+                let p = &self.params;
                 // Shots start a little ahead of the mech along the aim.
                 let lead_out = 2.5 * (1.0 + 0.05 * me.cubes) + 0.5;
-                let mut p = tc;
+                // Where it would land if it is in the air: the highest surface under it.
+                let floor = self.world.as_ref().filter(|_| p.lead_ballistic > 0.0).map(|w| w.surface_below(t.pos[0], t.pos[1], t.pos[2] + 0.3));
+                let airborne = floor.map_or(false, |f| t.pos[2] - f > 0.4);
+                // Jetting shows as vertical speed that is not falling at gravity.
+                let jet = airborne
+                    && (self.known.get(&t.id).and_then(|k| k.prev_vel).map_or(false, |(pv, pt)| {
+                        let dt = (o.t - pt).max(0.05);
+                        (t.vel[2] - pv[2]) / dt > -10.0
+                    }) || (t.vel[2] > 8.3 && t.vel[2] < 9.5));
+                let lead = if airborne { p.lead_air } else { p.lead_ground };
+                let rise = |tt: f32| -> f32 {
+                    match floor {
+                        None => t.vel[2] * tt * 0.5,
+                        Some(_) if !airborne => 0.0,
+                        Some(f) => {
+                            let vz = t.vel[2];
+                            let dz = if jet {
+                                // thrust +12 m/s^2 net up to a climb of 8.9 m/s
+                                let t1 = tt.min(((8.9 - vz) / 12.0).max(0.0));
+                                vz * t1 + 6.0 * t1 * t1 + 8.9 * (tt - t1)
+                            } else {
+                                vz * tt - 11.0 * tt * tt
+                            };
+                            (t.pos[2] + dz).max(f) - t.pos[2]
+                        }
+                    }
+                };
+                let mut pt = tc;
                 for _ in 0..3 {
-                    let tt = ((d3(&muzzle, &p) - lead_out).max(0.0)) / speed + 0.05;
-                    p = [tc[0] + t.vel[0] * tt, tc[1] + t.vel[1] * tt, tc[2] + t.vel[2] * tt * 0.5];
+                    let tt = ((d3(&muzzle, &pt) - lead_out).max(0.0)) / speed + p.lead_latency;
+                    pt = [tc[0] + t.vel[0] * tt * lead, tc[1] + t.vel[1] * tt * lead, tc[2] + rise(tt)];
                 }
-                let ok = w.ammo > 0.0 && w.reload <= 0.0 && d3(&muzzle, &p) < w.stat("range", 230.0) && self.clear(muzzle, p);
-                Shot { aim: flat(&p, &muzzle), tol: body, ok }
+                let ok = w.ammo > 0.0 && w.reload <= 0.0 && d3(&muzzle, &pt) < w.stat("range", 230.0) && self.clear(muzzle, pt);
+                Shot { aim: flat(&pt, &muzzle), tol: body, ok }
             }
             "laser" => {
                 let ok = dist < w.stat("range", 280.0) && self.clear(muzzle, tc);
@@ -794,12 +853,14 @@ impl Brain {
         // --- memory of mechs
         for m in o.mechs.iter().filter(|m| m.kind == "mech" && !(m.max_hp > 0.0 && m.hp <= 0.0)) {
             let prev_charge = self.known.get(&m.id).and_then(|k| k.charge_since);
+            let prev_vel = self.known.get(&m.id).filter(|k| o.t - k.seen_t < 0.35 && o.t > k.seen_t).map(|k| (k.vel, k.seen_t));
             self.known.insert(
                 m.id,
                 Known {
                     pos: m.pos,
                     vel: m.vel,
                     seen_t: o.t,
+                    prev_vel,
                     charge_since: if m.charging { Some(prev_charge.unwrap_or(o.t)) } else { None },
                     aim_yaw: m.aim[0],
                 },
@@ -931,7 +992,13 @@ impl Brain {
                     continue;
                 }
                 engaged = true;
-                let lined = wrap(s.aim[0] - me.aim[0]).abs() <= s.tol[0] && (s.aim[1] - me.aim[1]).abs() <= s.tol[1];
+                // The torso turns toward the new aim before a gun shot leaves, so allow that much.
+                let slack = if w.kind == "gun" {
+                    [me.stat("turn_rate", 4.0) * self.tick_s * p.aim_slack, me.stat("pitch_rate", 3.0) * self.tick_s * p.aim_slack]
+                } else {
+                    [0.0, 0.0]
+                };
+                let lined = wrap(s.aim[0] - me.aim[0]).abs() <= s.tol[0] + slack[0] && (s.aim[1] - me.aim[1]).abs() <= s.tol[1] + slack[1];
                 let pri = match w.kind.as_str() {
                     "lightning" => 4,
                     "laser" => 3,
@@ -1199,8 +1266,7 @@ impl Brain {
         // Outside a fight, still weave across the line of the nearest shooter.
         if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "fight" || label == "drone" || label == "reload") {
             if o.t >= self.strafe_until {
-                self.strafe = if self.rnd() < 0.5 { 1.0 } else { -1.0 };
-                self.strafe_until = o.t + p.strafe_min + self.rnd() * (p.strafe_max - p.strafe_min).max(0.0);
+                self.next_strafe(o.t);
             }
             let to = norm2(src[0] - pos[0], src[1] - pos[1]);
             let perp = [-to[1] * self.strafe, to[0] * self.strafe];
@@ -1326,15 +1392,22 @@ impl Brain {
     }
 
     /// Sideways movement relative to `to` (unit vector toward the opponent) with random dwell.
+    /// Start a new strafe dwell: reverse with probability `strafe_alt`, for a random time in [strafe_min, strafe_max].
+    fn next_strafe(&mut self, now: f32) {
+        let (smin, smax, alt) = (self.params.strafe_min, self.params.strafe_max.max(self.params.strafe_min), self.params.strafe_alt);
+        if self.rnd() < alt {
+            self.strafe = -self.strafe;
+        }
+        self.strafe_until = now + smin + self.rnd() * (smax - smin);
+    }
+
     fn strafe_dir(&mut self, o: &Obs, pos: &[f32; 3], to: [f32; 2], radial: f32, flip: bool) -> [f32; 2] {
-        let p = &self.params;
-        let (smin, smax) = (p.strafe_min, p.strafe_max.max(p.strafe_min));
+        let smin = self.params.strafe_min;
         if flip {
             self.strafe = -self.strafe;
             self.strafe_until = o.t + smin;
         } else if o.t >= self.strafe_until {
-            self.strafe = if self.rnd() < 0.5 { 1.0 } else { -1.0 };
-            self.strafe_until = o.t + smin + self.rnd() * (smax - smin);
+            self.next_strafe(o.t);
         }
         let mut dir = norm2(to[0] * radial - to[1] * self.strafe, to[1] * radial + to[0] * self.strafe);
         if !self.walkable(pos[0] + dir[0] * 6.0, pos[1] + dir[1] * 6.0) {
