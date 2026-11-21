@@ -325,10 +325,10 @@ impl Default for Params {
             arc_crowd: 1.0,
             arc_energy: 20.0,
             rush: 1.0,
-            rush_start: 90.0,
+            rush_start: 130.0,
             rush_range: 22.0,
-            rush_hp: 0.45,
-            rush_crowd: 1.0,
+            rush_hp: 0.0,
+            rush_crowd: 3.0,
             rush_energy: 40.0,
             rush_boost: 50.0,
             laser_first: 1.0,
@@ -390,8 +390,8 @@ impl Default for Params {
             fight_boost: 0.0,
             farm_stop: 0.0,
             hunt_any: 0.0,
-            solo_hp: 0.0,
-            close_boost: 0.0,
+            solo_hp: 0.12,
+            close_boost: 30.0,
         }
     }
 }
