@@ -205,6 +205,26 @@ pub struct Params {
     pub reload_early: f32,
     /// Step out of sight to reload even when the laser could fire meanwhile (0 = keep the laser on target).
     pub reload_laser: f32,
+    /// Retreat: 0 = back away while shooting; 1 = break line of sight from every known enemy and heal out of sight.
+    pub retreat_mode: f32,
+    /// Also break line of sight (instead of backing away) when outnumbered at full health.
+    pub break_crowd: f32,
+    /// While breaking line of sight, start laser charges (half speed) only if the cover is closer than this many metres (large = always).
+    pub break_laser: f32,
+    /// Start retreating when at least this many enemies are in view and HP is below `break_los_hp` (0 = off).
+    pub break_los: f32,
+    /// HP fraction for `break_los`.
+    pub break_los_hp: f32,
+    /// After a kill, go and pick up the cubes it dropped (0 = off).
+    pub collect: f32,
+    /// For this many seconds after the kill.
+    pub collect_s: f32,
+    /// Only above this HP fraction.
+    pub collect_hp: f32,
+    /// Only while fewer than this many enemies are in view.
+    pub collect_seen: f32,
+    /// Metres of preference for the weapon pickup we are already walking to.
+    pub arm_keep: f32,
 }
 
 impl Default for Params {
@@ -278,21 +298,31 @@ impl Default for Params {
             precharge: 0.0,
             mortar_take: 0.0,
             flee_nocharge: 0.0,
-            hunt: 250.0,
+            hunt: 0.0,
             hunt_hp: 0.8,
             no_mortar: 0.0,
-            laser_seek: 220.0,
+            laser_seek: 0.0,
             explore: 0.0,
             explore_r: 110.0,
-            roof: 1.0,
+            roof: 0.0,
             roof_cost: 40.0,
             roof_energy: 55.0,
-            loot_target: 40.0,
+            loot_target: 0.0,
             mortar_over_arc: 0.0,
-            laser_finish: 1.0,
+            laser_finish: 0.0,
             laser_lead: 0.0,
             reload_early: 0.0,
             reload_laser: 1.0,
+            retreat_mode: 1.0,
+            break_crowd: 0.0,
+            break_laser: 1000.0,
+            break_los: 0.0,
+            break_los_hp: 0.8,
+            collect: 0.0,
+            collect_s: 15.0,
+            collect_hp: 0.3,
+            collect_seen: 2.0,
+            arm_keep: 0.0,
         }
     }
 }
@@ -385,6 +415,16 @@ impl Params {
         p.laser_lead = g("laser_lead", p.laser_lead);
         p.reload_early = g("reload_early", p.reload_early);
         p.reload_laser = g("reload_laser", p.reload_laser);
+        p.retreat_mode = g("retreat_mode", p.retreat_mode);
+        p.break_crowd = g("break_crowd", p.break_crowd);
+        p.break_laser = g("break_laser", p.break_laser);
+        p.break_los = g("break_los", p.break_los);
+        p.break_los_hp = g("break_los_hp", p.break_los_hp);
+        p.collect = g("collect", p.collect);
+        p.collect_s = g("collect_s", p.collect_s);
+        p.collect_hp = g("collect_hp", p.collect_hp);
+        p.collect_seen = g("collect_seen", p.collect_seen);
+        p.arm_keep = g("arm_keep", p.arm_keep);
         p
     }
 
@@ -572,6 +612,8 @@ pub struct Brain {
     looked: Vec<bool>,
     /// Weapon pickup we are walking to.
     arm_pick: Option<u32>,
+    /// Where and when we last killed a mech (its cubes drop there).
+    kill_spot: Option<([f32; 3], f32)>,
 }
 
 impl Brain {
@@ -645,6 +687,7 @@ impl Brain {
             laser_full_t: None,
             looked: Vec::new(),
             arm_pick: None,
+            kill_spot: None,
         }
     }
 
@@ -1001,6 +1044,59 @@ impl Brain {
         best.0
     }
 
+    /// Every enemy position we know of (recently seen, extrapolated a little), nearest first, at most eight.
+    fn threats_all(&self, o: &Obs) -> Vec<[f32; 3]> {
+        let me = o.me.pos;
+        let mut v: Vec<[f32; 3]> = self
+            .known
+            .values()
+            .filter(|k| o.t - k.seen_t < self.params.memory_s && d2(&k.pos, &me) < 260.0)
+            .map(|k| {
+                let dt = (o.t - k.seen_t).min(2.0);
+                [k.pos[0] + k.vel[0] * dt, k.pos[1] + k.vel[1] * dt, k.pos[2]]
+            })
+            .collect();
+        if let Some((p, t)) = self.threat {
+            if o.t - t < 6.0 && !v.iter().any(|q| d2(q, &p) < 30.0) {
+                v.push(p);
+            }
+        }
+        v.sort_by(|a, b| d2(a, &me).partial_cmp(&d2(b, &me)).unwrap_or(std::cmp::Ordering::Equal));
+        v.truncate(8);
+        v
+    }
+
+    /// The quickest spot to reach that every threat's line of sight is blocked from, preferring
+    /// spots away from them.
+    fn find_hide(&mut self, o: &Obs, threats: &[[f32; 3]]) -> [f32; 2] {
+        let me = &o.me;
+        let (cx, cy) = threats.iter().fold((0.0, 0.0), |a, t| (a.0 + t[0], a.1 + t[1]));
+        let n = threats.len().max(1) as f32;
+        let away = norm2(me.pos[0] - cx / n, me.pos[1] - cy / n);
+        let mut best = ([me.pos[0] + away[0] * 40.0, me.pos[1] + away[1] * 40.0], f32::MIN);
+        for ring in [6.0f32, 12.0, 20.0, 30.0, 45.0, 65.0, 90.0] {
+            for k in 0..24 {
+                let a = k as f32 * TAU / 24.0 + ring * 0.01;
+                let c = [me.pos[0] + a.cos() * ring, me.pos[1] + a.sin() * ring];
+                if !self.walkable(c[0], c[1]) {
+                    continue;
+                }
+                let z = self.ground(c[0], c[1], me.pos[2]);
+                let hid = self.hidden_from(c, z, threats);
+                let near = threats.iter().map(|t| d2(&c, t)).fold(f32::MAX, f32::min);
+                let direct = self.straight(&me.pos, &c);
+                let path = if direct { ring } else { ring * 1.6 };
+                let s = hid as f32 * 100.0 + if hid == threats.len() { 300.0 } else { 0.0 } - path * 2.0 - self.zone_penalty(o, &c)
+                    + (a.cos() * away[0] + a.sin() * away[1]) * 15.0
+                    - (40.0 - near).max(0.0) * 3.0;
+                if s > best.1 {
+                    best = (c, s);
+                }
+            }
+        }
+        best.0
+    }
+
     /// How enclosed a spot is: the number of eight directions blocked by buildings within 40 m.
     fn enclosure(&self, c: [f32; 2], z: f32) -> usize {
         (0..8)
@@ -1218,6 +1314,11 @@ impl Brain {
 
         // --- what hurt us
         for e in &o.events {
+            if e.kind == "kill" {
+                if let Some(k) = e.target.and_then(|id| self.known.get(&id)) {
+                    self.kill_spot = Some((k.pos, o.t));
+                }
+            }
             if e.kind == "damaged" {
                 if let Some(by) = e.by {
                     self.last_hurt_t = o.t;
@@ -1426,6 +1527,9 @@ impl Brain {
         if hp_frac < p.retreat_hp && (threat_live || recently_hurt_by_mech) {
             self.fleeing = true;
         }
+        if p.break_los > 0.0 && enemies.len() as f32 >= p.break_los && hp_frac < p.break_los_hp {
+            self.fleeing = true;
+        }
         if hp_frac >= p.reengage_hp {
             self.fleeing = false;
         }
@@ -1533,7 +1637,7 @@ impl Brain {
                 .map(|(id, (k, q))| {
                     let up = q[2] - self.ground(q[0], q[1], q[2]);
                     let extra = if up.abs() < 3.0 || (q[2] - pos[2]).abs() < 3.0 { 0.0 } else { p.roof_cost };
-                    let keep = if self.arm_pick == Some(*id) { 25.0 } else { 0.0 };
+                    let keep = if self.arm_pick == Some(*id) { p.arm_keep } else { 0.0 };
                     (*id, *q, d2(q, &pos) + extra - keep - p.arm_rank * weapon_rank(k, &p) as f32)
                 })
                 .collect();
@@ -1543,6 +1647,23 @@ impl Brain {
         } else {
             self.arm_pick = None;
             None
+        };
+        // Cubes dropped by a kill: the nearest one known around the spot, or the spot itself until we have looked.
+        let collect_goal = match self.kill_spot {
+            Some((ks, kt)) if p.collect > 0.0 && o.t - kt < p.collect_s && hp_frac > p.collect_hp && (enemies.len() as f32) < p.collect_seen => {
+                let c = self
+                    .cubes_mem
+                    .values()
+                    .filter(|q| d2(*q, &ks) < 14.0 && (q[2] - pos[2]).abs() < 6.0)
+                    .min_by(|x, y| d2(*x, &pos).partial_cmp(&d2(*y, &pos)).unwrap_or(std::cmp::Ordering::Equal))
+                    .copied();
+                match c {
+                    Some(c) => Some(c),
+                    None if d2(&ks, &pos) > 6.0 && o.t - kt < 3.0 => Some(ks),
+                    _ => None,
+                }
+            }
+            _ => None,
         };
         let mut boost = false;
         let mut mv: [f32; 2];
@@ -1555,7 +1676,7 @@ impl Brain {
             label = "arm";
             mv = self.go(&pos, [g[0], g[1]]);
             boost = me.energy > 30.0 && d2(&g, &pos) > 12.0;
-            if g[2] - pos[2] > 2.5 || (self.label == "climb" && !me.grounded) {
+            if p.roof > 0.0 && (g[2] - pos[2] > 2.5 || (self.label == "climb" && !me.grounded)) {
                 // Up on a roof: walk to the wall below it, then jump and jet up and over the edge.
                 let hd = d2(&g, &pos);
                 let dir = norm2(g[0] - pos[0], g[1] - pos[1]);
@@ -1569,6 +1690,10 @@ impl Brain {
                     boost = pos[2] < g[2] + 2.0;
                 }
             }
+        } else if let Some(c) = collect_goal {
+            label = "collect";
+            mv = self.go(&pos, [c[0], c[1]]);
+            boost = me.energy > 30.0 && d2(&c, &pos) > 10.0;
         } else if let Some(t) = rush_t {
             label = "rush";
             let dist = d2(&t.pos, &pos);
@@ -1583,6 +1708,38 @@ impl Brain {
             boost = dist > arc_r - 6.0 && me.energy > p.rush_boost;
             if laser_on.is_some() && me.energy > 10.0 {
                 boost = true;
+            }
+        } else if (self.fleeing || (crowded && p.break_crowd > 0.0)) && threat_live && p.retreat_mode > 0.0 {
+            // Break line of sight from everyone we know of, then heal out of sight.
+            label = "break";
+            let all = self.threats_all(o);
+            let expired = self.cover.map_or(true, |(_, until)| o.t > until);
+            let exposed = self.cover.map_or(false, |(c, _)| {
+                let z = self.ground(c[0], c[1], pos[2]);
+                self.hidden_from(c, z, &all) < all.len()
+            });
+            if expired || exposed {
+                let c = self.find_hide(o, &all);
+                self.cover = Some((c, o.t + 1.0));
+            }
+            let c = self.cover.unwrap().0;
+            let dc = d2(&pos, &c);
+            mv = self.go(&pos, c);
+            if dc < 2.0 {
+                mv = [0.0, 0.0];
+            }
+            boost = me.energy > p.retreat_boost_energy && dc > 5.0;
+            if dc > p.break_laser {
+                for (i, w) in me.weapons.iter().enumerate().take(2) {
+                    if w.as_ref().map_or(false, |w| w.kind == "laser" && w.charge <= 0.0) {
+                        a.fire[i] = false;
+                    }
+                }
+            }
+            if shoot_at.is_none() {
+                if let Some(th) = all.first() {
+                    a.aim = [yaw_to(&pos, th), 0.0];
+                }
             }
         } else if let (Some(t), true) = (target, (self.fleeing || crowded) && p.kite > 0.0 && threat_live) {
             // Back away from the nearest enemy while weaving and shooting.
@@ -1630,7 +1787,7 @@ impl Brain {
         } else if self.fleeing {
             // Healing with no known threat: stay near shelter.
             label = "rest";
-            mv = self.idle_move(o, &pos);
+            mv = if p.retreat_mode > 0.0 { [0.0, 0.0] } else { self.idle_move(o, &pos) };
             if shoot_at.is_none() {
                 self.scan(&mut a);
             }
