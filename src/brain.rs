@@ -105,6 +105,8 @@ pub struct Params {
     pub reload_hide: f32,
     /// Step out of sight of a laser charging at us, up to this far (0 = off).
     pub laser_hide: f32,
+    /// Count enemies seen within this many seconds toward "outnumbered" (0 = only those in view now).
+    pub crowd_mem: f32,
 }
 
 impl Default for Params {
@@ -124,7 +126,7 @@ impl Default for Params {
             dodge_after: 9.0,
             evade_weight: 0.8,
             focus_hp: 120.0,
-            kite: 1.0,
+            kite: 0.0,
             finish_hp: 0.3,
             finish_range: 45.0,
             fight_speed: 1.0,
@@ -146,6 +148,7 @@ impl Default for Params {
             cube_grab: 45.0,
             reload_hide: 16.0,
             laser_hide: 8.0,
+            crowd_mem: 6.0,
         }
     }
 }
@@ -191,6 +194,7 @@ impl Params {
         p.cube_grab = g("cube_grab", p.cube_grab);
         p.reload_hide = g("reload_hide", p.reload_hide);
         p.laser_hide = g("laser_hide", p.laser_hide);
+        p.crowd_mem = g("crowd_mem", p.crowd_mem);
         p
     }
 
@@ -789,7 +793,12 @@ impl Brain {
         if finishing {
             self.fleeing = false;
         }
-        let crowded = near_enemies >= p.crowd_count && !finishing;
+        let known_near = if p.crowd_mem > 0.0 {
+            self.known.values().filter(|k| o.t - k.seen_t < p.crowd_mem && d2(&k.pos, &pos) < p.crowd_radius).count().max(near_enemies)
+        } else {
+            near_enemies
+        };
+        let crowded = known_near >= p.crowd_count && !finishing;
         if p.heal_lo > 0.0 && enemies.is_empty() && hp_frac < p.heal_lo && o.t - self.last_mech_hurt_t > 1.0 {
             self.healing = true;
         }
