@@ -174,7 +174,7 @@ pub struct Params {
     pub mortar_take: f32,
     /// Do not start a laser charge (half speed) while running for cover or backing off (0 = off).
     pub flee_nocharge: f32,
-    /// With nothing else to do, healthy and holding a laser or lightning, walk toward the freshest seen or heard
+    /// With nothing else to do, healthy and holding a laser, walk toward the freshest seen or heard
     /// enemy within this distance (0 = off).
     pub hunt: f32,
     /// Hunt only above this HP fraction.
@@ -201,6 +201,10 @@ pub struct Params {
     pub laser_finish: f32,
     /// Seconds of target motion to lead the laser by (the beam leaves on a later tick).
     pub laser_lead: f32,
+    /// Reload once at most this many rounds are left while the laser is charging (0 = only when empty).
+    pub reload_early: f32,
+    /// Step out of sight to reload even when the laser could fire meanwhile (0 = keep the laser on target).
+    pub reload_laser: f32,
 }
 
 impl Default for Params {
@@ -274,8 +278,8 @@ impl Default for Params {
             precharge: 0.0,
             mortar_take: 0.0,
             flee_nocharge: 0.0,
-            hunt: 0.0,
-            hunt_hp: 0.85,
+            hunt: 250.0,
+            hunt_hp: 0.8,
             no_mortar: 0.0,
             laser_seek: 220.0,
             explore: 0.0,
@@ -287,6 +291,8 @@ impl Default for Params {
             mortar_over_arc: 0.0,
             laser_finish: 1.0,
             laser_lead: 0.0,
+            reload_early: 0.0,
+            reload_laser: 1.0,
         }
     }
 }
@@ -377,6 +383,8 @@ impl Params {
         p.mortar_over_arc = g("mortar_over_arc", p.mortar_over_arc);
         p.laser_finish = g("laser_finish", p.laser_finish);
         p.laser_lead = g("laser_lead", p.laser_lead);
+        p.reload_early = g("reload_early", p.reload_early);
+        p.reload_laser = g("reload_laser", p.reload_laser);
         p
     }
 
@@ -1360,7 +1368,10 @@ impl Brain {
         // --- gun housekeeping
         if let Some(Some(g)) = me.weapons.iter().find(|w| w.as_ref().map_or(false, |w| w.kind == "gun")) {
             let mag = g.stat("mag", 12.0);
-            if g.reload <= 0.0 && (g.ammo <= 0.0 || (!engaged && g.ammo < mag * 0.6)) {
+            // With a laser shot on the way, reload a low magazine now so the gun is back when the beam is spent.
+            let laser_busy = me.weapons.iter().flatten().any(|w| w.kind == "laser" && w.charge > 0.0);
+            let early = p.reload_early > 0.0 && laser_busy && g.ammo <= p.reload_early;
+            if g.reload <= 0.0 && (g.ammo <= 0.0 || early || (!engaged && g.ammo < mag * 0.6)) {
                 a.reload = true;
             }
         }
@@ -1652,7 +1663,8 @@ impl Brain {
                 .filter(|k| o.t - k.seen_t < 4.0 && d2(&k.pos, &pos) < 200.0)
                 .map(|k| [k.pos[0], k.pos[1], k.pos[2] + 8.0])
                 .collect();
-            let hide = if p.reload_hide > 0.0 && reloading && !(has_arc && dist < 45.0) && !finishing {
+            let laser_up = has_laser && p.reload_laser <= 0.0 && me.weapons.iter().flatten().any(|w| w.kind == "laser" && w.cooldown < 0.8);
+            let hide = if p.reload_hide > 0.0 && reloading && !(has_arc && dist < 45.0) && !finishing && !laser_up {
                 self.hide_step(&pos, &eyes, p.reload_hide)
             } else {
                 None
@@ -1692,7 +1704,7 @@ impl Brain {
                     self.scan(&mut a);
                 }
             }
-            let armed = me.weapons.iter().flatten().any(|w| w.kind == "laser" || w.kind == "lightning");
+            let armed = me.weapons.iter().flatten().any(|w| w.kind == "laser");
             if label == "idle" && p.hunt > 0.0 && armed && hp_frac > p.hunt_hp && !self.healing && !must_rotate {
                 let seen = self
                     .known
