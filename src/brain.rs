@@ -652,7 +652,7 @@ pub struct Brain {
     pub world: Option<Arc<World>>,
     pub nav: Option<Nav>,
     pub params: Params,
-    rng: u64,
+    rng: (hello.seed ^ 0x5bd1e995a4c7f311) | 1,
     pickup_radius: f32,
     /// Seconds per simulation tick.
     tick_s: f32,
@@ -738,7 +738,7 @@ impl Brain {
             world,
             nav,
             params,
-            rng: (hello.seed ^ 0x9e3779b97f4a7c19) | 1,
+            rng: (hello.seed ^ 0x5bd1e995a4c7f311) | 1,
             pickup_radius: f("loot", "pickup_radius", 4.0),
             tick_s: 1.0 / f("match", "tick_hz", 20.0).max(1.0),
             strafe: 1.0,
