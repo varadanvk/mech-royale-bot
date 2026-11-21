@@ -344,8 +344,8 @@ impl Default for Params {
             precharge: 0.0,
             mortar_take: 0.0,
             flee_nocharge: 0.0,
-            hunt: 0.0,
-            hunt_hp: 0.8,
+            hunt: 250.0,
+            hunt_hp: 0.5,
             no_mortar: 0.0,
             laser_seek: 0.0,
             explore: 0.0,
@@ -388,10 +388,10 @@ impl Default for Params {
             aim_high: 1.0,
             charge_seen: 1.0,
             fight_boost: 0.0,
-            farm_stop: 0.0,
-            hunt_any: 0.0,
+            farm_stop: 40.0,
+            hunt_any: 1.0,
             solo_hp: 0.0,
-            close_boost: 0.0,
+            close_boost: 30.0,
         }
     }
 }
