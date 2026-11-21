@@ -181,6 +181,26 @@ pub struct Params {
     pub hunt_hp: f32,
     /// Never pick up a mortar (keep the slot for a laser or lightning).
     pub no_mortar: f32,
+    /// Without a laser: go for a known laser on the ground within this distance even with both slots full (0 = off).
+    pub laser_seek: f32,
+    /// Without a laser and nothing else to do: walk toward the nearest part of the map not looked at yet (0 = off).
+    pub explore: f32,
+    /// Map cells within this distance of us count as looked at.
+    pub explore_r: f32,
+    /// Also go for weapons on roofs, jumping and jetting up the wall next to them (0 = ground only).
+    pub roof: f32,
+    /// Extra metres a roof pickup counts as when choosing one.
+    pub roof_cost: f32,
+    /// Start a climb only above this energy.
+    pub roof_energy: f32,
+    /// Without a laser: metres of target preference for an enemy holding one (its laser drops when it dies).
+    pub loot_target: f32,
+    /// Rank the mortar above lightning (with `laser_first`: laser, mortar, lightning).
+    pub mortar_over_arc: f32,
+    /// Release a partial laser charge once it is enough to kill the target (0 = off).
+    pub laser_finish: f32,
+    /// Seconds of target motion to lead the laser by (the beam leaves on a later tick).
+    pub laser_lead: f32,
 }
 
 impl Default for Params {
@@ -257,6 +277,16 @@ impl Default for Params {
             hunt: 0.0,
             hunt_hp: 0.85,
             no_mortar: 0.0,
+            laser_seek: 220.0,
+            explore: 0.0,
+            explore_r: 110.0,
+            roof: 1.0,
+            roof_cost: 40.0,
+            roof_energy: 55.0,
+            loot_target: 40.0,
+            mortar_over_arc: 0.0,
+            laser_finish: 1.0,
+            laser_lead: 0.0,
         }
     }
 }
@@ -337,6 +367,16 @@ impl Params {
         p.hunt = g("hunt", p.hunt);
         p.hunt_hp = g("hunt_hp", p.hunt_hp);
         p.no_mortar = g("no_mortar", p.no_mortar);
+        p.laser_seek = g("laser_seek", p.laser_seek);
+        p.explore = g("explore", p.explore);
+        p.explore_r = g("explore_r", p.explore_r);
+        p.roof = g("roof", p.roof);
+        p.roof_cost = g("roof_cost", p.roof_cost);
+        p.roof_energy = g("roof_energy", p.roof_energy);
+        p.loot_target = g("loot_target", p.loot_target);
+        p.mortar_over_arc = g("mortar_over_arc", p.mortar_over_arc);
+        p.laser_finish = g("laser_finish", p.laser_finish);
+        p.laser_lead = g("laser_lead", p.laser_lead);
         p
     }
 
@@ -366,10 +406,11 @@ const UPGRADES: &[&str] = &[
 
 fn weapon_rank(kind: &str, p: &Params) -> i32 {
     let laser_first = p.laser_first > 0.0;
+    let mortar_second = p.mortar_over_arc > 0.0;
     match kind {
-        "lightning" => 3 - laser_first as i32,
+        "lightning" => 3 - laser_first as i32 - mortar_second as i32,
         "laser" => 2 + laser_first as i32,
-        "mortar" => (p.no_mortar <= 0.0) as i32,
+        "mortar" => (p.no_mortar <= 0.0) as i32 * (1 + mortar_second as i32),
         _ => 0,
     }
 }
@@ -519,6 +560,10 @@ pub struct Brain {
     rushing: Option<u32>,
     /// When our laser charge became full (None while not full).
     laser_full_t: Option<f32>,
+    /// Coarse map cells we have been near (for weapon search): flag per cell.
+    looked: Vec<bool>,
+    /// Weapon pickup we are walking to.
+    arm_pick: Option<u32>,
 }
 
 impl Brain {
@@ -590,6 +635,8 @@ impl Brain {
             label: "",
             rushing: None,
             laser_full_t: None,
+            looked: Vec::new(),
+            arm_pick: None,
         }
     }
 
@@ -674,7 +721,13 @@ impl Brain {
         if let Some((i, w, s)) = find("laser") {
             if s.ok {
                 engaged = true;
-                let full = w.charge >= w.stat("charge", 0.75) - 0.01;
+                let full_c = w.stat("charge", 0.75);
+                let mut full = w.charge >= full_c - 0.01;
+                if !full && p.laser_finish > 0.0 && t.max_hp > 0.0 && w.charge >= w.stat("min_charge", 0.15) {
+                    let frac = w.stat("min_frac", 0.35);
+                    let dmg = w.stat("damage", 315.0) * (frac + (1.0 - frac) * (w.charge / full_c).min(1.0)) * (1.0 + 0.04 * me.cubes.min(10.0));
+                    full = t.hp < dmg * 0.95;
+                }
                 if full {
                     // Aim for the beam, pulled toward the gun's lead as far as the beam still hits.
                     let mut la = s.aim;
@@ -722,6 +775,65 @@ impl Brain {
             a.aim = x;
         }
         engaged
+    }
+
+    const LOOK_CELL: f32 = 40.0;
+
+    fn look_dims(&self) -> Option<(f32, f32, usize, usize)> {
+        let w = self.world.as_ref()?;
+        let nx = (((w.max_x - w.min_x) / Self::LOOK_CELL).ceil() as usize).max(1);
+        let ny = (((w.max_y - w.min_y) / Self::LOOK_CELL).ceil() as usize).max(1);
+        Some((w.min_x, w.min_y, nx, ny))
+    }
+
+    /// Mark the map cells around us as looked at.
+    fn mark_looked(&mut self, pos: &[f32; 3]) {
+        let Some((x0, y0, nx, ny)) = self.look_dims() else { return };
+        if self.looked.len() != nx * ny {
+            self.looked = vec![false; nx * ny];
+        }
+        let r = self.params.explore_r;
+        let c = Self::LOOK_CELL;
+        let (ix0, ix1) = (((pos[0] - r - x0) / c).floor().max(0.0) as usize, (((pos[0] + r - x0) / c).floor().max(0.0) as usize).min(nx - 1));
+        let (iy0, iy1) = (((pos[1] - r - y0) / c).floor().max(0.0) as usize, (((pos[1] + r - y0) / c).floor().max(0.0) as usize).min(ny - 1));
+        for iy in iy0..=iy1 {
+            for ix in ix0..=ix1 {
+                let cx = x0 + (ix as f32 + 0.5) * c;
+                let cy = y0 + (iy as f32 + 0.5) * c;
+                if (cx - pos[0]).hypot(cy - pos[1]) < r {
+                    self.looked[iy * nx + ix] = true;
+                }
+            }
+        }
+    }
+
+    /// Nearest walkable cell centre not looked at yet, inside the zone (and the next circle once it matters).
+    fn unexplored(&self, o: &Obs, pos: &[f32; 3]) -> Option<[f32; 2]> {
+        let (x0, y0, nx, ny) = self.look_dims()?;
+        if self.looked.len() != nx * ny {
+            return None;
+        }
+        let z = &o.zone;
+        let c = Self::LOOK_CELL;
+        let mut best: Option<([f32; 2], f32)> = None;
+        for iy in 0..ny {
+            for ix in 0..nx {
+                if self.looked[iy * nx + ix] {
+                    continue;
+                }
+                let q = [x0 + (ix as f32 + 0.5) * c, y0 + (iy as f32 + 0.5) * c];
+                let inz = (q[0] - z.center[0]).hypot(q[1] - z.center[1]) < z.radius - 20.0
+                    && (o.t < z.shrink_start - 30.0 || (q[0] - z.next_center[0]).hypot(q[1] - z.next_center[1]) < z.next_radius - 10.0);
+                if !inz || !self.walkable(q[0], q[1]) {
+                    continue;
+                }
+                let d = (q[0] - pos[0]).hypot(q[1] - pos[1]);
+                if best.map_or(true, |b| d < b.1) {
+                    best = Some((q, d));
+                }
+            }
+        }
+        best.map(|b| b.0)
     }
 
     /// Aim solution for one weapon against a target, from our current position.
@@ -776,7 +888,9 @@ impl Brain {
             }
             "laser" => {
                 let ok = dist < w.stat("range", 280.0) && self.clear(muzzle, tc);
-                Shot { aim: flat(&tc, &muzzle), tol: [body[0] * 0.8, body[1] * 0.8], ok }
+                let ll = self.params.laser_lead;
+                let lc = [tc[0] + t.vel[0] * ll, tc[1] + t.vel[1] * ll, tc[2] + t.vel[2] * ll];
+                Shot { aim: flat(&lc, &muzzle), tol: [body[0] * 0.8, body[1] * 0.8], ok }
             }
             "lightning" => {
                 let cone = w.stat("cone_deg", 30.0).to_radians() * 0.5;
@@ -1124,11 +1238,13 @@ impl Brain {
         // --- enemies and target
         let enemies: Vec<&Actor> = o.mechs.iter().filter(|m| m.kind == "mech" && !(m.max_hp > 0.0 && m.hp <= 0.0)).collect();
         let near_enemies = enemies.iter().filter(|m| d2(&m.pos, &pos) < p.crowd_radius).count();
+        let no_laser = !me.weapons.iter().flatten().any(|w| w.kind == "laser");
         let score = |m: &Actor| {
             let d = d2(&m.pos, &pos);
             let hpf = if m.max_hp > 0.0 { m.hp / m.max_hp } else { 1.0 };
             let attacker = self.attackers.get(&m.id).map_or(false, |t| o.t - t < 4.0);
-            d + hpf * p.focus_hp - if attacker { 40.0 } else { 0.0 }
+            let loot = if no_laser && m.weapons.iter().any(|w| w == "laser") { p.loot_target } else { 0.0 };
+            d + hpf * p.focus_hp - if attacker { 40.0 } else { 0.0 } - loot
         };
         let best = enemies
             .iter()
@@ -1362,6 +1478,9 @@ impl Brain {
         } else {
             None
         };
+        if p.explore > 0.0 {
+            self.mark_looked(&pos);
+        }
         // Lightning rush: a target close enough and few others around, close in and burn it down.
         let arc_w = me.weapons.iter().flatten().find(|w| w.kind == "lightning");
         let rush_t = match (target, arc_w) {
@@ -1387,18 +1506,31 @@ impl Brain {
         }
         // An empty slot: the nearest good weapon on the ground comes first.
         let worst_rank = worst_slot.map_or(0, |(_, r)| r);
-        let arm_goal = if p.arm > 0.0 && (empty_slot || p.arm_better > 0.0) && hp_frac > p.arm_hp {
+        let arm_goal = if p.arm > 0.0 && (empty_slot || p.arm_better > 0.0 || p.laser_seek > 0.0) && hp_frac > p.arm_hp {
             let reach = if empty_slot { p.arm_reach } else { p.arm_better };
-            self.picks_mem
-                .values()
-                .filter(|(k, q)| {
+            let cands: Vec<(u32, [f32; 3], f32)> = self
+                .picks_mem
+                .iter()
+                .filter(|(_, (k, q))| {
                     let r = weapon_rank(k, &p);
-                    r > 0 && (empty_slot || r > worst_rank) && !held.contains(&k.as_str()) && d2(q, &pos) < reach && (q[2] - self.ground(q[0], q[1], q[2])).abs() < 3.0
+                    let d = d2(q, &pos);
+                    let laser = k == "laser" && p.laser_seek > 0.0 && d < p.laser_seek;
+                    let up = q[2] - self.ground(q[0], q[1], q[2]);
+                    let reachable = up.abs() < 3.0 || (p.roof > 0.0 && up < 22.0);
+                    r > 0 && (laser || ((empty_slot || r > worst_rank) && d < reach)) && !held.contains(&k.as_str()) && reachable
                 })
-                .map(|(k, q)| (*q, d2(q, &pos) - p.arm_rank * weapon_rank(k, &p) as f32))
-                .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|x| x.0)
+                .map(|(id, (k, q))| {
+                    let up = q[2] - self.ground(q[0], q[1], q[2]);
+                    let extra = if up.abs() < 3.0 || (q[2] - pos[2]).abs() < 3.0 { 0.0 } else { p.roof_cost };
+                    let keep = if self.arm_pick == Some(*id) { 25.0 } else { 0.0 };
+                    (*id, *q, d2(q, &pos) + extra - keep - p.arm_rank * weapon_rank(k, &p) as f32)
+                })
+                .collect();
+            let best = cands.iter().min_by(|x, y| x.2.partial_cmp(&y.2).unwrap_or(std::cmp::Ordering::Equal).then(x.0.cmp(&y.0)));
+            self.arm_pick = best.map(|b| b.0);
+            best.map(|b| b.1)
         } else {
+            self.arm_pick = None;
             None
         };
         let mut boost = false;
@@ -1412,6 +1544,20 @@ impl Brain {
             label = "arm";
             mv = self.go(&pos, [g[0], g[1]]);
             boost = me.energy > 30.0 && d2(&g, &pos) > 12.0;
+            if g[2] - pos[2] > 2.5 || (self.label == "climb" && !me.grounded) {
+                // Up on a roof: walk to the wall below it, then jump and jet up and over the edge.
+                let hd = d2(&g, &pos);
+                let dir = norm2(g[0] - pos[0], g[1] - pos[1]);
+                let at_wall = !self.walkable(pos[0] + dir[0] * 4.0, pos[1] + dir[1] * 4.0) || hd < 4.0;
+                let climbing = !me.grounded && self.label == "climb";
+                boost = me.energy > 70.0 && hd > 20.0;
+                if climbing || (hd < 30.0 && at_wall && me.energy > p.roof_energy) {
+                    label = "climb";
+                    mv = dir;
+                    a.jump = me.grounded;
+                    boost = pos[2] < g[2] + 2.0;
+                }
+            }
         } else if let Some(t) = rush_t {
             label = "rush";
             let dist = d2(&t.pos, &pos);
@@ -1539,6 +1685,13 @@ impl Brain {
             mv = self.go(&pos, goal);
         } else {
             mv = self.quiet(o, &mut a, &pos, hp_frac, must_rotate, out_next, zone_goal, &threats, &mut label);
+            if label == "idle" && p.explore > 0.0 && !held.contains(&"laser") && hp_frac > p.arm_hp && !self.healing && !must_rotate {
+                if let Some(g) = self.unexplored(o, &pos) {
+                    label = "seek";
+                    mv = self.go(&pos, g);
+                    self.scan(&mut a);
+                }
+            }
             let armed = me.weapons.iter().flatten().any(|w| w.kind == "laser" || w.kind == "lightning");
             if label == "idle" && p.hunt > 0.0 && armed && hp_frac > p.hunt_hp && !self.healing && !must_rotate {
                 let seen = self
@@ -1580,7 +1733,7 @@ impl Brain {
             }
         }
         // Outside a fight, still weave across the line of the nearest shooter.
-        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "fight" || label == "rush" || label == "drone" || label == "reload") {
+        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "fight" || label == "rush" || label == "climb" || label == "drone" || label == "reload") {
             if o.t >= self.strafe_until {
                 self.next_strafe(o.t);
             }
@@ -1620,7 +1773,7 @@ impl Brain {
             eprintln!("DL t {:.0} used {:.2} info {:.1} err {:?}", o.t, self.delay_used, self.delay_info, self.delay_err);
         }
         if std::env::var("TTRACE").is_ok() && o.tick % 20 == 0 {
-            eprintln!("TR {:.0} {} hp {:.0} cubes {} seen_cubes {} mem_cubes {} enemies {} heal {} flee {}", o.t, label, me.hp, me.cubes, o.cubes.len(), self.cubes_mem.len(), enemies.len(), self.healing, self.fleeing);
+            eprintln!("TR {:.1} {} hp {:.0} cubes {} enemies {} near {} e {:.0} w {}", o.t, label, me.hp, me.cubes, enemies.len(), near_enemies, me.energy, held.join("+"));
         }
         self.last_pos = raw;
         a.mv = if mv.iter().all(|v| v.is_finite()) { mv } else { [0.0, 0.0] };
