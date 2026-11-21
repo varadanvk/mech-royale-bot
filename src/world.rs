@@ -341,7 +341,7 @@ impl World {
         })
     }
 
-    /// Sight line as the game's viewer computes it: no building, terrain or trunk in the way, and
+    /// Sight line: no building, terrain or trunk in the way, and
     /// enough light left after the crowns (`canopyBlockT`).
     pub fn sees(&self, a: [f32; 3], b: [f32; 3]) -> bool {
         self.clear(a, b) && !self.trunk_between(a, b) && self.canopy_transmittance(a, b) >= self.canopy_block_t
