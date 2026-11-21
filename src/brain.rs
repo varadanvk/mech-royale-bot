@@ -414,9 +414,9 @@ impl Default for Params {
             sweep_window: 0.5,
             scan_fast: 1.0,
             scan_stale: 2.0,
-            aware_flee: 1.0,
-            face_rear: 15.0,
-            sound_look: 3.0,
+            aware_flee: 0.0,
+            face_rear: 0.0,
+            sound_look: 0.0,
         }
     }
 }
