@@ -263,6 +263,14 @@ pub struct Params {
     pub charge_seen: f32,
     /// Boost while moving in a fight whenever energy is above this (0 = off).
     pub fight_boost: f32,
+    /// From this match time on, no detours for weapons, cubes, drones or crates (0 = never stop).
+    pub farm_stop: f32,
+    /// Hunt also without a laser.
+    pub hunt_any: f32,
+    /// With at most one enemy within `crowd_radius`, retreat only below this HP fraction (0 = use `retreat_hp`).
+    pub solo_hp: f32,
+    /// Boost toward the target in a fight while further than the preferred distance by 15 m and energy is above this (0 = off).
+    pub close_boost: f32,
 }
 
 impl Default for Params {
@@ -380,6 +388,10 @@ impl Default for Params {
             aim_high: 1.0,
             charge_seen: 1.0,
             fight_boost: 0.0,
+            farm_stop: 0.0,
+            hunt_any: 0.0,
+            solo_hp: 0.0,
+            close_boost: 0.0,
         }
     }
 }
@@ -501,6 +513,10 @@ impl Params {
         p.aim_high = g("aim_high", p.aim_high);
         p.charge_seen = g("charge_seen", p.charge_seen);
         p.fight_boost = g("fight_boost", p.fight_boost);
+        p.farm_stop = g("farm_stop", p.farm_stop);
+        p.hunt_any = g("hunt_any", p.hunt_any);
+        p.solo_hp = g("solo_hp", p.solo_hp);
+        p.close_boost = g("close_boost", p.close_boost);
         p
     }
 
@@ -1544,7 +1560,8 @@ impl Brain {
             .copied();
         let early = o.t < p.farm_until;
         let drone_reach = if early { p.drone_range.max(p.farm_reach.min(120.0)) } else { p.drone_range };
-        let farm_drone = if calm && hp_frac > p.farm_hp && !self.healing {
+        let farm_on = p.farm_stop <= 0.0 || o.t < p.farm_stop;
+        let farm_drone = if calm && farm_on && hp_frac > p.farm_hp && !self.healing {
             drones
                 .iter()
                 .filter(|d| d2(&d.pos, &pos) < drone_reach)
@@ -1685,7 +1702,8 @@ impl Brain {
         // --- mode
         let threat_live = !threats.is_empty();
         let recently_hurt_by_mech = o.t - self.last_mech_hurt_t < 6.0;
-        if hp_frac < p.retreat_hp && (threat_live || recently_hurt_by_mech) {
+        let flee_hp = if p.solo_hp > 0.0 && near_enemies <= 1 { p.solo_hp } else { p.retreat_hp };
+        if hp_frac < flee_hp && (threat_live || recently_hurt_by_mech) {
             self.fleeing = true;
         }
         if p.break_los > 0.0 && enemies.len() as f32 >= p.break_los && hp_frac < p.break_los_hp {
@@ -1782,7 +1800,7 @@ impl Brain {
         }
         // An empty slot: the nearest good weapon on the ground comes first.
         let worst_rank = worst_slot.map_or(0, |(_, r)| r);
-        let arm_goal = if p.arm > 0.0 && (empty_slot || p.arm_better > 0.0 || p.laser_seek > 0.0) && hp_frac > p.arm_hp {
+        let arm_goal = if p.arm > 0.0 && farm_on && (empty_slot || p.arm_better > 0.0 || p.laser_seek > 0.0) && hp_frac > p.arm_hp {
             let reach = if empty_slot { p.arm_reach } else { p.arm_better };
             let cands: Vec<(u32, [f32; 3], f32)> = self
                 .picks_mem
@@ -2126,6 +2144,9 @@ impl Brain {
             if p.fight_boost > 0.0 && me.energy > p.fight_boost {
                 boost = true;
             }
+            if p.close_boost > 0.0 && off > 15.0 && me.energy > p.close_boost && label == "fight" {
+                boost = true;
+            }
         } else if let Some(d) = drone_target {
             label = "drone";
             let dist = d2(&d.pos, &pos);
@@ -2147,7 +2168,7 @@ impl Brain {
                     self.scan(&mut a);
                 }
             }
-            let armed = me.weapons.iter().flatten().any(|w| w.kind == "laser");
+            let armed = p.hunt_any > 0.0 || me.weapons.iter().flatten().any(|w| w.kind == "laser");
             if label == "idle" && p.hunt > 0.0 && armed && hp_frac > p.hunt_hp && !self.healing && !must_rotate {
                 let seen = self
                     .known
@@ -2491,12 +2512,13 @@ impl Brain {
         let worst = me.weapons.iter().take(2).flatten().map(|w| weapon_rank(&w.kind, &p)).filter(|r| *r > 0).min().unwrap_or(0);
         let early = o.t < p.farm_until;
         let reach = if early { p.farm_reach.max(100.0) } else { 100.0 };
+        let reach = if p.farm_stop > 0.0 && o.t >= p.farm_stop { 0.0 } else { reach };
         let picks: Vec<(String, [f32; 3])> = self.picks_mem.values().cloned().collect();
         for (kind, q) in &picks {
             let r = weapon_rank(kind, &p);
             if r > 0 && !held.contains(&kind.as_str()) && (empty_slot || r > worst) {
                 let v = if empty_slot && early { 120.0 + 30.0 * r as f32 } else { 60.0 + 30.0 * r as f32 };
-                consider(&mut goal, q, v, reach.max(140.0), on_ground(self, q));
+                consider(&mut goal, q, v, if reach > 0.0 { reach.max(140.0) } else { 0.0 }, on_ground(self, q));
             }
         }
         let cubes: Vec<[f32; 3]> = self.cubes_mem.values().copied().collect();
