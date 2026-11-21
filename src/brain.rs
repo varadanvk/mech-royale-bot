@@ -159,6 +159,28 @@ pub struct Params {
     pub arm_rank: f32,
     /// Holding a weaker second weapon: go for a better one within this distance (0 = off).
     pub arm_better: f32,
+    /// Upgrade order: 0 = survival first, 1 = damage first.
+    pub upg_dmg: f32,
+    /// Holding lightning: outside a rush, the zone or getting unstuck, boost only above this energy (0 = no limit).
+    pub arc_save: f32,
+    /// Preferred fight distance while holding a laser (0 = `gun_range`).
+    pub laser_range: f32,
+    /// Holding a laser or lightning: swap the gun for the other of the two (0 = keep the gun).
+    pub drop_gun: f32,
+    /// Charge the laser ahead of time when an enemy seen within the last 2 s is within this distance
+    /// but not in view (0 = off).
+    pub precharge: f32,
+    /// Let the mortar take the aim whenever it is ready and the target is beyond this distance (0 = only when the gun cannot fire).
+    pub mortar_take: f32,
+    /// Do not start a laser charge (half speed) while running for cover or backing off (0 = off).
+    pub flee_nocharge: f32,
+    /// With nothing else to do, healthy and holding a laser or lightning, walk toward the freshest seen or heard
+    /// enemy within this distance (0 = off).
+    pub hunt: f32,
+    /// Hunt only above this HP fraction.
+    pub hunt_hp: f32,
+    /// Never pick up a mortar (keep the slot for a laser or lightning).
+    pub no_mortar: f32,
 }
 
 impl Default for Params {
@@ -225,6 +247,16 @@ impl Default for Params {
             arm_hp: 0.35,
             arm_rank: 25.0,
             arm_better: 60.0,
+            upg_dmg: 1.0,
+            arc_save: 0.0,
+            laser_range: 0.0,
+            drop_gun: 0.0,
+            precharge: 0.0,
+            mortar_take: 0.0,
+            flee_nocharge: 0.0,
+            hunt: 0.0,
+            hunt_hp: 0.85,
+            no_mortar: 0.0,
         }
     }
 }
@@ -295,6 +327,16 @@ impl Params {
         p.arm_hp = g("arm_hp", p.arm_hp);
         p.arm_rank = g("arm_rank", p.arm_rank);
         p.arm_better = g("arm_better", p.arm_better);
+        p.upg_dmg = g("upg_dmg", p.upg_dmg);
+        p.arc_save = g("arc_save", p.arc_save);
+        p.laser_range = g("laser_range", p.laser_range);
+        p.drop_gun = g("drop_gun", p.drop_gun);
+        p.precharge = g("precharge", p.precharge);
+        p.mortar_take = g("mortar_take", p.mortar_take);
+        p.flee_nocharge = g("flee_nocharge", p.flee_nocharge);
+        p.hunt = g("hunt", p.hunt);
+        p.hunt_hp = g("hunt_hp", p.hunt_hp);
+        p.no_mortar = g("no_mortar", p.no_mortar);
         p
     }
 
@@ -308,6 +350,13 @@ impl Params {
     }
 }
 
+/// Upgrade preference with damage first.
+const UPGRADES_DMG: &[&str] = &[
+    "laser_damage", "gun_mag", "laser_charge", "plating", "gun_damage", "armor", "lightning_efficiency", "gun_rate",
+    "nanites", "lightning_chain", "servos", "reactor", "capacitor", "gyros", "lightning_range", "jets",
+    "gun_velocity", "mortar_reload", "mortar_splash", "sensors", "mortar_velocity", "laser_pierce",
+];
+
 /// Upgrade preference, best first. Survival first: placement is the score.
 const UPGRADES: &[&str] = &[
     "plating", "armor", "nanites", "gun_damage", "lightning_efficiency", "servos", "gun_rate", "laser_damage",
@@ -315,11 +364,12 @@ const UPGRADES: &[&str] = &[
     "gun_velocity", "mortar_reload", "mortar_splash", "sensors", "mortar_velocity", "laser_pierce",
 ];
 
-fn weapon_rank(kind: &str, laser_first: bool) -> i32 {
+fn weapon_rank(kind: &str, p: &Params) -> i32 {
+    let laser_first = p.laser_first > 0.0;
     match kind {
         "lightning" => 3 - laser_first as i32,
         "laser" => 2 + laser_first as i32,
-        "mortar" => 1,
+        "mortar" => (p.no_mortar <= 0.0) as i32,
         _ => 0,
     }
 }
@@ -467,6 +517,8 @@ pub struct Brain {
     pub label: &'static str,
     /// Target of the lightning rush in progress.
     rushing: Option<u32>,
+    /// When our laser charge became full (None while not full).
+    laser_full_t: Option<f32>,
 }
 
 impl Brain {
@@ -537,6 +589,7 @@ impl Brain {
             delay_used: 0.0,
             label: "",
             rushing: None,
+            laser_full_t: None,
         }
     }
 
@@ -657,7 +710,8 @@ impl Brain {
         if let Some((i, w, s)) = find("mortar") {
             if s.ok {
                 engaged = true;
-                if aim.is_none() {
+                let far = p.mortar_take > 0.0 && d2(&t.pos, &me.pos) > p.mortar_take && w.cooldown <= 0.1;
+                if aim.is_none() || far {
                     aim = Some(s.aim);
                 }
                 a.fire[*i] = lined(s, [0.0, 0.0]) && w.cooldown <= 0.12;
@@ -1062,7 +1116,8 @@ impl Brain {
 
         // --- upgrades
         if let Some(offer) = &o.offer {
-            let rank = |id: &str| UPGRADES.iter().position(|u| *u == id).unwrap_or(UPGRADES.len());
+            let list = if p.upg_dmg > 0.0 { UPGRADES_DMG } else { UPGRADES };
+            let rank = |id: &str| list.iter().position(|u| *u == id).unwrap_or(list.len());
             a.pick = offer.choices.iter().enumerate().min_by_key(|(_, c)| rank(&c.id)).map(|(i, _)| i as u32);
         }
 
@@ -1169,6 +1224,23 @@ impl Brain {
             }
         }
 
+        // --- laser: track how long a full charge has been held; charge ahead for an enemy about to show
+        if let Some((li, lw)) = me.weapons.iter().enumerate().take(2).find_map(|(i, w)| w.as_ref().filter(|w| w.kind == "laser").map(|w| (i, w))) {
+            let full = lw.charge >= lw.stat("charge", 0.75) - 0.01;
+            if !full {
+                self.laser_full_t = None;
+            } else if self.laser_full_t.is_none() {
+                self.laser_full_t = Some(o.t);
+            }
+            let held_full = self.laser_full_t.map_or(0.0, |t0| o.t - t0);
+            let soon = p.precharge > 0.0
+                && !engaged
+                && lw.cooldown <= 0.0
+                && self.known.iter().any(|(id, k)| o.t - k.seen_t < 2.0 && d2(&k.pos, &pos) < p.precharge && !enemies.iter().any(|m| m.id == *id));
+            if soon && held_full < lw.stat("hold_s", 2.0) - 0.4 {
+                a.fire[li] = true;
+            }
+        }
         // --- gun housekeeping
         if let Some(Some(g)) = me.weapons.iter().find(|w| w.as_ref().map_or(false, |w| w.kind == "gun")) {
             let mag = g.stat("mag", 12.0);
@@ -1180,14 +1252,20 @@ impl Brain {
         // --- loot within reach
         let held: Vec<&str> = me.weapons.iter().flatten().map(|w| w.kind.as_str()).collect();
         let empty_slot = me.weapons.len() < 2 || me.weapons.iter().take(2).any(|w| w.is_none());
-        let worst_slot = me.weapons.iter().enumerate().take(2).filter_map(|(i, w)| w.as_ref().map(|w| (i, weapon_rank(&w.kind, p.laser_first > 0.0)))).filter(|(_, r)| *r > 0).min_by_key(|(_, r)| *r);
+        let worst_slot = me.weapons.iter().enumerate().take(2).filter_map(|(i, w)| w.as_ref().map(|w| (i, weapon_rank(&w.kind, &p)))).filter(|(_, r)| *r > 0).min_by_key(|(_, r)| *r);
+        // Optionally the gun is the slot to give up once the other slot holds a laser or lightning.
+        let gun_i = me.weapons.iter().take(2).position(|w| w.as_ref().map_or(false, |w| w.kind == "gun"));
+        let worst_slot = match (gun_i, worst_slot) {
+            (Some(gi), Some((_, r))) if p.drop_gun > 0.0 && !empty_slot && r >= 2 => Some((gi, 1)),
+            _ => worst_slot,
+        };
         let wanted = |kind: &str| -> Option<Option<u32>> {
-            if held.contains(&kind) || weapon_rank(kind, p.laser_first > 0.0) == 0 {
+            if held.contains(&kind) || weapon_rank(kind, &p) == 0 {
                 None
             } else if empty_slot {
                 Some(None)
             } else {
-                worst_slot.filter(|(_, r)| weapon_rank(kind, p.laser_first > 0.0) > *r).map(|(i, _)| Some(i as u32))
+                worst_slot.filter(|(_, r)| weapon_rank(kind, &p) > *r).map(|(i, _)| Some(i as u32))
             }
         };
         for pk in &o.pickups {
@@ -1310,15 +1388,14 @@ impl Brain {
         // An empty slot: the nearest good weapon on the ground comes first.
         let worst_rank = worst_slot.map_or(0, |(_, r)| r);
         let arm_goal = if p.arm > 0.0 && (empty_slot || p.arm_better > 0.0) && hp_frac > p.arm_hp {
-            let lf = p.laser_first > 0.0;
             let reach = if empty_slot { p.arm_reach } else { p.arm_better };
             self.picks_mem
                 .values()
                 .filter(|(k, q)| {
-                    let r = weapon_rank(k, lf);
+                    let r = weapon_rank(k, &p);
                     r > 0 && (empty_slot || r > worst_rank) && !held.contains(&k.as_str()) && d2(q, &pos) < reach && (q[2] - self.ground(q[0], q[1], q[2])).abs() < 3.0
                 })
-                .map(|(k, q)| (*q, d2(q, &pos) - p.arm_rank * weapon_rank(k, lf) as f32))
+                .map(|(k, q)| (*q, d2(q, &pos) - p.arm_rank * weapon_rank(k, &p) as f32))
                 .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|x| x.0)
         } else {
@@ -1405,12 +1482,15 @@ impl Brain {
             let dist = d2(&t.pos, &pos);
             let has_arc = me.weapons.iter().flatten().any(|w| w.kind == "lightning") && me.energy > p.arc_energy;
             let they_arc = t.weapons.iter().any(|w| w == "lightning");
+            let has_laser = me.weapons.iter().flatten().any(|w| w.kind == "laser");
             let pref = if finishing {
                 p.finish_range
             } else if has_arc && hp_frac > p.arc_min_hp && near_enemies as f32 <= p.arc_crowd {
                 p.arc_range
             } else if they_arc {
-                p.gun_range.max(60.0)
+                p.gun_range.max(60.0).max(p.laser_range * has_laser as i32 as f32)
+            } else if has_laser && p.laser_range > 0.0 {
+                p.laser_range
             } else {
                 p.gun_range
             };
@@ -1459,6 +1539,35 @@ impl Brain {
             mv = self.go(&pos, goal);
         } else {
             mv = self.quiet(o, &mut a, &pos, hp_frac, must_rotate, out_next, zone_goal, &threats, &mut label);
+            let armed = me.weapons.iter().flatten().any(|w| w.kind == "laser" || w.kind == "lightning");
+            if label == "idle" && p.hunt > 0.0 && armed && hp_frac > p.hunt_hp && !self.healing && !must_rotate {
+                let seen = self
+                    .known
+                    .values()
+                    .filter(|k| d2(&k.pos, &pos) < p.hunt)
+                    .max_by(|x, y| x.seen_t.partial_cmp(&y.seen_t).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|k| k.pos);
+                let heard = o
+                    .sounds
+                    .iter()
+                    .filter(|sd| matches!(sd.kind.as_str(), "gun" | "laser" | "lightning" | "mortar" | "step" | "boost"))
+                    .min_by(|x, y| x.age.partial_cmp(&y.age).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|sd| {
+                        let r = match sd.dist.as_str() {
+                            "near" => 40.0,
+                            "mid" => 90.0,
+                            _ => 150.0,
+                        };
+                        [pos[0] + sd.bearing.cos() * r, pos[1] + sd.bearing.sin() * r, pos[2]]
+                    });
+                if let Some(g) = seen.or(heard) {
+                    let inz = d2(&g, &z.center) < z.radius - 10.0;
+                    if inz {
+                        label = "hunt";
+                        mv = self.go(&pos, [g[0], g[1]]);
+                    }
+                }
+            }
         }
 
         // A laser about to fire at us: duck out of its line if a step away does it.
@@ -1515,6 +1624,16 @@ impl Brain {
         }
         self.last_pos = raw;
         a.mv = if mv.iter().all(|v| v.is_finite()) { mv } else { [0.0, 0.0] };
+        if p.flee_nocharge > 0.0 && matches!(label, "kite" | "kitec" | "heal" | "crowd") {
+            for (i, w) in me.weapons.iter().enumerate().take(2) {
+                if w.as_ref().map_or(false, |w| w.kind == "laser" && w.charge <= 0.0) {
+                    a.fire[i] = false;
+                }
+            }
+        }
+        if p.arc_save > 0.0 && arc_w.is_some() && me.energy < p.arc_save && !(label == "rush" || label == "zone" || o.t < self.unstick_until) {
+            boost = false;
+        }
         a.boost = boost;
         if !a.aim.iter().all(|v| v.is_finite()) {
             a.aim = me.aim;
@@ -1702,12 +1821,12 @@ impl Brain {
         };
         let held: Vec<&str> = me.weapons.iter().flatten().map(|w| w.kind.as_str()).collect();
         let empty_slot = me.weapons.len() < 2 || me.weapons.iter().take(2).any(|w| w.is_none());
-        let worst = me.weapons.iter().take(2).flatten().map(|w| weapon_rank(&w.kind, p.laser_first > 0.0)).filter(|r| *r > 0).min().unwrap_or(0);
+        let worst = me.weapons.iter().take(2).flatten().map(|w| weapon_rank(&w.kind, &p)).filter(|r| *r > 0).min().unwrap_or(0);
         let early = o.t < p.farm_until;
         let reach = if early { p.farm_reach.max(100.0) } else { 100.0 };
         let picks: Vec<(String, [f32; 3])> = self.picks_mem.values().cloned().collect();
         for (kind, q) in &picks {
-            let r = weapon_rank(kind, p.laser_first > 0.0);
+            let r = weapon_rank(kind, &p);
             if r > 0 && !held.contains(&kind.as_str()) && (empty_slot || r > worst) {
                 let v = if empty_slot && early { 120.0 + 30.0 * r as f32 } else { 60.0 + 30.0 * r as f32 };
                 consider(&mut goal, q, v, reach.max(140.0), on_ground(self, q));
