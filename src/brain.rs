@@ -266,14 +266,14 @@ pub struct Params {
 impl Default for Params {
     fn default() -> Self {
         Params {
-            retreat_hp: 0.55,
+            retreat_hp: 0.0,
             reengage_hp: 0.92,
             gun_range: 40.0,
             gun_band: 10.0,
             arc_range: 30.0,
             arc_min_hp: 0.6,
             crowd_radius: 150.0,
-            crowd_count: 2,
+            crowd_count: 99,
             open_fire_range: 200.0,
             strafe_min: 0.3,
             strafe_max: 0.6,
