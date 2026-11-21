@@ -532,11 +532,13 @@ fn adjust(p: &mut Params, o: &[f32; NO]) {
             *v = (*v + o * scale).clamp(lo, hi);
         }
     }
-    m(&mut p.retreat_hp, o[0], 0.3, 0.05, 0.95);
-    m(&mut p.reengage_hp, o[1], 0.15, 0.3, 1.0);
-    m(&mut p.gun_range, o[2], 40.0, 15.0, 150.0);
+    // Backing off is only allowed to get less frequent than the base rules: retreat later, re-engage
+    // sooner, fight closer, count fewer enemies as a crowd, kite and hide-to-heal less.
+    m(&mut p.retreat_hp, o[0].min(0.0), 0.3, 0.05, 0.95);
+    m(&mut p.reengage_hp, o[1].min(0.0), 0.15, 0.3, 1.0);
+    m(&mut p.gun_range, o[2].min(0.0), 40.0, 15.0, 150.0);
     m(&mut p.open_fire_range, o[3], 100.0, 30.0, 350.0);
-    m(&mut p.crowd_radius, o[4], 100.0, 20.0, 300.0);
+    m(&mut p.crowd_radius, o[4].min(0.0), 100.0, 20.0, 300.0);
     m(&mut p.focus_hp, o[5], 150.0, -100.0, 400.0);
     if o[6] > 0.0 {
         p.hunt = 300.0 * o[6];
@@ -546,9 +548,9 @@ fn adjust(p: &mut Params, o: &[f32; NO]) {
     m(&mut p.arm_hp, o[9], 0.4, 0.0, 1.1);
     m(&mut p.zone_lead, o[10], 20.0, 0.0, 60.0);
     m(&mut p.evade_weight, o[11], 0.8, 0.0, 3.0);
-    m(&mut p.kite, o[12], 1.0, 0.0, 1.0);
+    m(&mut p.kite, o[12].min(0.0), 1.0, 0.0, 1.0);
     m(&mut p.rush_hp, o[13], 0.4, 0.0, 1.1);
-    m(&mut p.heal_lo, o[14], 0.4, 0.0, 0.99);
+    m(&mut p.heal_lo, o[14].min(0.0), 0.4, 0.0, 0.99);
     m(&mut p.finish_hp, o[15], 0.3, 0.0, 0.9);
     m(&mut p.cube_grab, o[16], 50.0, 0.0, 150.0);
 }
@@ -1433,6 +1435,12 @@ impl Brain {
             Some(net) => {
                 let x = self.features(o);
                 let out = net.forward(&x);
+                static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *TRACE.get_or_init(|| std::env::var_os("NN_TRACE").is_some()) && o.tick % 10 == 0 {
+                    let f: Vec<String> = x.iter().map(|v| format!("{v:.3}")).collect();
+                    let q: Vec<String> = out.iter().map(|v| format!("{v:.3}")).collect();
+                    eprintln!("NN {} {:.1} {} | {}", o.me.id, o.t, f.join(" "), q.join(" "));
+                }
                 let base = self.params.clone();
                 adjust(&mut self.params, &out);
                 Some(base)
