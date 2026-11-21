@@ -245,6 +245,12 @@ pub struct Params {
     pub stand_charge: f32,
     /// Backing off comes before fetching weapons and collecting cubes (0 = after).
     pub stand_first: f32,
+    /// Keep backing off while moving into the next circle (if still this many metres inside the current one),
+    /// with this weight pulling toward the next circle (0 = off: the zone comes first).
+    pub stand_zone: f32,
+    pub stand_zone_m: f32,
+    /// When backing away from a fight we are losing, move away from every enemy seen recently rather than from the target alone.
+    pub kite_away: f32,
 }
 
 impl Default for Params {
@@ -353,6 +359,9 @@ impl Default for Params {
             stand_mem: 1.0,
             stand_charge: 0.0,
             stand_first: 0.0,
+            stand_zone: 0.0,
+            stand_zone_m: 25.0,
+            kite_away: 0.0,
         }
     }
 }
@@ -465,6 +474,9 @@ impl Params {
         p.stand_mem = g("stand_mem", p.stand_mem);
         p.stand_charge = g("stand_charge", p.stand_charge);
         p.stand_first = g("stand_first", p.stand_first);
+        p.stand_zone = g("stand_zone", p.stand_zone);
+        p.stand_zone_m = g("stand_zone_m", p.stand_zone_m);
+        p.kite_away = g("kite_away", p.kite_away);
         p
     }
 
@@ -1798,7 +1810,8 @@ impl Brain {
         let mut boost = false;
         let mut mv: [f32; 2];
         let mut label = "idle";
-        if !me.in_zone || (must_rotate && out_next > 25.0) {
+        let zone_stand = p.stand_zone > 0.0 && stand_from.is_some() && me.in_zone && d2(&pos, &z.center) < z.radius - p.stand_zone_m;
+        if !me.in_zone || (must_rotate && out_next > 25.0 && !zone_stand) {
             label = "zone";
             mv = self.go(&pos, zone_goal);
             boost = !me.in_zone && me.energy > 5.0;
@@ -1839,10 +1852,15 @@ impl Brain {
             if laser_on.is_some() && me.energy > 10.0 {
                 boost = true;
             }
-        } else if let Some(near) = stand_from.filter(|_| !must_rotate || out_next < 0.0) {
+        } else if let Some(near) = stand_from.filter(|_| !must_rotate || out_next < 0.0 || zone_stand) {
             // Too close: back away from everyone in sight while the weapons keep working.
             label = "stand";
-            let dir = self.away_dir(o, &pos, p.stand_mem);
+            let pull = if must_rotate && out_next > 0.0 && zone_stand {
+                Some((norm2(zone_goal[0] - pos[0], zone_goal[1] - pos[1]), p.stand_zone))
+            } else {
+                None
+            };
+            let dir = self.away_dir(o, &pos, p.stand_mem, pull);
             let to = norm2(near[0] - pos[0], near[1] - pos[1]);
             if o.t >= self.strafe_until {
                 self.next_strafe(o.t);
@@ -1935,6 +1953,12 @@ impl Brain {
             let to = norm2(t.pos[0] - pos[0], t.pos[1] - pos[1]);
             let radial = if laser_on.is_some() { -0.2 } else { -p.kite };
             mv = self.strafe_dir(o, &pos, to, radial, false);
+            if p.kite_away > 0.0 && laser_on.is_none() {
+                let dir = self.away_dir(o, &pos, 3.0, None);
+                let perp = [-to[1] * self.strafe, to[0] * self.strafe];
+                let cand = norm2(dir[0] + perp[0] * p.stand_weave, dir[1] + perp[1] * p.stand_weave);
+                mv = if self.walkable(pos[0] + cand[0] * 5.0, pos[1] + cand[1] * 5.0) { cand } else { dir };
+            }
             boost = me.energy > p.retreat_boost_energy;
         } else if (self.fleeing || crowded) && threat_live {
             label = if self.fleeing { "heal" } else { "crowd" };
@@ -2159,7 +2183,7 @@ impl Brain {
 
     /// Direction that best increases the distance to every enemy seen recently, staying on walkable ground
     /// and inside the zone.
-    fn away_dir(&mut self, o: &Obs, pos: &[f32; 3], mem: f32) -> [f32; 2] {
+    fn away_dir(&mut self, o: &Obs, pos: &[f32; 3], mem: f32, pull: Option<([f32; 2], f32)>) -> [f32; 2] {
         let foes: Vec<([f32; 2], f32)> = self
             .known
             .values()
@@ -2194,6 +2218,9 @@ impl Brain {
                 sc -= out / 25.0 * 1.5;
             }
             sc += 0.25 * (dir[0] * self.away[0] + dir[1] * self.away[1]);
+            if let Some((g, w)) = pull {
+                sc += w * (dir[0] * g[0] + dir[1] * g[1]);
+            }
             if sc > best.0 {
                 best = (sc, dir);
             }
