@@ -123,6 +123,42 @@ pub struct Params {
     /// Pull the gun trigger when the aim is within this many ticks of torso turn of the solution
     /// (the torso turns before the shot leaves; 0 = only when already on target).
     pub aim_slack: f32,
+    /// Weapon handling: 0 = aim with the highest-ranked ready weapon; 1 = aim serves the gun while the
+    /// second weapon fires whenever its own solution lines up (laser takes the aim only once fully charged).
+    pub dual: f32,
+    /// With a full laser charge, shift the aim from the laser solution toward the gun solution by up to
+    /// this fraction of the laser tolerance, so both can hit.
+    pub laser_mix: f32,
+    /// Close in with lightning only while at most this many enemies are within `crowd_radius`.
+    pub arc_crowd: f32,
+    /// Close in with lightning only above this energy.
+    pub arc_energy: f32,
+    /// Rush a target with lightning (0 = off): close in and hold the arc and the gun on it.
+    pub rush: f32,
+    /// Start a rush on targets within this distance.
+    pub rush_start: f32,
+    /// Distance to hold during a rush.
+    pub rush_range: f32,
+    /// Rush only above this HP fraction (or when the target has less HP than us).
+    pub rush_hp: f32,
+    /// Rush only while at most this many other enemies are within `crowd_radius`.
+    pub rush_crowd: f32,
+    /// Start a rush above this energy; keep going while above `arc_energy`/2.
+    pub rush_energy: f32,
+    /// Boost toward the target during a rush while further than the arc range and energy is above this.
+    pub rush_boost: f32,
+    /// Prefer the laser over lightning as the second weapon.
+    pub laser_first: f32,
+    /// With an empty slot, go for the best known weapon pickup before anything but the zone (0 = off).
+    pub arm: f32,
+    /// Go for weapon pickups within this distance.
+    pub arm_reach: f32,
+    /// Only above this HP fraction.
+    pub arm_hp: f32,
+    /// Metres of extra distance one rank of weapon preference is worth when choosing a pickup.
+    pub arm_rank: f32,
+    /// Holding a weaker second weapon: go for a better one within this distance (0 = off).
+    pub arm_better: f32,
 }
 
 impl Default for Params {
@@ -172,6 +208,23 @@ impl Default for Params {
             lead_latency: 0.025,
             lead_ballistic: 1.0,
             aim_slack: 1.0,
+            dual: 1.0,
+            laser_mix: 0.5,
+            arc_crowd: 1.0,
+            arc_energy: 20.0,
+            rush: 1.0,
+            rush_start: 90.0,
+            rush_range: 22.0,
+            rush_hp: 0.45,
+            rush_crowd: 1.0,
+            rush_energy: 40.0,
+            rush_boost: 50.0,
+            laser_first: 1.0,
+            arm: 1.0,
+            arm_reach: 160.0,
+            arm_hp: 0.35,
+            arm_rank: 25.0,
+            arm_better: 60.0,
         }
     }
 }
@@ -225,6 +278,23 @@ impl Params {
         p.lead_latency = g("lead_latency", p.lead_latency);
         p.lead_ballistic = g("lead_ballistic", p.lead_ballistic);
         p.aim_slack = g("aim_slack", p.aim_slack);
+        p.dual = g("dual", p.dual);
+        p.laser_mix = g("laser_mix", p.laser_mix);
+        p.arc_crowd = g("arc_crowd", p.arc_crowd);
+        p.arc_energy = g("arc_energy", p.arc_energy);
+        p.rush = g("rush", p.rush);
+        p.rush_start = g("rush_start", p.rush_start);
+        p.rush_range = g("rush_range", p.rush_range);
+        p.rush_hp = g("rush_hp", p.rush_hp);
+        p.rush_crowd = g("rush_crowd", p.rush_crowd);
+        p.rush_energy = g("rush_energy", p.rush_energy);
+        p.rush_boost = g("rush_boost", p.rush_boost);
+        p.laser_first = g("laser_first", p.laser_first);
+        p.arm = g("arm", p.arm);
+        p.arm_reach = g("arm_reach", p.arm_reach);
+        p.arm_hp = g("arm_hp", p.arm_hp);
+        p.arm_rank = g("arm_rank", p.arm_rank);
+        p.arm_better = g("arm_better", p.arm_better);
         p
     }
 
@@ -245,10 +315,10 @@ const UPGRADES: &[&str] = &[
     "gun_velocity", "mortar_reload", "mortar_splash", "sensors", "mortar_velocity", "laser_pierce",
 ];
 
-fn weapon_rank(kind: &str) -> i32 {
+fn weapon_rank(kind: &str, laser_first: bool) -> i32 {
     match kind {
-        "lightning" => 3,
-        "laser" => 2,
+        "lightning" => 3 - laser_first as i32,
+        "laser" => 2 + laser_first as i32,
         "mortar" => 1,
         _ => 0,
     }
@@ -395,6 +465,8 @@ pub struct Brain {
     pub delay_used: f32,
     /// Short name of the current behaviour, for debugging.
     pub label: &'static str,
+    /// Target of the lightning rush in progress.
+    rushing: Option<u32>,
 }
 
 impl Brain {
@@ -464,6 +536,7 @@ impl Brain {
             delay_info: 0.0,
             delay_used: 0.0,
             label: "",
+            rushing: None,
         }
     }
 
@@ -522,6 +595,79 @@ impl Brain {
             }
         }
         norm2(target[0] - pos[0], target[1] - pos[1])
+    }
+
+    /// Fire every slot whose own solution lines up. The aim serves the gun while it can shoot (lightning's
+    /// cone is wide enough to come along); a fully charged laser takes the aim, nudged toward the gun's lead.
+    /// Returns whether any weapon has a firing solution.
+    fn fire_both(&mut self, o: &Obs, t: &Actor, a: &mut Action) -> bool {
+        let me = &o.me;
+        let p = &self.params;
+        let slack = [me.stat("turn_rate", 4.0) * self.tick_s * p.aim_slack, me.stat("pitch_rate", 3.0) * self.tick_s * p.aim_slack];
+        let lined = |s: &Shot, sl: [f32; 2]| wrap(s.aim[0] - me.aim[0]).abs() <= s.tol[0] + sl[0] && (s.aim[1] - me.aim[1]).abs() <= s.tol[1] + sl[1];
+        let mut sols: Vec<(usize, &Weapon, Shot)> = Vec::new();
+        for (i, slot) in me.weapons.iter().enumerate().take(2) {
+            if let Some(w) = slot {
+                sols.push((i, w, self.solve(o, w, t)));
+            }
+        }
+        let find = |k: &str| sols.iter().find(|(_, w, _)| w.kind == k);
+        let gun = find("gun").filter(|(_, _, s)| s.ok);
+        let mut aim: Option<[f32; 2]> = gun.map(|(_, _, s)| s.aim);
+        let mut engaged = gun.is_some();
+        if let Some((i, w, s)) = gun {
+            a.fire[*i] = lined(s, slack) && w.cooldown <= 0.12;
+        }
+        if let Some((i, w, s)) = find("laser") {
+            if s.ok {
+                engaged = true;
+                let full = w.charge >= w.stat("charge", 0.75) - 0.01;
+                if full {
+                    // Aim for the beam, pulled toward the gun's lead as far as the beam still hits.
+                    let mut la = s.aim;
+                    if let Some(g) = aim {
+                        let m = p.laser_mix;
+                        la[0] += wrap(g[0] - s.aim[0]).clamp(-s.tol[0] * m, s.tol[0] * m);
+                        la[1] += (g[1] - s.aim[1]).clamp(-s.tol[1] * m, s.tol[1] * m);
+                    }
+                    aim = Some(la);
+                    a.fire[*i] = !lined(s, [0.0, 0.0]);
+                } else {
+                    a.fire[*i] = w.cooldown <= 0.0 || w.charge > 0.0;
+                }
+                if aim.is_none() {
+                    aim = Some(s.aim);
+                }
+            } else if w.charge > 0.0 {
+                a.fire[*i] = true;
+            }
+        }
+        if let Some((i, w, s)) = find("lightning") {
+            if s.ok {
+                engaged = true;
+                let cur = aim.unwrap_or(s.aim);
+                // Keep the arc inside the cone of where the torso is pointing now and where it is going.
+                let inside = wrap(s.aim[0] - me.aim[0]).abs() <= s.tol[0] && wrap(s.aim[0] - cur[0]).abs() <= s.tol[0];
+                a.fire[*i] = inside && w.cooldown <= 0.12;
+                if aim.is_none() || wrap(s.aim[0] - cur[0]).abs() > s.tol[0] * 0.8 {
+                    aim = Some(s.aim);
+                }
+            }
+        }
+        if let Some((i, w, s)) = find("mortar") {
+            if s.ok {
+                engaged = true;
+                if aim.is_none() {
+                    aim = Some(s.aim);
+                }
+                a.fire[*i] = lined(s, [0.0, 0.0]) && w.cooldown <= 0.12;
+            }
+        }
+        let fallback = sols.first().map(|x| x.2.aim);
+        if let Some(x) = aim.or(fallback) {
+            a.aim = x;
+        }
+        engaged
     }
 
     /// Aim solution for one weapon against a target, from our current position.
@@ -978,7 +1124,9 @@ impl Brain {
 
         // --- weapons: solve every slot, aim with the best ready one, fire all that line up
         let mut engaged = false;
-        if let Some(t) = shoot_at {
+        if let (Some(t), true) = (shoot_at, p.dual > 0.0) {
+            engaged = self.fire_both(o, t, &mut a);
+        } else if let Some(t) = shoot_at {
             let mut best: Option<(i32, [f32; 2])> = None;
             let mut fallback = None;
             for (i, slot) in me.weapons.iter().enumerate().take(2) {
@@ -1032,14 +1180,14 @@ impl Brain {
         // --- loot within reach
         let held: Vec<&str> = me.weapons.iter().flatten().map(|w| w.kind.as_str()).collect();
         let empty_slot = me.weapons.len() < 2 || me.weapons.iter().take(2).any(|w| w.is_none());
-        let worst_slot = me.weapons.iter().enumerate().take(2).filter_map(|(i, w)| w.as_ref().map(|w| (i, weapon_rank(&w.kind)))).filter(|(_, r)| *r > 0).min_by_key(|(_, r)| *r);
+        let worst_slot = me.weapons.iter().enumerate().take(2).filter_map(|(i, w)| w.as_ref().map(|w| (i, weapon_rank(&w.kind, p.laser_first > 0.0)))).filter(|(_, r)| *r > 0).min_by_key(|(_, r)| *r);
         let wanted = |kind: &str| -> Option<Option<u32>> {
-            if held.contains(&kind) || weapon_rank(kind) == 0 {
+            if held.contains(&kind) || weapon_rank(kind, p.laser_first > 0.0) == 0 {
                 None
             } else if empty_slot {
                 Some(None)
             } else {
-                worst_slot.filter(|(_, r)| weapon_rank(kind) > *r).map(|(i, _)| Some(i as u32))
+                worst_slot.filter(|(_, r)| weapon_rank(kind, p.laser_first > 0.0) > *r).map(|(i, _)| Some(i as u32))
             }
         };
         for pk in &o.pickups {
@@ -1136,6 +1284,46 @@ impl Brain {
         } else {
             None
         };
+        // Lightning rush: a target close enough and few others around, close in and burn it down.
+        let arc_w = me.weapons.iter().flatten().find(|w| w.kind == "lightning");
+        let rush_t = match (target, arc_w) {
+            (Some(t), Some(_)) if p.rush > 0.0 => {
+                let d = d2(&t.pos, &pos);
+                let others = enemies.iter().filter(|m| m.id != t.id && d2(&m.pos, &pos) < p.crowd_radius).count() as f32;
+                let tf = if t.max_hp > 0.0 { t.hp } else { 1400.0 };
+                let cont = self.rushing == Some(t.id);
+                let e_ok = if cont { me.energy > p.arc_energy * 0.5 } else { me.energy > p.rush_energy };
+                let hp_ok = hp_frac > p.rush_hp || tf < me.hp * 0.7;
+                let reach = if cont { p.rush_start + 20.0 } else { p.rush_start };
+                if d < reach && e_ok && hp_ok && others <= p.rush_crowd {
+                    Some(t)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        self.rushing = rush_t.map(|t| t.id);
+        if rush_t.is_some() {
+            self.fleeing = false;
+        }
+        // An empty slot: the nearest good weapon on the ground comes first.
+        let worst_rank = worst_slot.map_or(0, |(_, r)| r);
+        let arm_goal = if p.arm > 0.0 && (empty_slot || p.arm_better > 0.0) && hp_frac > p.arm_hp {
+            let lf = p.laser_first > 0.0;
+            let reach = if empty_slot { p.arm_reach } else { p.arm_better };
+            self.picks_mem
+                .values()
+                .filter(|(k, q)| {
+                    let r = weapon_rank(k, lf);
+                    r > 0 && (empty_slot || r > worst_rank) && !held.contains(&k.as_str()) && d2(q, &pos) < reach && (q[2] - self.ground(q[0], q[1], q[2])).abs() < 3.0
+                })
+                .map(|(k, q)| (*q, d2(q, &pos) - p.arm_rank * weapon_rank(k, lf) as f32))
+                .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|x| x.0)
+        } else {
+            None
+        };
         let mut boost = false;
         let mut mv: [f32; 2];
         let mut label = "idle";
@@ -1143,6 +1331,25 @@ impl Brain {
             label = "zone";
             mv = self.go(&pos, zone_goal);
             boost = !me.in_zone && me.energy > 5.0;
+        } else if let Some(g) = arm_goal {
+            label = "arm";
+            mv = self.go(&pos, [g[0], g[1]]);
+            boost = me.energy > 30.0 && d2(&g, &pos) > 12.0;
+        } else if let Some(t) = rush_t {
+            label = "rush";
+            let dist = d2(&t.pos, &pos);
+            let to = norm2(t.pos[0] - pos[0], t.pos[1] - pos[1]);
+            let arc_r = arc_w.map_or(45.0, |w| w.stat("range", 45.0));
+            let radial = ((dist - p.rush_range) / 8.0).clamp(-1.0, 1.0);
+            mv = if dist > p.rush_range + 10.0 && !self.straight(&pos, &t.pos) {
+                self.go(&pos, [t.pos[0], t.pos[1]])
+            } else {
+                self.strafe_dir(o, &pos, to, radial * 2.0, false)
+            };
+            boost = dist > arc_r - 6.0 && me.energy > p.rush_boost;
+            if laser_on.is_some() && me.energy > 10.0 {
+                boost = true;
+            }
         } else if let (Some(t), true) = (target, (self.fleeing || crowded) && p.kite > 0.0 && threat_live) {
             // Back away from the nearest enemy while weaving and shooting.
             label = if self.fleeing { "kite" } else { "kitec" };
@@ -1196,11 +1403,11 @@ impl Brain {
         } else if let (Some(t), true) = (target, engaged || recently_hurt_by_mech || target.map_or(false, |t| d2(&t.pos, &pos) < p.open_fire_range)) {
             label = "fight";
             let dist = d2(&t.pos, &pos);
-            let has_arc = me.weapons.iter().flatten().any(|w| w.kind == "lightning") && me.energy > 20.0;
+            let has_arc = me.weapons.iter().flatten().any(|w| w.kind == "lightning") && me.energy > p.arc_energy;
             let they_arc = t.weapons.iter().any(|w| w == "lightning");
             let pref = if finishing {
                 p.finish_range
-            } else if has_arc && hp_frac > p.arc_min_hp && near_enemies <= 1 {
+            } else if has_arc && hp_frac > p.arc_min_hp && near_enemies as f32 <= p.arc_crowd {
                 p.arc_range
             } else if they_arc {
                 p.gun_range.max(60.0)
@@ -1264,7 +1471,7 @@ impl Brain {
             }
         }
         // Outside a fight, still weave across the line of the nearest shooter.
-        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "fight" || label == "drone" || label == "reload") {
+        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "fight" || label == "rush" || label == "drone" || label == "reload") {
             if o.t >= self.strafe_until {
                 self.next_strafe(o.t);
             }
@@ -1495,12 +1702,12 @@ impl Brain {
         };
         let held: Vec<&str> = me.weapons.iter().flatten().map(|w| w.kind.as_str()).collect();
         let empty_slot = me.weapons.len() < 2 || me.weapons.iter().take(2).any(|w| w.is_none());
-        let worst = me.weapons.iter().take(2).flatten().map(|w| weapon_rank(&w.kind)).filter(|r| *r > 0).min().unwrap_or(0);
+        let worst = me.weapons.iter().take(2).flatten().map(|w| weapon_rank(&w.kind, p.laser_first > 0.0)).filter(|r| *r > 0).min().unwrap_or(0);
         let early = o.t < p.farm_until;
         let reach = if early { p.farm_reach.max(100.0) } else { 100.0 };
         let picks: Vec<(String, [f32; 3])> = self.picks_mem.values().cloned().collect();
         for (kind, q) in &picks {
-            let r = weapon_rank(kind);
+            let r = weapon_rank(kind, p.laser_first > 0.0);
             if r > 0 && !held.contains(&kind.as_str()) && (empty_slot || r > worst) {
                 let v = if empty_slot && early { 120.0 + 30.0 * r as f32 } else { 60.0 + 30.0 * r as f32 };
                 consider(&mut goal, q, v, reach.max(140.0), on_ground(self, q));
