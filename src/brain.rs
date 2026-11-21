@@ -319,7 +319,7 @@ impl Default for Params {
             laser_lead: 0.0,
             reload_early: 0.0,
             reload_laser: 1.0,
-            retreat_mode: 1.0,
+            retreat_mode: 0.0,
             break_crowd: 0.0,
             break_laser: 1000.0,
             break_los: 0.0,
