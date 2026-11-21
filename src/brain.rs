@@ -231,6 +231,16 @@ pub struct Params {
     pub wall_r: f32,
     /// 1 = hold a low-exposure spot inside the next circle; 2 = keep away from the known enemies inside the zone.
     pub wall_mode: f32,
+    /// Keep every enemy in sight at least this far away, backing off from all of them while shooting (0 = off).
+    pub standoff: f32,
+    /// Weight of the sideways weave while backing off.
+    pub stand_weave: f32,
+    /// Boost while backing off above this energy.
+    pub stand_boost: f32,
+    /// Let enemies below this HP fraction come closer.
+    pub stand_finish: f32,
+    /// Only back off from enemies seen within this many seconds.
+    pub stand_mem: f32,
 }
 
 impl Default for Params {
@@ -332,6 +342,11 @@ impl Default for Params {
             wall_t: 0.0,
             wall_r: 290.0,
             wall_mode: 1.0,
+            standoff: 0.0,
+            stand_weave: 0.5,
+            stand_boost: 30.0,
+            stand_finish: 0.25,
+            stand_mem: 1.0,
         }
     }
 }
@@ -437,6 +452,11 @@ impl Params {
         p.wall_t = g("wall_t", p.wall_t);
         p.wall_r = g("wall_r", p.wall_r);
         p.wall_mode = g("wall_mode", p.wall_mode);
+        p.standoff = g("standoff", p.standoff);
+        p.stand_weave = g("stand_weave", p.stand_weave);
+        p.stand_boost = g("stand_boost", p.stand_boost);
+        p.stand_finish = g("stand_finish", p.stand_finish);
+        p.stand_mem = g("stand_mem", p.stand_mem);
         p
     }
 
@@ -587,6 +607,7 @@ pub struct Brain {
     threat: Option<([f32; 3], f32)>,
     fleeing: bool,
     cover: Option<([f32; 2], f32)>,
+    away: [f32; 2],
     scan_yaw: f32,
     known: BTreeMap<u32, Known>,
     /// Mechs that shot us recently: id -> time.
@@ -616,6 +637,7 @@ pub struct Brain {
     pub delay_used: f32,
     /// Short name of the current behaviour, for debugging.
     pub label: &'static str,
+    trace_dmg: bool,
     /// Target of the lightning rush in progress.
     rushing: Option<u32>,
     /// When our laser charge became full (None while not full).
@@ -667,6 +689,7 @@ impl Brain {
             threat: None,
             fleeing: false,
             cover: None,
+            away: [0.0, 0.0],
             scan_yaw: 0.0,
             known: BTreeMap::new(),
             attackers: BTreeMap::new(),
@@ -697,6 +720,7 @@ impl Brain {
             delay_info: 0.0,
             delay_used: 0.0,
             label: "",
+            trace_dmg: std::env::var("TDMG").is_ok(),
             rushing: None,
             laser_full_t: None,
             looked: Vec::new(),
@@ -1749,6 +1773,19 @@ impl Brain {
             }
             _ => None,
         };
+        // Stand-off: the nearest enemy in sight that is closer than we want (nearly dead ones may come in).
+        let stand_from = if p.standoff > 0.0 && !finishing {
+            enemies
+                .iter()
+                .filter(|m| {
+                    let f = if m.max_hp > 0.0 { m.hp / m.max_hp } else { 1.0 };
+                    d2(&m.pos, &pos) < p.standoff && f >= p.stand_finish
+                })
+                .min_by(|x, y| d2(&x.pos, &pos).partial_cmp(&d2(&y.pos, &pos)).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|m| m.pos)
+        } else {
+            None
+        };
         let late = (p.wall_t > 0.0 && o.t >= p.wall_t) || (p.wall_t > 0.0 && o.zone.radius <= p.wall_r);
         let mut boost = false;
         let mut mv: [f32; 2];
@@ -1794,6 +1831,20 @@ impl Brain {
             if laser_on.is_some() && me.energy > 10.0 {
                 boost = true;
             }
+        } else if let Some(near) = stand_from.filter(|_| !must_rotate || out_next < 0.0) {
+            // Too close: back away from everyone in sight while the weapons keep working.
+            label = "stand";
+            let dir = self.away_dir(o, &pos, p.stand_mem);
+            let to = norm2(near[0] - pos[0], near[1] - pos[1]);
+            if o.t >= self.strafe_until {
+                self.next_strafe(o.t);
+            }
+            let perp = [-to[1] * self.strafe, to[0] * self.strafe];
+            let w = if laser_on.is_some() { 1.5 } else { p.stand_weave };
+            let cand = norm2(dir[0] + perp[0] * w, dir[1] + perp[1] * w);
+            mv = if self.walkable(pos[0] + cand[0] * 5.0, pos[1] + cand[1] * 5.0) { cand } else { dir };
+            let charging = me.weapons.iter().flatten().any(|w| w.kind == "laser" && w.charge > 0.0);
+            boost = me.energy > p.stand_boost && !charging;
         } else if (self.fleeing || (crowded && p.break_crowd > 0.0)) && threat_live && p.retreat_mode > 0.0 {
             // Break line of sight from everyone we know of, then heal out of sight.
             label = "break";
@@ -2024,7 +2075,7 @@ impl Brain {
             }
         }
         // Outside a fight, still weave across the line of the nearest shooter.
-        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "fight" || label == "rush" || label == "climb" || label == "hold" || label == "drone" || label == "reload") {
+        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "fight" || label == "rush" || label == "climb" || label == "hold" || label == "drone" || label == "reload" || label == "stand") {
             if o.t >= self.strafe_until {
                 self.next_strafe(o.t);
             }
@@ -2063,6 +2114,12 @@ impl Brain {
         if std::env::var("TTRACE_DELAY").is_ok() && o.tick % 200 == 0 {
             eprintln!("DL t {:.0} used {:.2} info {:.1} err {:?}", o.t, self.delay_used, self.delay_info, self.delay_err);
         }
+        if self.trace_dmg {
+            let taken: f32 = o.events.iter().filter(|e| e.kind == "damaged" && e.by.map_or(false, |b| b < 100)).map(|e| e.amount).sum();
+            let nd = target.map_or(-1.0, |t| d2(&t.pos, &pos));
+            let dealt: f32 = o.events.iter().filter(|e| e.kind == "hit" && e.target.map_or(false, |b| b < 100)).map(|e| e.amount).sum();
+            eprintln!("TD {:.1} {} {:.0} {:.2} {} {} {:.0} {} {:.0}", o.t, label, taken, hp_frac, enemies.len(), near_enemies, nd, me.cubes, dealt);
+        }
         if std::env::var("TTRACE").is_ok() && o.tick % 20 == 0 {
             eprintln!("TR {:.1} {} hp {:.0} cubes {} enemies {} near {} e {:.0} w {}", o.t, label, me.hp, me.cubes, enemies.len(), near_enemies, me.energy, held.join("+"));
         }
@@ -2083,6 +2140,54 @@ impl Brain {
             a.aim = me.aim;
         }
         a
+    }
+
+    /// Direction that best increases the distance to every enemy seen recently, staying on walkable ground
+    /// and inside the zone.
+    fn away_dir(&mut self, o: &Obs, pos: &[f32; 3], mem: f32) -> [f32; 2] {
+        let foes: Vec<([f32; 2], f32)> = self
+            .known
+            .values()
+            .filter(|k| o.t - k.seen_t <= mem && d2(&k.pos, pos) < 220.0)
+            .map(|k| {
+                let d = d2(&k.pos, pos).max(10.0);
+                (norm2(pos[0] - k.pos[0], pos[1] - k.pos[1]), 1.0 / d)
+            })
+            .collect();
+        let z = &o.zone;
+        let mut best = (f32::MIN, [0.0f32, 0.0f32]);
+        for i in 0..24 {
+            let ang = i as f32 * std::f32::consts::TAU / 24.0;
+            let dir = [ang.cos(), ang.sin()];
+            let mut open = 0.0;
+            for step in [3.0f32, 6.0, 10.0, 15.0, 21.0, 28.0] {
+                if !self.walkable(pos[0] + dir[0] * step, pos[1] + dir[1] * step) {
+                    break;
+                }
+                open = step;
+            }
+            if open < 3.0 {
+                continue;
+            }
+            let mut sc: f32 = foes.iter().map(|(u, w)| (u[0] * dir[0] + u[1] * dir[1]) * w).sum::<f32>();
+            let wsum: f32 = foes.iter().map(|(_, w)| *w).sum::<f32>().max(1e-3);
+            sc /= wsum;
+            sc -= (28.0 - open) / 28.0 * 0.8;
+            let ahead = [pos[0] + dir[0] * 25.0, pos[1] + dir[1] * 25.0];
+            let out = d2(&ahead, &z.center) - (z.radius - 15.0);
+            if out > 0.0 {
+                sc -= out / 25.0 * 1.5;
+            }
+            sc += 0.25 * (dir[0] * self.away[0] + dir[1] * self.away[1]);
+            if sc > best.0 {
+                best = (sc, dir);
+            }
+        }
+        if best.0 == f32::MIN {
+            best.1 = self.away;
+        }
+        self.away = best.1;
+        best.1
     }
 
     /// Prefer a nearby step from which the target is still in sight but fewer other enemies can see us.
