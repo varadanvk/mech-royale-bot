@@ -2,6 +2,7 @@
 name = "tinman"
 version = "0.1.0"
 edition = "2021"
+authors = ["Varadan Kalkunte", "Gabi Minto"]
 license = "MIT"
 
 [dependencies]

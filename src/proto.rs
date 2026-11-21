@@ -103,11 +103,15 @@ pub struct Zone {
 #[serde(default)]
 pub struct Choice {
     pub id: String,
+    pub name: String,
+    pub desc: String,
 }
 
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(default)]
 pub struct Offer {
+    pub id: u32,
+    pub expires: f32,
     pub choices: Vec<Choice>,
 }
 
@@ -118,6 +122,8 @@ pub struct Drop {
     pub pos: [f32; 3],
     pub radius: f32,
     pub lands_in: f32,
+    pub capture_s: f32,
+    pub progress: f32,
     pub holder: Option<u32>,
 }
 
@@ -130,6 +136,35 @@ pub struct Event {
     pub bearing: Option<f32>,
     pub by: Option<u32>,
     pub rear: bool,
+    pub weapon: Option<String>,
+    pub target: Option<u32>,
+    pub effect: Option<String>,
+    /// Pickup or drop id (number), or upgrade id (string).
+    pub id: Option<serde_json::Value>,
+    pub cubes: Option<f32>,
+    /// Weapon kind for `took` and `dropped`.
+    #[serde(rename = "kind")]
+    pub item: Option<String>,
+    pub slot: Option<u32>,
+    pub reason: Option<String>,
+}
+
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(default)]
+pub struct Sound {
+    pub kind: String,
+    pub bearing: f32,
+    pub dist: String,
+    pub age: f32,
+}
+
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(default)]
+pub struct Beam {
+    pub by: u32,
+    pub kind: String,
+    pub path: Vec<[f32; 3]>,
+    pub age: f32,
 }
 
 #[derive(Deserialize, Default, Debug, Clone)]
@@ -145,6 +180,8 @@ pub struct Obs {
     pub crates: Vec<Item>,
     pub cubes: Vec<Item>,
     pub pickups: Vec<Item>,
+    pub sounds: Vec<Sound>,
+    pub beams: Vec<Beam>,
     pub events: Vec<Event>,
     pub drops: Vec<Drop>,
     pub zone: Zone,
