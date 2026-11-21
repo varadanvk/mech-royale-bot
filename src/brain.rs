@@ -111,6 +111,8 @@ pub struct Params {
     pub hunt_hp: f32,
     /// Do not go looking before this match time.
     pub hunt_after: f32,
+    /// Fight from spots with cover a step away from the target's line, searched up to this far (0 = off).
+    pub peek_r: f32,
 }
 
 impl Default for Params {
@@ -155,6 +157,7 @@ impl Default for Params {
             crowd_mem: 6.0,
             hunt_hp: 0.85,
             hunt_after: 0.0,
+            peek_r: 18.0,
         }
     }
 }
@@ -203,6 +206,7 @@ impl Params {
         p.crowd_mem = g("crowd_mem", p.crowd_mem);
         p.hunt_hp = g("hunt_hp", p.hunt_hp);
         p.hunt_after = g("hunt_after", p.hunt_after);
+        p.peek_r = g("peek_r", p.peek_r);
         p
     }
 
@@ -288,6 +292,8 @@ pub struct Brain {
     leads: Vec<([f32; 2], f32)>,
     /// Exploration waypoint when there are no leads.
     roam: Option<([f32; 2], f32)>,
+    /// Current peek spot for the fight: position, target id, and when chosen.
+    peek: Option<([f32; 2], u32, f32)>,
     /// Short name of the current behaviour, for debugging.
     pub label: &'static str,
 }
@@ -343,6 +349,7 @@ impl Brain {
             healing: false,
             leads: Vec::new(),
             roam: None,
+            peek: None,
             label: "",
         }
     }
@@ -971,8 +978,32 @@ impl Brain {
                 let g = self.go(&pos, [c[0], c[1]]);
                 mv = norm2(g[0] + mv[0] * 0.35, g[1] + mv[1] * 0.35);
                 boost = me.energy > 30.0;
-            } else if p.expose_weight > 0.0 {
-                mv = self.less_exposed(o, &pos, t, mv, p.expose_weight);
+            } else {
+                let spot = if p.peek_r > 0.0 && !finishing {
+                    if self.peek.map_or(true, |(_, id, at)| id != t.id || o.t - at > 1.0) {
+                        let s = self.peek_spot(o, &pos, t, pref, p.peek_r);
+                        self.peek = s.map(|c| (c, t.id, o.t));
+                    }
+                    self.peek.map(|(c, _, _)| c)
+                } else {
+                    None
+                };
+                match spot {
+                    Some(c) if d2(&pos, &c) > 2.5 => {
+                        label = "peek";
+                        mv = self.go(&pos, c);
+                    }
+                    Some(c) => {
+                        // At the spot: sidestep a little around it.
+                        label = "peek";
+                        let back = norm2(c[0] - pos[0], c[1] - pos[1]);
+                        mv = norm2(mv[0] * 0.5 + back[0] * 0.5, mv[1] * 0.5 + back[1] * 0.5);
+                    }
+                    None if p.expose_weight > 0.0 => {
+                        mv = self.less_exposed(o, &pos, t, mv, p.expose_weight);
+                    }
+                    None => {}
+                }
             }
             mv = [mv[0] * p.fight_speed, mv[1] * p.fight_speed];
             boost = boost || (laser_on.is_some() && me.energy > 10.0);
@@ -1049,6 +1080,54 @@ impl Brain {
             a.aim = me.aim;
         }
         a
+    }
+
+    /// A spot near us that sees the target, has cover from it one step away, and that other enemies cannot see.
+    fn peek_spot(&self, o: &Obs, pos: &[f32; 3], t: &Actor, pref: f32, r: f32) -> Option<[f32; 2]> {
+        let teye = [t.pos[0], t.pos[1], t.pos[2] + 8.0];
+        let tc = [t.pos[0], t.pos[1], t.pos[2] + 4.5];
+        let others: Vec<[f32; 3]> = self
+            .known
+            .iter()
+            .filter(|(id, k)| **id != t.id && o.t - k.seen_t < 6.0 && d2(&k.pos, pos) < 220.0)
+            .map(|(_, k)| [k.pos[0], k.pos[1], k.pos[2] + 8.0])
+            .collect();
+        let mut best: Option<([f32; 2], f32)> = None;
+        let mut rings = vec![0.0f32];
+        let mut rr = 6.0;
+        while rr <= r + 0.01 {
+            rings.push(rr);
+            rr += 6.0;
+        }
+        for ring in rings {
+            let nk = if ring == 0.0 { 1 } else { 12 };
+            for k in 0..nk {
+                let a = k as f32 * TAU / nk as f32 + ring * 0.05;
+                let c = [pos[0] + a.cos() * ring, pos[1] + a.sin() * ring];
+                if ring > 0.0 && !self.straight(pos, &c) {
+                    continue;
+                }
+                let z = self.ground(c[0], c[1], pos[2]);
+                if (z - pos[2]).abs() > 1.5 || !self.clear([c[0], c[1], z + 7.0], tc) {
+                    continue;
+                }
+                let cover = (0..8).any(|j| {
+                    let b = j as f32 * TAU / 8.0;
+                    let q = [c[0] + b.cos() * 4.5, c[1] + b.sin() * 4.5];
+                    let qz = self.ground(q[0], q[1], z);
+                    self.walkable(q[0], q[1]) && !self.clear(teye, [q[0], q[1], qz + 4.5]) && !self.clear(teye, [q[0], q[1], qz + 8.5])
+                });
+                if !cover {
+                    continue;
+                }
+                let seen = others.iter().filter(|e| self.clear(**e, [c[0], c[1], z + 5.0])).count() as f32;
+                let s = -seen * 25.0 - ring * 0.5 - (d2(&c, &t.pos) - pref).abs() * 0.3;
+                if best.map_or(true, |b| s > b.1) {
+                    best = Some((c, s));
+                }
+            }
+        }
+        best.map(|b| b.0)
     }
 
     /// Somewhere to look for an enemy: the freshest lead inside the safe area, else a roaming point.
