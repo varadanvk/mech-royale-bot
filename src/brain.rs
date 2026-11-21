@@ -2226,7 +2226,7 @@ impl Brain {
             let dealt: f32 = o.events.iter().filter(|e| e.kind == "hit" && e.target.map_or(false, |b| b < 100)).map(|e| e.amount).sum();
             let lz: f32 = o.events.iter().filter(|e| e.kind == "hit" && e.weapon.as_deref() == Some("laser") && e.target.map_or(false, |b| b < 100)).map(|e| e.amount).sum();
             let lst = me.weapons.iter().flatten().find(|w| w.kind == "laser").map_or(-1.0, |w| if w.charge > 0.0 { 2.0 } else if w.cooldown > 0.0 { 1.0 } else { 0.0 });
-            eprintln!("TD {:.1} {} {:.0} {:.2} {} {} {:.0} {} {:.0} {:.0} {}", o.t, label, taken, hp_frac, enemies.len(), near_enemies, nd, me.cubes, dealt, lz, lst);
+            eprintln!("TD {:.1} {} {:.0} {:.2} {} {} {:.0} {} {:.0} {:.0} {} {} {}", o.t, label, taken, hp_frac, enemies.len(), near_enemies, nd, me.cubes, dealt, lz, lst, held.join("+"), self.picks_mem.values().filter(|q| q.0 == "laser").map(|q| d2(&q.1, &pos)).fold(9999.0f32, f32::min) as i32);
         }
         if std::env::var("TTRACE").is_ok() && o.tick % 20 == 0 {
             eprintln!("TR {:.1} {} hp {:.0} cubes {} enemies {} near {} e {:.0} w {}", o.t, label, me.hp, me.cubes, enemies.len(), near_enemies, me.energy, held.join("+"));
