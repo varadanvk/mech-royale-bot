@@ -369,7 +369,7 @@ impl Default for Params {
             collect_hp: 0.3,
             collect_seen: 2.0,
             arm_keep: 0.0,
-            wall_t: 0.0,
+            wall_t: 170.0,
             wall_r: 290.0,
             wall_mode: 1.0,
             standoff: 0.0,
@@ -388,9 +388,9 @@ impl Default for Params {
             aim_high: 1.0,
             charge_seen: 1.0,
             fight_boost: 0.0,
-            farm_stop: 0.0,
+            farm_stop: 40.0,
             hunt_any: 0.0,
-            solo_hp: 0.0,
+            solo_hp: 0.12,
             close_boost: 0.0,
         }
     }
