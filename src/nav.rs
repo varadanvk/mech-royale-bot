@@ -6,10 +6,78 @@ use std::sync::{Arc, Mutex};
 pub const CELL: f32 = 3.0;
 const STEPS: [(isize, isize); 8] = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)];
 
-/// Recently computed distance fields by goal cell, most recent last. A distance field depends
+/// Recently used distance fields by goal cell, most recent last. A distance field depends
 /// only on the walkability grid and the goal, so navs built from the same grid can share one.
-pub type DistCache = Arc<Mutex<Vec<(usize, Arc<Vec<f32>>)>>>;
+pub type DistCache = Arc<Mutex<Vec<(usize, Arc<Mutex<Field>>)>>>;
 const DIST_CACHE_LEN: usize = 32;
+
+/// Bucket width of the Dijkstra queue: below the cheapest step, so the cells of one bucket
+/// cannot improve each other and are final when the bucket is reached.
+const W: f32 = CELL * 0.95;
+
+/// A distance field toward one goal, settled outward from the goal only as far as queries need.
+/// Cells in buckets before `next` hold their final distance; every other cell holds a value no
+/// smaller than its final distance, which is itself at least `next * W`. Queries that compare a
+/// settled cell against its neighbours therefore get the same answers as with the full field.
+pub struct Field {
+    dist: Vec<f32>,
+    buckets: Vec<Vec<(f32, u32)>>,
+    next: usize,
+}
+
+impl Field {
+    fn empty(n: usize) -> Field {
+        Field { dist: vec![f32::MAX; n], buckets: Vec::new(), next: 0 }
+    }
+
+    fn new(n: usize, g: usize) -> Field {
+        let mut f = Field::empty(n);
+        f.dist[g] = 0.0;
+        f.buckets.push(vec![(0.0, g as u32)]);
+        f
+    }
+
+    fn settled(&self, c: usize) -> bool {
+        let d = self.dist[c];
+        d != f32::MAX && ((d / W) as usize) < self.next
+    }
+
+    /// Process buckets until cell `c` is final (or the queue is exhausted: unreachable).
+    fn settle(&mut self, steps: &[u8], nx: usize, c: usize) {
+        let offs: [isize; 8] = STEPS.map(|(di, dj)| dj * nx as isize + di);
+        while self.next < self.buckets.len() && !self.settled(c) {
+            let b = self.next;
+            let mut cur = std::mem::take(&mut self.buckets[b]);
+            while let Some((d, c)) = cur.pop() {
+                let c = c as usize;
+                if d > self.dist[c] {
+                    continue;
+                }
+                let mask = steps[c];
+                for (k, &off) in offs.iter().enumerate() {
+                    if mask & (1 << k) == 0 {
+                        continue;
+                    }
+                    let n = (c as isize + off) as usize;
+                    let nd = d + if k >= 4 { CELL * 1.4142 } else { CELL };
+                    if nd < self.dist[n] {
+                        self.dist[n] = nd;
+                        let k = ((nd / W) as usize).max(b + 1);
+                        if k >= self.buckets.len() {
+                            self.buckets.resize_with(k + 1, Vec::new);
+                        }
+                        self.buckets[k].push((nd, n as u32));
+                    }
+                }
+            }
+            self.buckets[b] = cur;
+            self.next += 1;
+        }
+        if self.next >= self.buckets.len() {
+            self.buckets = Vec::new();
+        }
+    }
+}
 
 /// Cloning shares the walkability grid and the current distance field.
 #[derive(Clone)]
@@ -21,7 +89,7 @@ pub struct Nav {
     walk: Arc<Vec<bool>>,
     /// Per cell: bit k set if step `STEPS[k]` leads to a walkable cell without cutting a corner.
     steps: Arc<Vec<u8>>,
-    dist: Arc<Vec<f32>>,
+    dist: Arc<Mutex<Field>>,
     goal: Option<usize>,
     cache: Option<DistCache>,
 }
@@ -81,7 +149,7 @@ impl Nav {
                 steps[c] |= 1 << k;
             }
         }
-        Nav { nx, ny, x0: w.min_x, y0: w.min_y, walk: Arc::new(walk), steps: Arc::new(steps), dist: Arc::new(vec![f32::MAX; nx * ny]), goal: None, cache: None }
+        Nav { nx, ny, x0: w.min_x, y0: w.min_y, walk: Arc::new(walk), steps: Arc::new(steps), dist: Arc::new(Mutex::new(Field::empty(nx * ny))), goal: None, cache: None }
     }
 
     pub fn cell(&self, x: f32, y: f32) -> usize {
@@ -154,8 +222,7 @@ impl Nav {
                 return;
             }
         }
-        let dist = self.distance_field(g);
-        self.dist = Arc::new(dist);
+        self.dist = Arc::new(Mutex::new(Field::new(self.nx * self.ny, g)));
         if let Some(c) = &self.cache {
             let mut c = c.lock().unwrap();
             if c.len() >= DIST_CACHE_LEN {
@@ -168,7 +235,6 @@ impl Nav {
     /// Grid distances to cell `g`. Dijkstra with a bucket queue: every step costs at least CELL,
     /// so cells within one bucket (narrower than CELL) cannot improve each other and pop in any order.
     pub fn distance_field(&self, g: usize) -> Vec<f32> {
-        const W: f32 = CELL * 0.95;
         let mut dist = vec![f32::MAX; self.nx * self.ny];
         let mut buckets: Vec<Vec<(f32, u32)>> = Vec::new();
         dist[g] = 0.0;
@@ -209,13 +275,18 @@ impl Nav {
     /// Path length from (x, y) to the goal along the grid, or None if unreachable.
     pub fn path_len(&self, x: f32, y: f32) -> Option<f32> {
         let c = self.nearest_walkable(x, y)?;
-        (self.dist[c] < f32::MAX).then_some(self.dist[c])
+        let mut f = self.dist.lock().unwrap();
+        f.settle(&self.steps, self.nx, c);
+        (f.dist[c] < f32::MAX).then_some(f.dist[c])
     }
 
     /// Point to steer toward from (x, y): a few steps down the distance field toward the goal.
     pub fn steer(&self, x: f32, y: f32) -> Option<[f32; 2]> {
         let mut c = self.nearest_walkable(x, y)?;
-        if self.dist[c] == f32::MAX {
+        let mut f = self.dist.lock().unwrap();
+        f.settle(&self.steps, self.nx, c);
+        let dist = &f.dist;
+        if dist[c] == f32::MAX {
             return None;
         }
         let nx = self.nx as isize;
@@ -235,7 +306,7 @@ impl Nav {
                 if !self.walk[n] || (di != 0 && dj != 0 && (!self.walk[(cj * nx + i) as usize] || !self.walk[(j * nx + ci) as usize])) {
                     continue;
                 }
-                if self.dist[n] < self.dist[best] {
+                if dist[n] < dist[best] {
                     best = n;
                 }
             }
