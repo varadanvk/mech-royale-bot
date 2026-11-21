@@ -174,7 +174,7 @@ pub struct Params {
     pub mortar_take: f32,
     /// Do not start a laser charge (half speed) while running for cover or backing off (0 = off).
     pub flee_nocharge: f32,
-    /// With nothing else to do, healthy and holding a laser or lightning, walk toward the freshest seen or heard
+    /// With nothing else to do, healthy and holding a laser, walk toward the freshest seen or heard
     /// enemy within this distance (0 = off).
     pub hunt: f32,
     /// Hunt only above this HP fraction.
@@ -254,8 +254,8 @@ impl Default for Params {
             precharge: 0.0,
             mortar_take: 0.0,
             flee_nocharge: 0.0,
-            hunt: 0.0,
-            hunt_hp: 0.85,
+            hunt: 250.0,
+            hunt_hp: 0.8,
             no_mortar: 0.0,
         }
     }
@@ -1539,7 +1539,7 @@ impl Brain {
             mv = self.go(&pos, goal);
         } else {
             mv = self.quiet(o, &mut a, &pos, hp_frac, must_rotate, out_next, zone_goal, &threats, &mut label);
-            let armed = me.weapons.iter().flatten().any(|w| w.kind == "laser" || w.kind == "lightning");
+            let armed = me.weapons.iter().flatten().any(|w| w.kind == "laser");
             if label == "idle" && p.hunt > 0.0 && armed && hp_frac > p.hunt_hp && !self.healing && !must_rotate {
                 let seen = self
                     .known
