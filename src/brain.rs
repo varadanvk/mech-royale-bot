@@ -231,6 +231,28 @@ pub struct Params {
     pub wall_r: f32,
     /// 1 = hold a low-exposure spot inside the next circle; 2 = keep away from the known enemies inside the zone.
     pub wall_mode: f32,
+    /// Turn to look at a mech that hits us from out of view (0 = off).
+    pub look_unseen: f32,
+    /// Damage (decaying over about 3 s) from one unseen mech that makes us look.
+    pub look_dmg: f32,
+    /// Seconds to keep looking toward it.
+    pub look_s: f32,
+    /// From this match time, fight from a roof top that the nearby ground cannot see (0 = off).
+    pub roof_t: f32,
+    /// Only roof spots hidden from all ground closer than this.
+    pub roof_hide: f32,
+    /// Weight of the far view (ground 100-200 m away that sees the spot) when choosing.
+    pub roof_far: f32,
+    /// Metres of distance one point of spot score is worth.
+    pub roof_dist: f32,
+    /// In a fight with other enemies known around: move to a spot within this distance that sees the
+    /// target but as few of the others as possible (0 = off; the 6 m step of `expose_weight` instead).
+    pub isolate: f32,
+    /// Also when backing off outnumbered (kitec) or kiting.
+    pub isolate_kite: f32,
+    /// Without a laser and with nothing in sight to shoot: turn a full circle every this many seconds
+    /// to spot weapons lying around (0 = off).
+    pub spin: f32,
 }
 
 impl Default for Params {
@@ -319,7 +341,7 @@ impl Default for Params {
             laser_lead: 0.0,
             reload_early: 0.0,
             reload_laser: 1.0,
-            retreat_mode: 1.0,
+            retreat_mode: 0.0,
             break_crowd: 0.0,
             break_laser: 1000.0,
             break_los: 0.0,
@@ -332,6 +354,16 @@ impl Default for Params {
             wall_t: 0.0,
             wall_r: 290.0,
             wall_mode: 1.0,
+            look_unseen: 0.0,
+            look_dmg: 60.0,
+            look_s: 0.9,
+            roof_t: 0.0,
+            roof_hide: 50.0,
+            roof_far: 1.0,
+            roof_dist: 0.3,
+            isolate: 0.0,
+            isolate_kite: 0.0,
+            spin: 0.0,
         }
     }
 }
@@ -437,6 +469,16 @@ impl Params {
         p.wall_t = g("wall_t", p.wall_t);
         p.wall_r = g("wall_r", p.wall_r);
         p.wall_mode = g("wall_mode", p.wall_mode);
+        p.look_unseen = g("look_unseen", p.look_unseen);
+        p.look_dmg = g("look_dmg", p.look_dmg);
+        p.look_s = g("look_s", p.look_s);
+        p.roof_t = g("roof_t", p.roof_t);
+        p.roof_hide = g("roof_hide", p.roof_hide);
+        p.roof_far = g("roof_far", p.roof_far);
+        p.roof_dist = g("roof_dist", p.roof_dist);
+        p.isolate = g("isolate", p.isolate);
+        p.isolate_kite = g("isolate_kite", p.isolate_kite);
+        p.spin = g("spin", p.spin);
         p
     }
 
@@ -628,6 +670,17 @@ pub struct Brain {
     kill_spot: Option<([f32; 3], f32)>,
     /// Spot held late in the match, and when it was chosen.
     hold: Option<([f32; 2], f32)>,
+    /// Mechs hitting us from out of view: id -> (last hit time, bearing, decaying damage).
+    unseen_hits: BTreeMap<u32, (f32, f32, f32)>,
+    /// Looking toward an unseen attacker: (id, yaw, until).
+    look: Option<(u32, f32, f32)>,
+    /// Roof spot we are heading for or holding (index into `roof::spots`), and when chosen.
+    roof_goal: Option<(usize, f32)>,
+    /// Fight spot chosen by `isolate_spot`, and until when it holds.
+    iso: Option<([f32; 2], f32)>,
+    /// Current look-around turn: (start time, yaw turned so far, last yaw).
+    spin_state: Option<(f32, f32, f32)>,
+    last_spin_t: f32,
 }
 
 impl Brain {
@@ -648,6 +701,11 @@ impl Brain {
 
     /// Like `with_map`, with explicit parameters.
     pub fn with_params(hello: &Hello, world: Option<Arc<World>>, nav: Option<Nav>, params: Params) -> Brain {
+        if params.roof_t > 0.0 {
+            if let (Some(w), Some(n)) = (world.as_ref(), nav.as_ref()) {
+                crate::roof::spots(w, n);
+            }
+        }
         let cfg = &hello.config;
         let f = |a: &str, b: &str, d: f32| cfg.get(a).and_then(|v| v.get(b)).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d);
         Brain {
@@ -703,6 +761,12 @@ impl Brain {
             arm_pick: None,
             kill_spot: None,
             hold: None,
+            unseen_hits: BTreeMap::new(),
+            look: None,
+            roof_goal: None,
+            iso: None,
+            spin_state: None,
+            last_spin_t: -100.0,
         }
     }
 
@@ -1407,6 +1471,12 @@ impl Brain {
                 if let Some(by) = e.by {
                     self.last_hurt_t = o.t;
                     if by < 100 {
+                        if !o.mechs.iter().any(|m| m.id == by) {
+                            if let Some(b) = e.bearing {
+                                let prev = self.unseen_hits.get(&by).map_or(0.0, |x| x.2 * (-(o.t - x.0) / 3.0).exp());
+                                self.unseen_hits.insert(by, (o.t, b, prev + e.amount));
+                            }
+                        }
                         self.last_mech_hurt_t = o.t;
                         self.attackers.insert(by, o.t);
                         if let Some(b) = e.bearing {
@@ -1870,6 +1940,13 @@ impl Brain {
             let radial = if laser_on.is_some() { -0.2 } else { -p.kite };
             mv = self.strafe_dir(o, &pos, to, radial, false);
             boost = me.energy > p.retreat_boost_energy;
+            if p.isolate_kite > 0.0 {
+                if let Some(g) = self.isolate_spot(o, &pos, t) {
+                    if d2(&pos, &g) > 2.5 {
+                        mv = self.go(&pos, g);
+                    }
+                }
+            }
         } else if (self.fleeing || crowded) && threat_live {
             label = if self.fleeing { "heal" } else { "crowd" };
             if self.cover.map_or(true, |(_, until)| o.t > until) {
@@ -1957,6 +2034,12 @@ impl Brain {
                 let g = self.go(&pos, [c[0], c[1]]);
                 mv = norm2(g[0] + mv[0] * 0.35, g[1] + mv[1] * 0.35);
                 boost = me.energy > 30.0;
+            } else if let Some(g) = if p.isolate > 0.0 { self.isolate_spot(o, &pos, t) } else { None } {
+                label = "iso";
+                if d2(&pos, &g) > 2.5 {
+                    mv = self.go(&pos, g);
+                    boost = me.energy > 40.0 && d2(&pos, &g) > 10.0;
+                }
             } else if p.expose_weight > 0.0 {
                 mv = self.less_exposed(o, &pos, t, mv, p.expose_weight);
             }
@@ -2042,6 +2125,17 @@ impl Brain {
             }
         }
 
+        if p.roof_t > 0.0 && o.t >= p.roof_t && label != "zone" && label != "arm" {
+            if let Some((m, b, j, l)) = self.roof_move(o, &pos) {
+                mv = m;
+                boost = b;
+                a.jump = a.jump || j;
+                label = l;
+            }
+        } else if p.roof_t > 0.0 {
+            self.roof_goal = None;
+        }
+
         // --- stuck: wanting to move but not moving means a ledge or a wall; hop and jet over it
         let wants = mv[0].abs() + mv[1].abs() > 0.1;
         if wants && d2(&raw, &self.last_pos) < 0.15 {
@@ -2079,10 +2173,165 @@ impl Brain {
             boost = false;
         }
         a.boost = boost;
+        if p.look_unseen > 0.0 {
+            self.look_at_unseen(o, &mut a);
+        }
+        if p.spin > 0.0 {
+            let has_laser = me.weapons.iter().flatten().any(|w| w.kind == "laser");
+            let calm_now = shoot_at.is_none() && enemies.is_empty() && laser_on.is_none() && o.t - self.last_mech_hurt_t > 3.0;
+            if !has_laser && calm_now {
+                match self.spin_state {
+                    None if o.t - self.last_spin_t > p.spin || o.t < 0.5 => {
+                        self.spin_state = Some((o.t, 0.0, me.aim[0]));
+                    }
+                    _ => {}
+                }
+            } else {
+                self.spin_state = None;
+            }
+            if let Some((t0, done, last)) = self.spin_state {
+                let done = done + wrap(me.aim[0] - last).abs();
+                if done > TAU - 0.3 || o.t - t0 > 3.0 {
+                    self.spin_state = None;
+                    self.last_spin_t = o.t;
+                } else {
+                    self.spin_state = Some((t0, done, me.aim[0]));
+                    a.aim = [wrap(me.aim[0] + 1.2), 0.0];
+                    for (i, w) in me.weapons.iter().enumerate().take(2) {
+                        if let Some(w) = w {
+                            if w.kind == "gun" {
+                                a.fire[i] = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if !a.aim.iter().all(|v| v.is_finite()) {
             a.aim = me.aim;
         }
         a
+    }
+
+    /// Head for, climb onto and hold a roof spot inside the next circle. Returns (move, boost, jump, label).
+    fn roof_move(&mut self, o: &Obs, pos: &[f32; 3]) -> Option<([f32; 2], bool, bool, &'static str)> {
+        let (w, nav) = (self.world.clone()?, self.nav.as_ref()?);
+        let spots = crate::roof::spots(&w, nav);
+        let p = self.params.clone();
+        let z = &o.zone;
+        let ok = |s: &crate::roof::RoofSpot| self.in_next(o, &[s.x, s.y], 20.0) && s.hidden_r >= p.roof_hide;
+        let score = |s: &crate::roof::RoofSpot| (s.seen[2] + s.seen[3]) * 100.0 * p.roof_far + s.hidden_r.min(150.0) * 0.5 - (s.x - pos[0]).hypot(s.y - pos[1]) * p.roof_dist;
+        let keep = self.roof_goal.filter(|(i, t0)| ok(&spots[*i]) && o.t - t0 < 30.0);
+        let cur = match keep {
+            Some((i, _)) => i,
+            None => {
+                let best = spots.iter().enumerate().filter(|(_, s)| ok(s)).max_by(|a, b| score(a.1).partial_cmp(&score(b.1)).unwrap_or(std::cmp::Ordering::Equal)).map(|(i, _)| i);
+                let i = best?;
+                self.roof_goal = Some((i, o.t));
+                i
+            }
+        };
+        let _ = z;
+        let s = &spots[cur];
+        let me = &o.me;
+        let here = w.surface_below(pos[0], pos[1], pos[2] + 0.6);
+        let on_top = (pos[2] - s.top).abs() < 1.5 && (here - s.top).abs() < 1.0;
+        let d = (s.x - pos[0]).hypot(s.y - pos[1]);
+        let dir = norm2(s.x - pos[0], s.y - pos[1]);
+        if on_top {
+            if d < 2.0 {
+                return Some(([0.0, 0.0], false, false, "roof"));
+            }
+            return Some((dir, false, false, "roof"));
+        }
+        let climbing = self.label == "rclimb" && !me.grounded;
+        let need = (s.top - pos[2]) / 60.0 * 100.0 + 15.0;
+        let db = (s.base[0] - pos[0]).hypot(s.base[1] - pos[1]);
+        if climbing || (db < 6.0 && me.energy >= need) || (pos[2] > s.ground + 3.0 && !me.grounded) {
+            let up = pos[2] < s.top + 2.0;
+            return Some((dir, up && me.energy > 1.0, me.grounded, "rclimb"));
+        }
+        if db < 6.0 {
+            // Wait at the wall for energy.
+            return Some(([0.0, 0.0], false, false, "rwait"));
+        }
+        let mv = self.go(pos, s.base);
+        Some((mv, me.energy > 70.0 && db > 40.0, false, "rgo"))
+    }
+
+    /// Turn toward a mech that keeps hitting us from out of view, holding fire meanwhile.
+    fn look_at_unseen(&mut self, o: &Obs, a: &mut Action) {
+        let p = &self.params;
+        self.unseen_hits.retain(|_, x| o.t - x.0 < 4.0);
+        if let Some((id, _, until)) = self.look {
+            if o.t > until || o.mechs.iter().any(|m| m.id == id) {
+                self.look = None;
+            }
+        }
+        if self.look.is_none() {
+            let cand = self
+                .unseen_hits
+                .iter()
+                .filter(|(id, x)| o.t - x.0 < 1.0 && x.2 * (-(o.t - x.0) / 3.0).exp() >= p.look_dmg && !o.mechs.iter().any(|m| m.id == **id))
+                .max_by(|x, y| x.1 .2.partial_cmp(&y.1 .2).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(id, x)| (*id, x.1));
+            if let Some((id, b)) = cand {
+                self.look = Some((id, b, o.t + p.look_s));
+                self.unseen_hits.remove(&id);
+            }
+        }
+        if let Some((_, yaw, _)) = self.look {
+            a.aim = [yaw, 0.0];
+            for (i, w) in o.me.weapons.iter().enumerate().take(2) {
+                if let Some(w) = w {
+                    a.fire[i] = w.kind == "laser" && w.charge > 0.0;
+                }
+            }
+        }
+    }
+
+    /// A reachable spot nearby from which the target is in sight but as few other known enemies as
+    /// possible can see us (None when no other enemy is known).
+    fn isolate_spot(&mut self, o: &Obs, pos: &[f32; 3], t: &Actor) -> Option<[f32; 2]> {
+        let others: Vec<[f32; 3]> = self
+            .known
+            .iter()
+            .filter(|(id, k)| **id != t.id && o.t - k.seen_t < 6.0 && d2(&k.pos, pos) < 220.0)
+            .map(|(_, k)| [k.pos[0], k.pos[1], k.pos[2] + 8.0])
+            .collect();
+        if others.is_empty() {
+            self.iso = None;
+            return None;
+        }
+        if let Some((g, until)) = self.iso {
+            if o.t < until {
+                return Some(g);
+            }
+        }
+        let tc = [t.pos[0], t.pos[1], t.pos[2] + 4.5];
+        let r = self.params.isolate;
+        let mut best: Option<([f32; 2], f32)> = None;
+        for ring in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            let rr = ring * r;
+            let nk = if ring == 0.0 { 1 } else { 16 };
+            for k in 0..nk {
+                let a = k as f32 * TAU / nk as f32 + ring;
+                let c = [pos[0] + a.cos() * rr, pos[1] + a.sin() * rr];
+                if !self.walkable(c[0], c[1]) || (rr > 0.0 && !self.straight(pos, &c)) {
+                    continue;
+                }
+                let z = self.ground(c[0], c[1], pos[2]);
+                let seen = others.iter().filter(|e| self.clear(**e, [c[0], c[1], z + 5.0]) || self.clear(**e, [c[0], c[1], z + 8.5])).count() as f32;
+                let tv = self.clear([c[0], c[1], z + 7.0], tc);
+                let s = -seen * 3.0 + if tv { 2.0 } else { 0.0 } - rr * 0.03 - self.zone_penalty(o, &c) * 0.05;
+                if best.map_or(true, |b| s > b.1) {
+                    best = Some((c, s));
+                }
+            }
+        }
+        let g = best.map(|b| b.0)?;
+        self.iso = Some((g, o.t + 1.0));
+        Some(g)
     }
 
     /// Prefer a nearby step from which the target is still in sight but fewer other enemies can see us.

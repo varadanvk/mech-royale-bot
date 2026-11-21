@@ -3,4 +3,5 @@
 pub mod brain;
 pub mod nav;
 pub mod proto;
+pub mod roof;
 pub mod world;
