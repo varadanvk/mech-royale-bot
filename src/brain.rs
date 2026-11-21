@@ -181,6 +181,11 @@ pub struct Params {
     pub hunt_hp: f32,
     /// Never pick up a mortar (keep the slot for a laser or lightning).
     pub no_mortar: f32,
+    /// With nothing else to do, healthy and holding a laser: walk to where an enemy was last seen or heard,
+    /// at any distance, if that was within this many seconds (0 = off).
+    pub seek: f32,
+    /// With nothing seen or heard to go to: walk toward the next circle's centre while further than this (0 = off).
+    pub seek_center: f32,
 }
 
 impl Default for Params {
@@ -257,6 +262,8 @@ impl Default for Params {
             hunt: 250.0,
             hunt_hp: 0.8,
             no_mortar: 0.0,
+            seek: 30.0,
+            seek_center: 0.0,
         }
     }
 }
@@ -337,6 +344,8 @@ impl Params {
         p.hunt = g("hunt", p.hunt);
         p.hunt_hp = g("hunt_hp", p.hunt_hp);
         p.no_mortar = g("no_mortar", p.no_mortar);
+        p.seek = g("seek", p.seek);
+        p.seek_center = g("seek_center", p.seek_center);
         p
     }
 
@@ -519,6 +528,10 @@ pub struct Brain {
     rushing: Option<u32>,
     /// When our laser charge became full (None while not full).
     laser_full_t: Option<f32>,
+    /// Last place and time each enemy was seen, kept longer than `known`.
+    sighted: BTreeMap<u32, ([f32; 3], f32)>,
+    /// Last place and time a fight was heard.
+    heard: Option<([f32; 3], f32)>,
 }
 
 impl Brain {
@@ -590,6 +603,8 @@ impl Brain {
             label: "",
             rushing: None,
             laser_full_t: None,
+            sighted: BTreeMap::new(),
+            heard: None,
         }
     }
 
@@ -1065,6 +1080,39 @@ impl Brain {
                     aim_yaw: m.aim[0],
                 },
             );
+        }
+        for m in o.mechs.iter().filter(|m| m.kind == "mech" && !(m.max_hp > 0.0 && m.hp <= 0.0)) {
+            self.sighted.insert(m.id, (m.pos, o.t));
+        }
+        for m in o.mechs.iter().filter(|m| m.kind == "mech" && m.max_hp > 0.0 && m.hp <= 0.0) {
+            self.sighted.remove(&m.id);
+        }
+        for e in &o.events {
+            if e.kind == "kill" {
+                if let Some(t) = e.target {
+                    self.sighted.remove(&t);
+                }
+            }
+        }
+        if p.seek > 0.0 {
+            let seek_age = p.seek;
+            self.sighted.retain(|_, (_, t)| o.t - *t < seek_age);
+            if let Some(sd) = o
+                .sounds
+                .iter()
+                .filter(|sd| matches!(sd.kind.as_str(), "gun" | "laser" | "lightning" | "mortar") && sd.age < 1.0)
+                .min_by(|x, y| x.age.partial_cmp(&y.age).unwrap_or(std::cmp::Ordering::Equal))
+            {
+                let r = match sd.dist.as_str() {
+                    "near" => 40.0,
+                    "mid" => 90.0,
+                    _ => 160.0,
+                };
+                self.heard = Some(([pos[0] + sd.bearing.cos() * r, pos[1] + sd.bearing.sin() * r, pos[2]], o.t - sd.age));
+            }
+            if self.heard.map_or(false, |(_, t)| o.t - t > seek_age) {
+                self.heard = None;
+            }
         }
         let mem = p.memory_s;
         self.known.retain(|_, k| o.t - k.seen_t < mem);
@@ -1566,6 +1614,34 @@ impl Brain {
                         label = "hunt";
                         mv = self.go(&pos, [g[0], g[1]]);
                     }
+                }
+            }
+            if label == "idle" && p.seek > 0.0 && armed && hp_frac > p.hunt_hp && !self.healing && !must_rotate {
+                // Nothing in reach: go to the freshest place an enemy was seen or a fight was heard.
+                // Places we reach without finding anyone are forgotten.
+                let pos2 = pos;
+                self.sighted.retain(|_, (q, _)| d2(q, &pos2) > 15.0);
+                if self.heard.map_or(false, |(q, _)| d2(&q, &pos) < 15.0) {
+                    self.heard = None;
+                }
+                let inz = |q: &[f32; 3]| d2(q, &z.center) < z.radius - 10.0;
+                let seen = self
+                    .sighted
+                    .values()
+                    .filter(|(q, _)| inz(q))
+                    .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .copied();
+                let heard = self.heard.filter(|(q, _)| inz(q));
+                let g = match (seen, heard) {
+                    (Some(s), Some(h)) => Some(if h.1 > s.1 + 3.0 { h.0 } else { s.0 }),
+                    (s, h) => s.or(h).map(|x| x.0),
+                };
+                if let Some(g) = g {
+                    label = "seek";
+                    mv = self.go(&pos, [g[0], g[1]]);
+                } else if p.seek_center > 0.0 && d2(&pos, &z.next_center) > p.seek_center {
+                    label = "seek";
+                    mv = self.go(&pos, z.next_center);
                 }
             }
         }
