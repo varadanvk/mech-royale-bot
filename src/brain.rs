@@ -251,6 +251,16 @@ pub struct Params {
     pub stand_zone_m: f32,
     /// When backing away from a fight we are losing, move away from every enemy seen recently rather than from the target alone.
     pub kite_away: f32,
+    /// After the laser fires, step out of sight up to this far, charge it there and step back out (0 = off).
+    pub peek: f32,
+    /// Give up waiting out of sight after this many seconds.
+    pub peek_s: f32,
+    /// Only while at most this many enemies are in sight.
+    pub peek_crowd: f32,
+    /// When the line to the target's centre is blocked, aim at its upper body if that line is clear (0 = off).
+    pub aim_high: f32,
+    /// Start a laser charge on any enemy in sight even without a clear line yet (0 = off).
+    pub charge_seen: f32,
 }
 
 impl Default for Params {
@@ -362,6 +372,11 @@ impl Default for Params {
             stand_zone: 0.0,
             stand_zone_m: 25.0,
             kite_away: 0.0,
+            peek: 0.0,
+            peek_s: 5.0,
+            peek_crowd: 2.0,
+            aim_high: 0.0,
+            charge_seen: 0.0,
         }
     }
 }
@@ -477,6 +492,11 @@ impl Params {
         p.stand_zone = g("stand_zone", p.stand_zone);
         p.stand_zone_m = g("stand_zone_m", p.stand_zone_m);
         p.kite_away = g("kite_away", p.kite_away);
+        p.peek = g("peek", p.peek);
+        p.peek_s = g("peek_s", p.peek_s);
+        p.peek_crowd = g("peek_crowd", p.peek_crowd);
+        p.aim_high = g("aim_high", p.aim_high);
+        p.charge_seen = g("charge_seen", p.charge_seen);
         p
     }
 
@@ -628,6 +648,8 @@ pub struct Brain {
     fleeing: bool,
     cover: Option<([f32; 2], f32)>,
     away: [f32; 2],
+    /// Out of sight between laser shots: where we fired from, at whom, since when.
+    peek: Option<([f32; 2], u32, f32)>,
     scan_yaw: f32,
     known: BTreeMap<u32, Known>,
     /// Mechs that shot us recently: id -> time.
@@ -710,6 +732,7 @@ impl Brain {
             fleeing: false,
             cover: None,
             away: [0.0, 0.0],
+            peek: None,
             scan_yaw: 0.0,
             known: BTreeMap::new(),
             attackers: BTreeMap::new(),
@@ -854,7 +877,7 @@ impl Brain {
                 if aim.is_none() {
                     aim = Some(s.aim);
                 }
-            } else if w.charge > 0.0 {
+            } else if w.charge > 0.0 || (p.charge_seen > 0.0 && w.cooldown <= 0.0) {
                 a.fire[*i] = true;
             }
         }
@@ -950,8 +973,14 @@ impl Brain {
     fn solve(&self, o: &Obs, w: &Weapon, t: &Actor) -> Shot {
         let me = &o.me;
         let scale = 1.0 + 0.05 * t.cubes;
-        let tc = [t.pos[0], t.pos[1], t.pos[2] + 4.5 * scale];
         let muzzle = [me.pos[0], me.pos[1], me.pos[2] + me.stat("muzzle_height", 7.0)];
+        let mut tc = [t.pos[0], t.pos[1], t.pos[2] + 4.5 * scale];
+        if self.params.aim_high > 0.0 && !self.clear(muzzle, tc) {
+            let hi = [t.pos[0], t.pos[1], t.pos[2] + 7.6 * scale];
+            if self.clear(muzzle, hi) {
+                tc = hi;
+            }
+        }
         let dist = d3(&muzzle, &tc);
         let flat = |p: &[f32; 3], from: &[f32; 3]| [(p[1] - from[1]).atan2(p[0] - from[0]), (p[2] - from[2]).atan2(d2(p, from).max(0.01))];
         let body = [(2.5 * scale * 0.85 / dist.max(1.0)).atan(), (4.5 * scale * 0.8 / dist.max(1.0)).atan()];
@@ -1793,6 +1822,10 @@ impl Brain {
             }
             _ => None,
         };
+        if self.peek.map_or(false, |(_, id, t0)| o.t - t0 > p.peek_s || !self.known.contains_key(&id)) {
+            self.peek = None;
+        }
+        let peek_wait = self.peek.filter(|_| hp_frac > p.retreat_hp && !must_rotate && enemies.is_empty()).and_then(|(spot, id, _)| self.known.get(&id).map(|k| (spot, k.pos)));
         // Stand-off: the nearest enemy in sight that is closer than we want (nearly dead ones may come in).
         let stand_from = if p.standoff > 0.0 && !finishing {
             enemies
@@ -2003,6 +2036,29 @@ impl Brain {
             if shoot_at.is_none() {
                 self.scan(&mut a);
             }
+        } else if let Some((spot, tk)) = peek_wait {
+            // Out of sight: charge the laser, then step back to where we fired from.
+            let lw = me.weapons.iter().enumerate().take(2).find_map(|(i, w)| w.as_ref().filter(|w| w.kind == "laser").map(|w| (i, w.charge >= w.stat("charge", 0.75) - 0.01, w.cooldown)));
+            a.aim = [yaw_to(&pos, &tk), 0.0];
+            match lw {
+                Some((li, full, cd)) if !full => {
+                    label = "hide";
+                    a.fire[li] = cd <= 0.0 || me.weapons[li].as_ref().map_or(false, |w| w.charge > 0.0);
+                    mv = [0.0, 0.0];
+                }
+                Some((li, _, _)) => {
+                    label = "repeek";
+                    a.fire[li] = true;
+                    mv = self.go(&pos, spot);
+                    if d2(&pos, &spot) < 1.5 {
+                        mv = norm2(tk[0] - pos[0], tk[1] - pos[1]);
+                    }
+                }
+                None => {
+                    label = "repeek";
+                    mv = self.go(&pos, spot);
+                }
+            }
         } else if let (Some(t), true) = (target, engaged || recently_hurt_by_mech || target.map_or(false, |t| d2(&t.pos, &pos) < p.open_fire_range)) {
             label = "fight";
             let dist = d2(&t.pos, &pos);
@@ -2038,7 +2094,18 @@ impl Brain {
             } else {
                 None
             };
-            if let Some(h) = hide {
+            let just_fired = me.weapons.iter().flatten().any(|w| w.kind == "laser" && w.cooldown > 0.6 && w.charge <= 0.0);
+            let peek = if p.peek > 0.0 && hide.is_none() && just_fired && !finishing && (enemies.len() as f32) <= p.peek_crowd {
+                self.hide_step(&pos, &eyes, p.peek)
+            } else {
+                None
+            };
+            if let Some(h) = peek {
+                label = "peek";
+                mv = h;
+                boost = me.energy > 25.0;
+                self.peek = Some(([pos[0], pos[1]], t.id, o.t));
+            } else if let Some(h) = hide {
                 label = "reload";
                 mv = h;
                 boost = me.energy > 25.0;
@@ -2114,7 +2181,7 @@ impl Brain {
             }
         }
         // Outside a fight, still weave across the line of the nearest shooter.
-        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "fight" || label == "rush" || label == "climb" || label == "hold" || label == "drone" || label == "reload" || label == "stand") {
+        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "fight" || label == "rush" || label == "climb" || label == "hold" || label == "drone" || label == "reload" || label == "stand" || label == "peek" || label == "hide" || label == "repeek") {
             if o.t >= self.strafe_until {
                 self.next_strafe(o.t);
             }
@@ -2157,7 +2224,9 @@ impl Brain {
             let taken: f32 = o.events.iter().filter(|e| e.kind == "damaged" && e.by.map_or(false, |b| b < 100)).map(|e| e.amount).sum();
             let nd = target.map_or(-1.0, |t| d2(&t.pos, &pos));
             let dealt: f32 = o.events.iter().filter(|e| e.kind == "hit" && e.target.map_or(false, |b| b < 100)).map(|e| e.amount).sum();
-            eprintln!("TD {:.1} {} {:.0} {:.2} {} {} {:.0} {} {:.0}", o.t, label, taken, hp_frac, enemies.len(), near_enemies, nd, me.cubes, dealt);
+            let lz: f32 = o.events.iter().filter(|e| e.kind == "hit" && e.weapon.as_deref() == Some("laser") && e.target.map_or(false, |b| b < 100)).map(|e| e.amount).sum();
+            let lst = me.weapons.iter().flatten().find(|w| w.kind == "laser").map_or(-1.0, |w| if w.charge > 0.0 { 2.0 } else if w.cooldown > 0.0 { 1.0 } else { 0.0 });
+            eprintln!("TD {:.1} {} {:.0} {:.2} {} {} {:.0} {} {:.0} {:.0} {}", o.t, label, taken, hp_frac, enemies.len(), near_enemies, nd, me.cubes, dealt, lz, lst);
         }
         if std::env::var("TTRACE").is_ok() && o.tick % 20 == 0 {
             eprintln!("TR {:.1} {} hp {:.0} cubes {} enemies {} near {} e {:.0} w {}", o.t, label, me.hp, me.cubes, enemies.len(), near_enemies, me.energy, held.join("+"));
