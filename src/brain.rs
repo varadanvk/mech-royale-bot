@@ -1,5 +1,6 @@
 //! Decision logic: one `act` per observation.
 use crate::nav::Nav;
+use crate::net::{Net, NF, NO};
 use crate::proto::{Action, Actor, Hello, Obs, Weapon};
 use crate::world::World;
 use std::collections::{BTreeMap, VecDeque};
@@ -524,6 +525,34 @@ const UPGRADES: &[&str] = &[
     "gun_velocity", "mortar_reload", "mortar_splash", "sensors", "mortar_velocity", "laser_pierce",
 ];
 
+/// Apply the learned adjustments; a zero output leaves the parameter untouched.
+fn adjust(p: &mut Params, o: &[f32; NO]) {
+    fn m(v: &mut f32, o: f32, scale: f32, lo: f32, hi: f32) {
+        if o != 0.0 {
+            *v = (*v + o * scale).clamp(lo, hi);
+        }
+    }
+    m(&mut p.retreat_hp, o[0], 0.3, 0.05, 0.95);
+    m(&mut p.reengage_hp, o[1], 0.15, 0.3, 1.0);
+    m(&mut p.gun_range, o[2], 40.0, 15.0, 150.0);
+    m(&mut p.open_fire_range, o[3], 100.0, 30.0, 350.0);
+    m(&mut p.crowd_radius, o[4], 100.0, 20.0, 300.0);
+    m(&mut p.focus_hp, o[5], 150.0, -100.0, 400.0);
+    if o[6] > 0.0 {
+        p.hunt = 300.0 * o[6];
+    }
+    m(&mut p.hunt_hp, o[7], 0.3, 0.0, 1.0);
+    m(&mut p.farm_hp, o[8], 0.4, 0.0, 1.1);
+    m(&mut p.arm_hp, o[9], 0.4, 0.0, 1.1);
+    m(&mut p.zone_lead, o[10], 20.0, 0.0, 60.0);
+    m(&mut p.evade_weight, o[11], 0.8, 0.0, 3.0);
+    m(&mut p.kite, o[12], 1.0, 0.0, 1.0);
+    m(&mut p.rush_hp, o[13], 0.4, 0.0, 1.1);
+    m(&mut p.heal_lo, o[14], 0.4, 0.0, 0.99);
+    m(&mut p.finish_hp, o[15], 0.3, 0.0, 0.9);
+    m(&mut p.cube_grab, o[16], 50.0, 0.0, 150.0);
+}
+
 fn weapon_rank(kind: &str, p: &Params) -> i32 {
     let laser_first = p.laser_first > 0.0;
     let mortar_second = p.mortar_over_arc > 0.0;
@@ -692,6 +721,10 @@ pub struct Brain {
     kill_spot: Option<([f32; 3], f32)>,
     /// Spot held late in the match, and when it was chosen.
     hold: Option<([f32; 2], f32)>,
+    /// Learned adjustments of the parameters (None = rules only).
+    net: Option<Arc<Net>>,
+    nn_prev_hp: f32,
+    nn_dmg: f32,
 }
 
 impl Brain {
@@ -712,6 +745,11 @@ impl Brain {
 
     /// Like `with_map`, with explicit parameters.
     pub fn with_params(hello: &Hello, world: Option<Arc<World>>, nav: Option<Nav>, params: Params) -> Brain {
+        Brain::with_params_and_net(hello, world, nav, params, Net::builtin().map(Arc::new))
+    }
+
+    /// Like `with_params`, with explicit decision weights (None = rules only).
+    pub fn with_params_and_net(hello: &Hello, world: Option<Arc<World>>, nav: Option<Nav>, params: Params, net: Option<Arc<Net>>) -> Brain {
         let cfg = &hello.config;
         let f = |a: &str, b: &str, d: f32| cfg.get(a).and_then(|v| v.get(b)).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d);
         Brain {
@@ -770,7 +808,79 @@ impl Brain {
             arm_pick: None,
             kill_spot: None,
             hold: None,
+            net,
+            nn_prev_hp: -1.0,
+            nn_dmg: 0.0,
         }
+    }
+
+    /// Situation features for the learned layer (all roughly in [-2, 2]).
+    fn features(&mut self, o: &Obs) -> [f32; NF] {
+        let me = &o.me;
+        let pos = me.pos;
+        let mut x = [0f32; NF];
+        let hpf = me.hp / me.max_hp.max(1.0);
+        if self.nn_prev_hp >= 0.0 {
+            let lost = (self.nn_prev_hp - me.hp).max(0.0) / me.max_hp.max(1.0);
+            self.nn_dmg = self.nn_dmg * 0.95 + lost;
+        }
+        self.nn_prev_hp = me.hp;
+        let has = |k: &str| me.weapons.iter().flatten().any(|w| w.kind == k) as i32 as f32;
+        let z = &o.zone;
+        let near = |v: &mut dyn Iterator<Item = f32>| v.fold(300.0f32, f32::min) / 200.0;
+        x[0] = hpf;
+        x[1] = me.energy / me.max_energy.max(1.0);
+        x[2] = (me.cubes / 10.0).min(2.0);
+        x[3] = o.t / 300.0;
+        x[4] = z.radius / 500.0;
+        x[5] = ((d2(&pos, &z.next_center) - z.next_radius) / 100.0).clamp(-3.0, 3.0);
+        x[6] = me.in_zone as i32 as f32;
+        x[7] = has("laser");
+        x[8] = has("lightning");
+        x[9] = has("mortar");
+        x[10] = (me.weapons.len() < 2 || me.weapons.iter().take(2).any(|w| w.is_none())) as i32 as f32;
+        if let Some(g) = me.weapons.iter().flatten().find(|w| w.kind == "gun") {
+            x[11] = g.ammo / g.stat("mag", 12.0).max(1.0);
+            x[12] = (g.reload > 0.0) as i32 as f32;
+        }
+        if let Some(l) = me.weapons.iter().flatten().find(|w| w.kind == "laser") {
+            x[13] = l.charge / l.stat("charge", 0.75).max(0.01);
+        }
+        let vis: Vec<&Actor> = o.mechs.iter().filter(|m| m.kind == "mech" && !(m.max_hp > 0.0 && m.hp <= 0.0)).collect();
+        x[14] = vis.len() as f32 / 4.0;
+        x[15] = self.known.len() as f32 / 8.0;
+        x[16] = o.alive as f32 / 16.0;
+        x[17] = (o.t - self.last_mech_hurt_t).min(10.0) / 10.0;
+        x[18] = self.nn_dmg.min(3.0);
+        x[19] = self.fleeing as i32 as f32;
+        x[20] = self.healing as i32 as f32;
+        x[21] = vis.iter().filter(|m| d2(&m.pos, &pos) < 150.0).count() as f32 / 4.0;
+        x[22] = z.next_radius / 500.0;
+        x[23] = ((z.shrink_start - o.t) / 60.0).clamp(-3.0, 3.0);
+        x[24] = near(&mut o.pickups.iter().map(|q| d2(&q.pos, &pos)));
+        x[25] = near(&mut self.cubes_mem.values().map(|q| d2(q, &pos)));
+        x[26] = near(&mut o.mechs.iter().filter(|m| m.kind == "npc" && m.hp > 0.0).map(|m| d2(&m.pos, &pos)));
+        x[27] = 1.0;
+        let mut ks: Vec<(f32, u32)> = self.known.iter().map(|(id, k)| (d2(&k.pos, &pos), *id)).collect();
+        ks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+        for slot in 0..4 {
+            let b = 28 + slot * 7;
+            let Some(&(d, id)) = ks.get(slot) else {
+                x[b] = 2.0;
+                continue;
+            };
+            let k = &self.known[&id];
+            let rel = wrap(yaw_to(&pos, &k.pos) - me.aim[0]);
+            let v = vis.iter().find(|m| m.id == id);
+            x[b] = (d / 200.0).min(2.0);
+            x[b + 1] = rel.cos();
+            x[b + 2] = rel.sin();
+            x[b + 3] = v.is_some() as i32 as f32;
+            x[b + 4] = v.map_or(0.5, |m| if m.max_hp > 0.0 { m.hp / m.max_hp } else { 1.0 });
+            x[b + 5] = (wrap(k.aim_yaw - yaw_to(&k.pos, &pos)).abs() < 0.2) as i32 as f32;
+            x[b + 6] = ((o.t - k.seen_t) / 10.0).min(2.0);
+        }
+        x
     }
 
     fn rnd(&mut self) -> f32 {
@@ -1318,6 +1428,17 @@ impl Brain {
         };
         self.estimate_delay(&now);
         self.prev_motion = Some(now);
+        // Learned layer: adjust this decision's parameters (zero output = unchanged).
+        let saved = match self.net.clone() {
+            Some(net) => {
+                let x = self.features(o);
+                let out = net.forward(&x);
+                let base = self.params.clone();
+                adjust(&mut self.params, &out);
+                Some(base)
+            }
+            None => None,
+        };
         let delay = self.assumed_delay();
         self.delay_used = delay;
         let n = ((delay / 0.1).round() as usize).min(self.sent.len());
@@ -1330,6 +1451,9 @@ impl Brain {
         self.sent.push_back(Sent { mv: a.mv, boost: a.boost, aim: a.aim, fire: a.fire });
         while self.sent.len() > 6 {
             self.sent.pop_front();
+        }
+        if let Some(b) = saved {
+            self.params = b;
         }
         a
     }
