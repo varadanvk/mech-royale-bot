@@ -107,6 +107,10 @@ pub struct Params {
     pub laser_hide: f32,
     /// Count enemies seen within this many seconds toward "outnumbered" (0 = only those in view now).
     pub crowd_mem: f32,
+    /// With nothing to do and HP above this fraction, go looking for a lone enemy (0 = never).
+    pub hunt_hp: f32,
+    /// Do not go looking before this match time.
+    pub hunt_after: f32,
 }
 
 impl Default for Params {
@@ -149,6 +153,8 @@ impl Default for Params {
             reload_hide: 16.0,
             laser_hide: 8.0,
             crowd_mem: 6.0,
+            hunt_hp: 0.85,
+            hunt_after: 0.0,
         }
     }
 }
@@ -195,6 +201,8 @@ impl Params {
         p.reload_hide = g("reload_hide", p.reload_hide);
         p.laser_hide = g("laser_hide", p.laser_hide);
         p.crowd_mem = g("crowd_mem", p.crowd_mem);
+        p.hunt_hp = g("hunt_hp", p.hunt_hp);
+        p.hunt_after = g("hunt_after", p.hunt_after);
         p
     }
 
@@ -276,6 +284,10 @@ pub struct Brain {
     cubes_mem: HashMap<u32, [f32; 3]>,
     picks_mem: HashMap<u32, (String, [f32; 3])>,
     healing: bool,
+    /// Where enemies were last heard or seen: position and time.
+    leads: Vec<([f32; 2], f32)>,
+    /// Exploration waypoint when there are no leads.
+    roam: Option<([f32; 2], f32)>,
     /// Short name of the current behaviour, for debugging.
     pub label: &'static str,
 }
@@ -329,6 +341,8 @@ impl Brain {
             cubes_mem: HashMap::new(),
             picks_mem: HashMap::new(),
             healing: false,
+            leads: Vec::new(),
+            roam: None,
             label: "",
         }
     }
@@ -607,6 +621,26 @@ impl Brain {
             self.crates_mem.retain(|id, q| !gone(q, o.crates.iter().any(|c| c.id == *id)));
             self.cubes_mem.retain(|id, q| !gone(q, o.cubes.iter().any(|c| c.id == *id)));
             self.picks_mem.retain(|id, q| !gone(&q.1, o.pickups.iter().any(|c| c.id == *id)));
+        }
+
+        // --- leads: weapon sounds (only mechs make these) and enemies in sight
+        for snd in &o.sounds {
+            if matches!(snd.kind.as_str(), "gun" | "laser" | "lightning" | "mortar") {
+                let d = match snd.dist.as_str() {
+                    "near" => 40.0,
+                    "mid" => 110.0,
+                    _ => 220.0,
+                };
+                self.leads.push(([pos[0] + snd.bearing.cos() * d, pos[1] + snd.bearing.sin() * d], o.t - snd.age));
+            }
+        }
+        for m in o.mechs.iter().filter(|m| m.kind == "mech") {
+            self.leads.push(([m.pos[0], m.pos[1]], o.t));
+        }
+        self.leads.retain(|(_, t)| o.t - t < 15.0);
+        if self.leads.len() > 64 {
+            let n = self.leads.len() - 64;
+            self.leads.drain(0..n);
         }
 
         // --- what hurt us
@@ -1017,6 +1051,37 @@ impl Brain {
         a
     }
 
+    /// Somewhere to look for an enemy: the freshest lead inside the safe area, else a roaming point.
+    fn hunt_goal(&mut self, o: &Obs, pos: &[f32; 3]) -> [f32; 2] {
+        let z = &o.zone;
+        let safe = |c: &[f32; 2]| d2(c, &z.center) < z.radius - 20.0 && (o.t < z.shrink_start - 25.0 || d2(c, &z.next_center) < z.next_radius - 10.0);
+        let lead = self
+            .leads
+            .iter()
+            .filter(|(c, _)| safe(c) && d2(c, pos) > 25.0)
+            .max_by(|x, y| (x.1 - d2(&x.0, pos) * 0.02).partial_cmp(&(y.1 - d2(&y.0, pos) * 0.02)).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(c, _)| *c);
+        if let Some(c) = lead {
+            return c;
+        }
+        let stale = self.roam.map_or(true, |(c, t)| o.t - t > 25.0 || d2(&c, pos) < 8.0 || !safe(&c));
+        if stale {
+            let (cx, cy, r) = if o.t < z.shrink_start - 25.0 { (z.center[0], z.center[1], z.radius) } else { (z.next_center[0], z.next_center[1], z.next_radius) };
+            let mut c = [cx, cy];
+            for _ in 0..12 {
+                let a = self.rnd() * TAU;
+                let rr = (r - 30.0).max(0.0) * self.rnd().sqrt();
+                let q = [cx + a.cos() * rr, cy + a.sin() * rr];
+                if self.walkable(q[0], q[1]) && d2(&q, pos) > 60.0 {
+                    c = q;
+                    break;
+                }
+            }
+            self.roam = Some((c, o.t));
+        }
+        self.roam.unwrap().0
+    }
+
     /// Prefer a nearby step from which the target is still in sight but fewer other enemies can see us.
     fn less_exposed(&self, o: &Obs, pos: &[f32; 3], t: &Actor, mv: [f32; 2], w: f32) -> [f32; 2] {
         let others: Vec<[f32; 3]> = self
@@ -1254,6 +1319,11 @@ impl Brain {
         let mv = match g {
             Some(g) => {
                 *label = "loot";
+                self.go(pos, g)
+            }
+            None if p.hunt_hp > 0.0 && hp_frac > p.hunt_hp && o.t >= p.hunt_after && !self.healing => {
+                *label = "hunt";
+                let g = self.hunt_goal(o, pos);
                 self.go(pos, g)
             }
             None => self.idle_move(o, pos),
