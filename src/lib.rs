@@ -2,5 +2,6 @@
 //! `proto` the wire types, `brain` the decision logic.
 pub mod brain;
 pub mod nav;
+pub mod net;
 pub mod proto;
 pub mod world;
