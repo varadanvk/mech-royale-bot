@@ -307,7 +307,7 @@ impl Default for Params {
             focus_stick: 50.0,
             farm_until: 0.0,
             farm_reach: 160.0,
-            heal_lo: 0.5,
+            heal_lo: 0.0,
             heal_hi: 0.7,
             expose_weight: 1.0,
             cube_grab: 45.0,
@@ -369,7 +369,7 @@ impl Default for Params {
             collect_hp: 0.3,
             collect_seen: 2.0,
             arm_keep: 0.0,
-            wall_t: 0.0,
+            wall_t: 170.0,
             wall_r: 290.0,
             wall_mode: 1.0,
             standoff: 0.0,
@@ -391,7 +391,7 @@ impl Default for Params {
             farm_stop: 0.0,
             hunt_any: 0.0,
             solo_hp: 0.0,
-            close_boost: 0.0,
+            close_boost: 30.0,
         }
     }
 }
