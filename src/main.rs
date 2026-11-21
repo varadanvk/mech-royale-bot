@@ -63,6 +63,9 @@ fn main() {
             None => Action { tick: obs.tick, aim: obs.me.aim, ..Default::default() },
         };
         let mut action = action;
+        if (obs.t as f64) > 270.0 {
+            action = Action { tick: obs.tick, aim: obs.me.aim, ..Default::default() };
+        }
         // NaN would serialize as null and fail the schema: fall back to safe values.
         if !action.mv.iter().all(|v| v.is_finite()) {
             action.mv = [0.0, 0.0];
