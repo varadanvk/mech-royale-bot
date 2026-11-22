@@ -271,6 +271,9 @@ pub struct Params {
     pub solo_hp: f32,
     /// Boost toward the target in a fight while further than the preferred distance by 15 m and energy is above this (0 = off).
     pub close_boost: f32,
+    /// Take on drones by choice (farming, chasing). 0: only shoot back at a drone that hurt us in the last
+    /// 3 s while no mech is in view, and never move toward one.
+    pub drone_fight: f32,
 }
 
 impl Default for Params {
@@ -392,6 +395,7 @@ impl Default for Params {
             hunt_any: 0.0,
             solo_hp: 0.0,
             close_boost: 30.0,
+            drone_fight: 0.0,
         }
     }
 }
@@ -517,6 +521,7 @@ impl Params {
         p.hunt_any = g("hunt_any", p.hunt_any);
         p.solo_hp = g("solo_hp", p.solo_hp);
         p.close_boost = g("close_boost", p.close_boost);
+        p.drone_fight = g("drone_fight", p.drone_fight);
         p
     }
 
@@ -654,6 +659,8 @@ pub struct Brain {
     pub params: Params,
     rng: u64,
     pickup_radius: f32,
+    /// Drone body: radius and height.
+    npc_size: [f32; 2],
     /// Seconds per simulation tick.
     tick_s: f32,
     strafe: f32,
@@ -661,6 +668,16 @@ pub struct Brain {
     last_pos: [f32; 3],
     stuck: u32,
     unstick_until: f32,
+    /// Match time of the decision in progress.
+    now_t: f32,
+    /// Whether `go` steered us this decision.
+    nav_used: bool,
+    /// Recent path-following directions, one per decision: (time, direction).
+    nav_hist: VecDeque<(f32, [f32; 2])>,
+    /// Path-following direction held after it kept reversing: (direction, goal, until).
+    nav_hold: Option<([f32; 2], [f32; 2], f32)>,
+    /// Recent decisions: (time, true position, steered by `go`, move sent).
+    trail: VecDeque<(f32, [f32; 2], bool, [f32; 2])>,
     last_hurt_t: f32,
     /// Last time a mech (not a drone or the zone) damaged us.
     last_mech_hurt_t: f32,
@@ -740,12 +757,18 @@ impl Brain {
             params,
             rng: (hello.seed ^ 0x9e3779b97f4a7c19) | 1,
             pickup_radius: f("loot", "pickup_radius", 4.0),
+            npc_size: [f("npc", "radius", 1.8), f("npc", "height", 3.5)],
             tick_s: 1.0 / f("match", "tick_hz", 20.0).max(1.0),
             strafe: 1.0,
             strafe_until: 0.0,
             last_pos: [0.0; 3],
             stuck: 0,
             unstick_until: 0.0,
+            now_t: 0.0,
+            nav_used: false,
+            nav_hist: VecDeque::new(),
+            nav_hold: None,
+            trail: VecDeque::new(),
             last_hurt_t: -100.0,
             last_mech_hurt_t: -100.0,
             threat: None,
@@ -824,6 +847,44 @@ impl Brain {
 
     /// Unit move direction toward a goal along the ground path.
     fn go(&mut self, pos: &[f32; 3], goal: [f32; 2]) -> [f32; 2] {
+        let dir = self.path_dir(pos, goal);
+        if dir == [0.0, 0.0] {
+            return dir;
+        }
+        self.nav_used = true;
+        // Close to the goal, turning around is just arriving.
+        if d2(pos, &goal) <= 6.0 {
+            return dir;
+        }
+        let t = self.now_t;
+        if let Some((hd, hg, until)) = self.nav_hold {
+            if t < until && d2(&hg, &goal) < 10.0 {
+                return hd;
+            }
+            self.nav_hold = None;
+        }
+        // One entry per decision; keep the last second.
+        if self.nav_hist.back().map_or(false, |e| e.0 == t) {
+            self.nav_hist.pop_back();
+        }
+        self.nav_hist.push_back((t, dir));
+        while self.nav_hist.front().map_or(false, |e| t - e.0 > 1.0) {
+            self.nav_hist.pop_front();
+        }
+        // The path direction keeps reversing: commit to one way for a second to break the cycle.
+        let flips = self.nav_hist.iter().zip(self.nav_hist.iter().skip(1)).filter(|(x, y)| x.1[0] * y.1[0] + x.1[1] * y.1[1] < -0.5).count();
+        if flips >= 3 {
+            let prev = self.nav_hist.iter().rev().nth(1).map_or(dir, |e| e.1);
+            let open = |d: [f32; 2]| self.walkable(pos[0] + d[0] * 4.0, pos[1] + d[1] * 4.0);
+            let hd = if !open(dir) && open(prev) { prev } else { dir };
+            self.nav_hold = Some((hd, goal, t + 1.0));
+            self.nav_hist.clear();
+            return hd;
+        }
+        dir
+    }
+
+    fn path_dir(&mut self, pos: &[f32; 3], goal: [f32; 2]) -> [f32; 2] {
         let dist = d2(pos, &goal);
         if dist < 1.5 {
             return [0.0, 0.0];
@@ -865,14 +926,21 @@ impl Brain {
             }
         }
         let find = |k: &str| sols.iter().find(|(_, w, _)| w.kind == k);
+        let full_now = |w: &Weapon| w.charge >= w.stat("charge", 0.75) - 0.01;
         let gun = find("gun").filter(|(_, _, s)| s.ok);
         let mut aim: Option<[f32; 2]> = gun.map(|(_, _, s)| s.aim);
         let mut engaged = gun.is_some();
         if let Some((i, w, s)) = gun {
             a.fire[*i] = lined(s, slack) && w.cooldown <= 0.12;
         }
-        if let Some((i, w, s)) = find("laser") {
-            if s.ok {
+        // The laser is for mechs; a charge that has waited nearly as long as it can without a line is let go
+        // rather than holding the aim away from the gun.
+        let near_auto = |w: &Weapon| self.laser_full_t.map_or(false, |t0| o.t - t0 >= w.stat("hold_s", 2.0) - 0.25);
+        if let Some((i, w, s)) = find("laser").filter(|_| t.kind == "mech") {
+            if s.ok && full_now(w) && near_auto(w) && !lined(s, [0.0, 0.0]) {
+                engaged = true;
+                a.fire[*i] = false;
+            } else if s.ok {
                 engaged = true;
                 let full_c = w.stat("charge", 0.75);
                 let mut full = w.charge >= full_c - 0.01;
@@ -897,7 +965,7 @@ impl Brain {
                 if aim.is_none() {
                     aim = Some(s.aim);
                 }
-            } else if w.charge > 0.0 || (p.charge_seen > 0.0 && w.cooldown <= 0.0) {
+            } else if (w.charge > 0.0 && !(full_now(w) && near_auto(w))) || (p.charge_seen > 0.0 && w.cooldown <= 0.0 && w.charge <= 0.0) {
                 a.fire[*i] = true;
             }
         }
@@ -994,8 +1062,11 @@ impl Brain {
         let me = &o.me;
         let scale = 1.0 + 0.05 * t.cubes;
         let muzzle = [me.pos[0], me.pos[1], me.pos[2] + me.stat("muzzle_height", 7.0)];
-        let mut tc = [t.pos[0], t.pos[1], t.pos[2] + 4.5 * scale];
-        if self.params.aim_high > 0.0 && !self.clear(muzzle, tc) {
+        // Body radius and half height: a mech grows with its cubes, a drone is much smaller.
+        let drone = t.kind == "npc";
+        let (radius, half) = if drone { (self.npc_size[0], self.npc_size[1] * 0.5) } else { (2.5 * scale, 4.5 * scale) };
+        let mut tc = [t.pos[0], t.pos[1], t.pos[2] + half];
+        if self.params.aim_high > 0.0 && !drone && !self.clear(muzzle, tc) {
             let hi = [t.pos[0], t.pos[1], t.pos[2] + 7.6 * scale];
             if self.clear(muzzle, hi) {
                 tc = hi;
@@ -1003,7 +1074,7 @@ impl Brain {
         }
         let dist = d3(&muzzle, &tc);
         let flat = |p: &[f32; 3], from: &[f32; 3]| [(p[1] - from[1]).atan2(p[0] - from[0]), (p[2] - from[2]).atan2(d2(p, from).max(0.01))];
-        let body = [(2.5 * scale * 0.85 / dist.max(1.0)).atan(), (4.5 * scale * 0.8 / dist.max(1.0)).atan()];
+        let body = [(radius * 0.85 / dist.max(1.0)).atan(), (half * 0.8 / dist.max(1.0)).atan()];
         match w.kind.as_str() {
             "gun" => {
                 let speed = w.stat("speed", 252.0);
@@ -1444,6 +1515,8 @@ impl Brain {
         let mut a = Action { tick: o.tick, aim: me.aim, ..Default::default() };
         let hp_frac = me.hp / me.max_hp.max(1.0);
         let walk_speed = me.stat("walk_speed", 11.7);
+        self.now_t = o.t;
+        self.nav_used = false;
 
         // --- memory of mechs
         for m in o.mechs.iter().filter(|m| m.kind == "mech" && !(m.max_hp > 0.0 && m.hp <= 0.0)) {
@@ -1553,15 +1626,17 @@ impl Brain {
         // Drone to deal with: one shooting us, or (when calm) one worth farming.
         let calm = enemies.is_empty() && o.t - self.last_mech_hurt_t > 5.0;
         let drones: Vec<&Actor> = o.mechs.iter().filter(|m| m.kind == "npc" && m.hp > 0.0).collect();
+        // Without `drone_fight`, only a drone that hurt us in the last 3 s counts.
+        let drone_mem = if p.drone_fight > 0.0 { f32::MAX } else { 3.0 };
         let hostile_drone = drones
             .iter()
-            .filter(|d| self.drone_attackers.contains_key(&d.id))
+            .filter(|d| self.drone_attackers.get(&d.id).map_or(false, |t| o.t - t < drone_mem))
             .min_by(|x, y| d2(&x.pos, &pos).partial_cmp(&d2(&y.pos, &pos)).unwrap_or(std::cmp::Ordering::Equal))
             .copied();
         let early = o.t < p.farm_until;
         let drone_reach = if early { p.drone_range.max(p.farm_reach.min(120.0)) } else { p.drone_range };
         let farm_on = p.farm_stop <= 0.0 || o.t < p.farm_stop;
-        let farm_drone = if calm && farm_on && hp_frac > p.farm_hp && !self.healing {
+        let farm_drone = if p.drone_fight > 0.0 && calm && farm_on && hp_frac > p.farm_hp && !self.healing {
             drones
                 .iter()
                 .filter(|d| d2(&d.pos, &pos) < drone_reach)
@@ -1636,6 +1711,27 @@ impl Brain {
                 self.laser_full_t = Some(o.t);
             }
             let held_full = self.laser_full_t.map_or(0.0, |t0| o.t - t0);
+            // Without a mech to shoot at, never start a charge; hold one only for a mech seen within the last
+            // second, aimed where it should be now, and let it go before it would fire on its own.
+            if !shoot_at.map_or(false, |t| t.kind == "mech") {
+                let recent = self
+                    .known
+                    .values()
+                    .filter(|k| o.t - k.seen_t < 1.0)
+                    .min_by(|x, y| d2(&x.pos, &pos).partial_cmp(&d2(&y.pos, &pos)).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|k| {
+                        let dt = o.t - k.seen_t;
+                        [k.pos[0] + k.vel[0] * dt, k.pos[1] + k.vel[1] * dt, k.pos[2] + 4.5]
+                    });
+                match recent {
+                    Some(q) if lw.charge > 0.0 && held_full < lw.stat("hold_s", 2.0) - 0.25 => {
+                        a.fire[li] = true;
+                        let muzzle = [pos[0], pos[1], pos[2] + me.stat("muzzle_height", 7.0)];
+                        a.aim = [yaw_to(&muzzle, &q), (q[2] - muzzle[2]).atan2(d2(&q, &muzzle).max(0.1))];
+                    }
+                    _ => a.fire[li] = false,
+                }
+            }
             let soon = p.precharge > 0.0
                 && !engaged
                 && lw.cooldown <= 0.0
@@ -2147,12 +2243,23 @@ impl Brain {
             if p.close_boost > 0.0 && off > 15.0 && me.energy > p.close_boost && label == "fight" {
                 boost = true;
             }
-        } else if let Some(d) = drone_target {
+        } else if let (Some(d), true) = (drone_target, p.drone_fight > 0.0) {
             label = "drone";
             let dist = d2(&d.pos, &pos);
             let to = norm2(d.pos[0] - pos[0], d.pos[1] - pos[1]);
             let radial = ((dist - 50.0) / 15.0).clamp(-1.0, 1.0);
             mv = self.strafe_dir(o, &pos, to, radial, false);
+        } else if let Some(d) = drone_target {
+            // Shoot back but carry on with our own business, never closing in on the drone.
+            let (aim, fire, reload) = (a.aim, a.fire, a.reload);
+            mv = self.quiet(o, &mut a, &pos, hp_frac, must_rotate, out_next, zone_goal, &threats, &mut label);
+            (a.aim, a.fire, a.reload) = (aim, fire, reload);
+            label = "drone";
+            let to = norm2(d.pos[0] - pos[0], d.pos[1] - pos[1]);
+            let toward = mv[0] * to[0] + mv[1] * to[1];
+            if toward > 0.0 && !must_rotate {
+                mv = [mv[0] - to[0] * toward, mv[1] - to[1] * toward];
+            }
         } else if let Some(d) = hostile_drone {
             // Too hurt to fight it: walk away from it.
             label = "leave";
@@ -2234,11 +2341,26 @@ impl Brain {
         } else {
             self.stuck = 0;
         }
-        if self.stuck >= 5 {
+        // Progress watchdog: over the last 2 s we meant to get somewhere (following a path, or a move that
+        // adds up to real distance) yet moved less than 2 m.
+        self.trail.push_back((o.t, [raw[0], raw[1]], self.nav_used && wants, mv));
+        while self.trail.front().map_or(false, |e| o.t - e.0 > 2.05) {
+            self.trail.pop_front();
+        }
+        let mut no_progress = false;
+        if let Some(first) = self.trail.front().filter(|e| o.t - e.0 >= 1.95) {
+            let n = self.trail.len() as f32;
+            let nav_frac = self.trail.iter().filter(|e| e.2).count() as f32 / n;
+            let intent = self.trail.iter().fold([0.0f32; 2], |s, e| [s[0] + e.3[0], s[1] + e.3[1]]);
+            let intent = (intent[0] * intent[0] + intent[1] * intent[1]).sqrt() * walk_speed * 0.1;
+            no_progress = wants && d2(&raw, &first.1) < 2.0 && (nav_frac >= 0.8 || intent >= 6.0);
+        }
+        if self.stuck >= 5 || no_progress {
             self.unstick_until = o.t + 0.8;
             self.strafe = -self.strafe;
             self.wander = None;
             self.stuck = 0;
+            self.trail.clear();
         }
         if o.t < self.unstick_until {
             a.jump = me.grounded;
@@ -2586,5 +2708,57 @@ impl Brain {
             }
         }
         mv
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn brain() -> Brain {
+        Brain::with_params(&Hello::default(), None, None, Params::default())
+    }
+
+    fn obs(other: &str, events: &str) -> Obs {
+        let s = format!(
+            r#"{{"tick": 100, "t": 5.0,
+              "self": {{"pos": [0,0,0], "aim": [0,0], "hp": 1400, "max_hp": 1400, "energy": 100, "grounded": true, "in_zone": true,
+                        "weapons": [{{"kind": "gun", "ammo": 12}}, {{"kind": "laser"}}]}},
+              "mechs": [{other}], "events": [{events}],
+              "zone": {{"center": [0,0], "radius": 500, "next_center": [0,0], "next_radius": 400, "shrink_start": 100}}}}"#
+        );
+        serde_json::from_str(&s).unwrap()
+    }
+
+    const DRONE: &str = r#"{"id": 104, "kind": "npc", "pos": [40, 0, 0], "hp": 350, "max_hp": 350}"#;
+    const MECH: &str = r#"{"id": 3, "kind": "mech", "pos": [40, 0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+
+    #[test]
+    fn drones_are_aimed_at_by_their_own_size() {
+        let b = brain();
+        let o = obs(DRONE, "");
+        let gun = o.me.weapons[0].clone().unwrap();
+        let drone = b.solve(&o, &gun, &o.mechs[0]);
+        let want = (1.75f32 - 7.0).atan2(40.0);
+        assert!((drone.aim[1] - want).abs() < 0.01, "pitch {} want {}", drone.aim[1], want);
+        let o = obs(MECH, "");
+        let mech = b.solve(&o, &gun, &o.mechs[0]);
+        assert!(drone.tol[0] < mech.tol[0] && drone.tol[1] < mech.tol[1]);
+    }
+
+    #[test]
+    fn laser_is_kept_for_mechs() {
+        let hurt = r#"{"type": "damaged", "amount": 25, "weapon": "npc", "by": 104, "bearing": 0}"#;
+        let a = brain().decide(&obs(DRONE, hurt), [0.0; 3]);
+        assert!(!a.fire[1], "laser charged at a drone");
+        assert!(a.aim[0].abs() < 0.2, "not aimed at the drone");
+        let a = brain().decide(&obs(MECH, ""), [0.0; 3]);
+        assert!(a.fire[1], "laser not charged at a mech");
+    }
+
+    #[test]
+    fn drones_are_left_alone_unless_they_shoot() {
+        let a = brain().decide(&obs(DRONE, ""), [0.0; 3]);
+        assert!(!a.fire[0] && !a.fire[1]);
     }
 }

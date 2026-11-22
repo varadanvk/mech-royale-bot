@@ -285,15 +285,40 @@ impl Nav {
         let mut c = self.nearest_walkable(x, y)?;
         let mut f = self.dist.lock().unwrap();
         f.settle(&self.steps, self.nx, c);
-        let dist = &f.dist;
-        if dist[c] == f32::MAX {
+        if f.dist[c] == f32::MAX {
             return None;
         }
         let nx = self.nx as isize;
-        // If we are standing in a blocked cell, first get back onto the grid.
-        if !self.walk[self.cell(x, y)] {
-            return Some(self.center(c));
+        // Standing in a blocked cell (pressed against a wall): step back onto the grid toward the goal.
+        // The nearest walkable cell often lies behind us, and heading there and back again cycles.
+        let here = self.cell(x, y);
+        if !self.walk[here] {
+            let (hi, hj) = ((here % self.nx) as isize, (here / self.nx) as isize);
+            let mut best: Option<(f32, usize)> = None;
+            for dj in -2..=2isize {
+                for di in -2..=2isize {
+                    let (i, j) = (hi + di, hj + dj);
+                    if i < 0 || j < 0 || i >= nx || j >= self.ny as isize {
+                        continue;
+                    }
+                    let n = (j * nx + i) as usize;
+                    if !self.walk[n] {
+                        continue;
+                    }
+                    f.settle(&self.steps, self.nx, n);
+                    if f.dist[n] == f32::MAX {
+                        continue;
+                    }
+                    let p = self.center(n);
+                    let cost = (p[0] - x).hypot(p[1] - y) + f.dist[n];
+                    if best.map_or(true, |b| cost < b.0) {
+                        best = Some((cost, n));
+                    }
+                }
+            }
+            return Some(self.center(best.map_or(c, |b| b.1)));
         }
+        let dist = &f.dist;
         for _ in 0..4 {
             let (ci, cj) = ((c as isize) % nx, (c as isize) / nx);
             let mut best = c;
