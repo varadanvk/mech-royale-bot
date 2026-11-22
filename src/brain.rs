@@ -379,6 +379,8 @@ pub struct Params {
     pub cube_r_low: f32,
     /// Sidestep tuning: how far ahead a bullet is tracked and how far we step.
     pub dodge_look: f32,
+    /// With shots in the air that can reach us, choose the fight move by scoring candidate moves against them; the value weighs progress along the wanted move (0 = off).
+    pub plan: f32,
     pub dodge_reach: f32,
     /// Tell a free-for-all from a practice match (see `detect`) and keep a picture of every enemy alongside the
     /// usual logic; nothing it learns changes a decision unless `ffa_play` is on and a free-for-all is settled
@@ -668,6 +670,7 @@ impl Default for Params {
             ext_finish: 1.0,
             cube_r_low: 40.0,
             dodge_look: 1.2,
+            plan: 2.0,
             dodge_reach: 3.5,
             ffa_detect: 1.0,
             ffa_play: 1.0,
@@ -916,6 +919,7 @@ impl Params {
         p.ext_finish = g("ext_finish", p.ext_finish);
         p.cube_r_low = g("cube_r_low", p.cube_r_low);
         p.dodge_look = g("dodge_look", p.dodge_look);
+        p.plan = g("plan", p.plan);
         p.dodge_reach = g("dodge_reach", p.dodge_reach);
         p.ffa_detect = g("ffa_detect", p.ffa_detect);
         p.ffa_play = g("ffa_play", p.ffa_play);
@@ -1285,6 +1289,7 @@ pub struct Brain {
     /// Sidestep in progress: direction and end time; when the last one started.
     dodge_dir: [f32; 2],
     dodge_until: f32,
+    plan_last: [f32; 2],
     /// Retreat burst in progress until this time, toward this cell (None: none found, fight in place).
     cr_until: f32,
     cr_goal: Option<[f32; 2]>,
@@ -1450,6 +1455,7 @@ impl Brain {
             hp_hist: VecDeque::new(),
             dodge_dir: [0.0, 0.0],
             dodge_until: -1.0,
+            plan_last: [0.0, 0.0],
             cr_until: -1.0,
             cr_goal: None,
             fp_side: 1.0,
@@ -3510,10 +3516,19 @@ impl Brain {
         }
 
         // Sidestep an incoming shot.
-        if p.dodge > 0.0 && label != "zone" && label != "climb" && o.t >= self.unstick_until && self.dodge_check(o, target, mv, &threats) {
+        let planned = if p.plan > 0.0 && label != "zone" && label != "climb" && o.t >= self.unstick_until && (target.is_some() || !enemies.is_empty()) {
+            self.plan_move(o, mv, boost, a.aim[0], target.map(|t| [t.pos[0], t.pos[1]]), &threats)
+        } else {
+            None
+        };
+        if let Some((m, b)) = planned {
+            mv = m;
+            boost = b;
+        } else if p.dodge > 0.0 && label != "zone" && label != "climb" && o.t >= self.unstick_until && self.dodge_check(o, target, mv, &threats) {
             mv = self.dodge_dir;
             boost = me.energy > 3.0;
         }
+        self.plan_last = if mv.iter().all(|v| v.is_finite()) { norm2(mv[0], mv[1]) } else { [0.0, 0.0] };
 
         // --- stuck: wanting to move but not moving means a ledge or a wall; hop and jet over it
         let wants = mv[0].abs() + mv[1].abs() > 0.1;
@@ -4091,6 +4106,8 @@ impl Brain {
 
 #[path = "tactics.rs"]
 mod tactics;
+#[path = "plan.rs"]
+mod plan;
 #[path = "ffa.rs"]
 pub mod ffa;
 #[path = "pincer.rs"]
