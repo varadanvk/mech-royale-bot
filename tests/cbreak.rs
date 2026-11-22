@@ -17,7 +17,7 @@ fn load() -> Option<(Arc<World>, Nav)> {
 }
 
 fn off() -> Params {
-    Params { cb_away: 0.0, cb_path: 0.0, cb_known: 0.0, cb_corner: 0.0, cb_turn: 0.0, ..Params::default() }
+    Params { cb_away: 0.0, cb_path: 0.0, cb_known: 0.0, cb_corner: 0.0, cb_turn: 0.0, hold_fire: 0.0, ..Params::default() }
 }
 
 fn d2(a: [f32; 2], b: [f32; 2]) -> f32 {

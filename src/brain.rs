@@ -5,7 +5,7 @@ use crate::nav::Nav;
 use crate::proto::{Action, Actor, Hello, Obs, Weapon};
 use crate::sight::{Foe, Pick, SightTable, Zone};
 use crate::world::{PrismKind, World};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
 
@@ -395,6 +395,9 @@ pub struct Params {
     pub cb_known: f32,
     pub cb_corner: f32,
     pub cb_turn: f32,
+    /// Outside a free-for-all, hold fire on a mech farther than this many metres unless it hit us in the last 2 s
+    /// or two or more mechs within 60 m are aimed at us; approaching and the rest go on as usual (0 = off).
+    pub hold_fire: f32,
 }
 
 impl Default for Params {
@@ -574,6 +577,7 @@ impl Default for Params {
             cb_known: 1.0,
             cb_corner: 1.0,
             cb_turn: 1.0,
+            hold_fire: 40.0,
         }
     }
 }
@@ -757,6 +761,7 @@ impl Params {
         p.cb_known = g("cb_known", p.cb_known);
         p.cb_corner = g("cb_corner", p.cb_corner);
         p.cb_turn = g("cb_turn", p.cb_turn);
+        p.hold_fire = g("hold_fire", p.hold_fire);
         p
     }
 
@@ -1047,6 +1052,8 @@ pub struct Brain {
     pub dbg_kills: Vec<(f32, Option<u32>, Option<u32>)>,
     pub dbg_mode: String,
     pub dbg_enemies: Vec<ffa::EnemyInfo>,
+    /// Per-match counts, kept only when `TINMAN_TALLY` is set (tracing; no decision reads them).
+    tally: Option<Tally>,
 }
 
 impl Brain {
@@ -1183,6 +1190,7 @@ impl Brain {
             dbg_kills: Vec::new(),
             dbg_mode: String::new(),
             dbg_enemies: Vec::new(),
+            tally: std::env::var("TINMAN_TALLY").is_ok().then(Tally::default),
         }
     }
 
@@ -2198,6 +2206,20 @@ impl Brain {
             }
         }
 
+        // Holding fire (`hold_fire`): a mech farther than that is only aimed at, unless it hit us in the last 2 s
+        // or two or more mechs within 60 m are aimed at us. A laser charge already under way goes on.
+        if let Some(t) = shoot_at.filter(|t| p.hold_fire > 0.0 && !ffa_on && t.kind == "mech") {
+            let hurt = self.attackers.get(&t.id).map_or(false, |x| o.t - x < 2.0);
+            let aimed = enemies.iter().filter(|m| d2(&m.pos, &pos) < 60.0 && wrap(m.aim[0] - yaw_to(&m.pos, &pos)).abs() < 0.2).count();
+            if d2(&t.pos, &pos) > p.hold_fire && !hurt && aimed < 2 {
+                for (i, w) in me.weapons.iter().enumerate().take(2) {
+                    if !w.as_ref().map_or(false, |w| w.kind == "laser" && w.charge > 0.0) {
+                        a.fire[i] = false;
+                    }
+                }
+            }
+        }
+
         // --- laser: track how long a full charge has been held; charge ahead for an enemy about to show
         // Aim that a held charge needs kept whatever the movement mode does with the torso.
         let mut laser_aim: Option<[f32; 2]> = None;
@@ -3123,6 +3145,38 @@ impl Brain {
             }
         }
         a.boost = boost;
+        if let Some(tl) = self.tally.as_mut() {
+            tl.dec += 1;
+            tl.t = o.t;
+            if enemies.is_empty() {
+                tl.unseen += 1;
+            }
+            for m in enemies.iter().filter(|m| d2(&m.pos, &pos) < 45.0) {
+                tl.near.insert(m.id);
+            }
+            for _ in o.events.iter().filter(|e| e.kind == "kill") {
+                if o.t < 120.0 {
+                    tl.kills_early += 1;
+                } else {
+                    tl.kills_late += 1;
+                }
+            }
+            if let Some(t) = shoot_at.filter(|t| engaged && t.kind == "mech" && (a.fire[0] || a.fire[1])) {
+                tl.fire += 1;
+                if a.mv[0].hypot(a.mv[1]) > 0.1 {
+                    tl.fire_mv += 1;
+                }
+                if d2(&t.pos, &pos) > 40.0 {
+                    tl.far += 1;
+                    if !self.attackers.get(&t.id).map_or(false, |x| o.t - x < 2.0) {
+                        tl.far_cold += 1;
+                    }
+                }
+            }
+            if label == "den" {
+                tl.den += 1;
+            }
+        }
         if !a.aim.iter().all(|v| v.is_finite()) {
             a.aim = me.aim;
         }
@@ -3614,8 +3668,32 @@ mod tactics;
 #[path = "ffa.rs"]
 pub mod ffa;
 
+/// Per-match counts for tracing: decisions; decisions shooting at a mech, moving while doing so, at one
+/// farther than 40 m, and of those at one that had not hit us in the last 2 s; decisions with no mech in view;
+/// decisions holding the den; mechs seen within 45 m; our kills before and from 120 s.
+#[derive(Default)]
+struct Tally {
+    t: f32,
+    dec: u32,
+    fire: u32,
+    fire_mv: u32,
+    far: u32,
+    far_cold: u32,
+    unseen: u32,
+    den: u32,
+    near: BTreeSet<u32>,
+    kills_early: u32,
+    kills_late: u32,
+}
+
 impl Drop for Brain {
     fn drop(&mut self) {
+        if let Some(tl) = &self.tally {
+            eprintln!(
+                "TALLY seed {} t {:.1} dec {} fire {} fire_mv {} far {} far_cold {} unseen {} den {} near45 {} kills_early {} kills_late {}",
+                self.ffa_seed, tl.t, tl.dec, tl.fire, tl.fire_mv, tl.far, tl.far_cold, tl.unseen, tl.den, tl.near.len(), tl.kills_early, tl.kills_late
+            );
+        }
         if self.trace_ffa {
             let t = self.ffa_ticks;
             eprintln!(
@@ -3645,6 +3723,7 @@ mod tests {
             ext_fpos: 0.0,
             ext_late: 0.0,
             ext_finish: 0.0,
+            hold_fire: 0.0,
             ..Params::default()
         }
     }
@@ -3954,6 +4033,29 @@ mod tests {
         let mut b = with(Params { laser_fix: 1.0, ..base() });
         let a = b.decide(&o, [0.0; 3]);
         assert!(!a.fire[1]);
+    }
+
+    #[test]
+    fn fire_is_held_on_a_distant_mech() {
+        let far = r#"{"id": 3, "kind": "mech", "pos": [80, 0, 0], "aim": [3.14159, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let near = r#"{"id": 3, "kind": "mech", "pos": [35, 0, 0], "aim": [3.14159, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let hit = r#"{"type": "damaged", "amount": 45, "weapon": "gun", "by": 3, "bearing": 0}"#;
+        let quiet = || with(Params { hold_fire: 40.0, ..base() });
+        let mut b = quiet();
+        let a = b.decide(&obs(far, ""), [0.0; 3]);
+        assert!(!a.fire[0] && !a.fire[1], "fired at a mech 80 m away");
+        assert_eq!(b.focus, Some(3), "the mech is still the target");
+        assert!(a.mv[0] > 0.5, "no approach {:?}", a.mv);
+        let a = quiet().decide(&obs(far, hit), [0.0; 3]);
+        assert!(a.fire[0] || a.fire[1], "no answer to a hit");
+        let a = quiet().decide(&obs(near, ""), [0.0; 3]);
+        assert!(a.fire[0] || a.fire[1], "no fire within 40 m");
+        let two = format!(r#"{near}, {{"id": 4, "kind": "mech", "pos": [0, 50, 0], "aim": [-1.5708, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}}"#);
+        let two = two.replace("[35, 0, 0]", "[55, 0, 0]");
+        let a = quiet().decide(&obs(&two, ""), [0.0; 3]);
+        assert!(a.fire[0] || a.fire[1], "no fire with two mechs aimed at us");
+        let a = with(base()).decide(&obs(far, ""), [0.0; 3]);
+        assert!(a.fire[0] || a.fire[1], "without the switch the mech is shot at");
     }
 
     #[test]
