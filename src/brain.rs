@@ -281,6 +281,19 @@ pub struct Params {
     pub threat_face: f32,
     /// Against a target holding lightning within 60 m, back away (boosting) while kiting or holding.
     pub ltg_space: f32,
+    /// Laser discipline: let a charge go only when the beam lines up on a mech where it will be; never dump it
+    /// unaimed. With the target out of view, keep holding toward where it should be until the charge fires itself.
+    pub laser_hold: f32,
+    /// Shoot back at drones near enough to attack us (or that hurt us recently) while no mech is in view or
+    /// shooting at us, finishing the most damaged first; never walk toward them.
+    pub drone_threat: f32,
+    /// Target choice: metres of preference for an enemy whose torso is aimed at us (0 = off).
+    pub focus_aimer: f32,
+    /// While walking to a weapon, shoot crates in view within 100 m when no mech is around (0 = off).
+    pub arm_crates: f32,
+    /// No lightning rush on a laser holder from beyond the arc range + 15 m unless its laser fired within the
+    /// last 1.5 s, and none from beyond 60 m with an empty magazine (0 = off).
+    pub rush_guard: f32,
 }
 
 impl Default for Params {
@@ -406,6 +419,11 @@ impl Default for Params {
             hold_fight: 1.0,
             threat_face: 1.0,
             ltg_space: 1.0,
+            laser_hold: 0.0,
+            drone_threat: 0.0,
+            focus_aimer: 0.0,
+            arm_crates: 0.0,
+            rush_guard: 0.0,
         }
     }
 }
@@ -535,6 +553,11 @@ impl Params {
         p.hold_fight = g("hold_fight", p.hold_fight);
         p.threat_face = g("threat_face", p.threat_face);
         p.ltg_space = g("ltg_space", p.ltg_space);
+        p.laser_hold = g("laser_hold", p.laser_hold);
+        p.drone_threat = g("drone_threat", p.drone_threat);
+        p.focus_aimer = g("focus_aimer", p.focus_aimer);
+        p.arm_crates = g("arm_crates", p.arm_crates);
+        p.rush_guard = g("rush_guard", p.rush_guard);
         p
     }
 
@@ -555,9 +578,9 @@ const UPGRADES_DMG: &[&str] = &[
     "gun_velocity", "mortar_reload", "mortar_splash", "sensors", "mortar_velocity", "laser_pierce",
 ];
 
-/// Upgrade preference, best first. Survival first: placement is the score.
+/// Upgrade preference, best first. Survival first: hit points, armour, regeneration and speed before damage.
 const UPGRADES: &[&str] = &[
-    "plating", "armor", "nanites", "gun_damage", "lightning_efficiency", "servos", "gun_rate", "laser_damage",
+    "plating", "armor", "nanites", "servos", "gun_damage", "lightning_efficiency", "gun_rate", "laser_damage",
     "lightning_chain", "reactor", "laser_charge", "capacitor", "gun_mag", "gyros", "lightning_range", "jets",
     "gun_velocity", "mortar_reload", "mortar_splash", "sensors", "mortar_velocity", "laser_pierce",
 ];
@@ -674,6 +697,8 @@ pub struct Brain {
     pickup_radius: f32,
     /// Drone body: radius and height.
     npc_size: [f32; 2],
+    /// Distance within which a drone opens fire on a mech it can see.
+    npc_aggro: f32,
     /// Seconds per simulation tick.
     tick_s: f32,
     strafe: f32,
@@ -706,6 +731,8 @@ pub struct Brain {
     attackers: BTreeMap<u32, f32>,
     /// Drones that shot us recently: id -> time.
     drone_attackers: BTreeMap<u32, f32>,
+    /// Mechs whose laser we saw fire recently: id -> time.
+    laser_fired: BTreeMap<u32, f32>,
     post: Option<([f32; 2], f32)>,
     wander: Option<[f32; 2]>,
     dodged_charge: BTreeMap<u32, f32>,
@@ -771,6 +798,7 @@ impl Brain {
             rng: (hello.seed ^ 0x9e3779b97f4a7c19) | 1,
             pickup_radius: f("loot", "pickup_radius", 4.0),
             npc_size: [f("npc", "radius", 1.8), f("npc", "height", 3.5)],
+            npc_aggro: f("npc", "aggro_range", 45.0),
             tick_s: 1.0 / f("match", "tick_hz", 20.0).max(1.0),
             strafe: 1.0,
             strafe_until: 0.0,
@@ -793,6 +821,7 @@ impl Brain {
             known: BTreeMap::new(),
             attackers: BTreeMap::new(),
             drone_attackers: BTreeMap::new(),
+            laser_fired: BTreeMap::new(),
             post: None,
             wander: None,
             dodged_charge: BTreeMap::new(),
@@ -948,9 +977,18 @@ impl Brain {
         }
         // The laser is for mechs; a charge that has waited nearly as long as it can without a line is let go
         // rather than holding the aim away from the gun.
-        let near_auto = |w: &Weapon| self.laser_full_t.map_or(false, |t0| o.t - t0 >= w.stat("hold_s", 2.0) - 0.25);
+        // With `laser_hold` a charge is never let go unaimed: it is held on the solution until it lines up or
+        // fires by itself at the end of the hold.
+        let hold = p.laser_hold > 0.0;
+        let near_auto = |w: &Weapon| !hold && self.laser_full_t.map_or(false, |t0| o.t - t0 >= w.stat("hold_s", 2.0) - 0.25);
         if let Some((i, w, s)) = find("laser").filter(|_| t.kind == "mech") {
-            if s.ok && full_now(w) && near_auto(w) && !lined(s, [0.0, 0.0]) {
+            if hold && !s.ok && w.charge > 0.0 {
+                // No clear line right now: keep the charge and the aim on where the mech is.
+                a.fire[*i] = true;
+                if aim.is_none() {
+                    aim = Some(s.aim);
+                }
+            } else if s.ok && full_now(w) && near_auto(w) && !lined(s, [0.0, 0.0]) {
                 engaged = true;
                 a.fire[*i] = false;
             } else if s.ok {
@@ -1131,7 +1169,8 @@ impl Brain {
             }
             "laser" => {
                 let ok = dist < w.stat("range", 280.0) && self.clear(muzzle, tc);
-                let ll = self.params.laser_lead;
+                // Holding for a lined-up release: lead by at least the tick the beam takes to leave.
+                let ll = if self.params.laser_hold > 0.0 { self.params.laser_lead.max(self.tick_s) } else { self.params.laser_lead };
                 let lc = [tc[0] + t.vel[0] * ll, tc[1] + t.vel[1] * ll, tc[2] + t.vel[2] * ll];
                 Shot { aim: flat(&lc, &muzzle), tol: [body[0] * 0.8, body[1] * 0.8], ok }
             }
@@ -1534,6 +1573,10 @@ impl Brain {
         // --- memory of mechs
         for m in o.mechs.iter().filter(|m| m.kind == "mech" && !(m.max_hp > 0.0 && m.hp <= 0.0)) {
             let prev_charge = self.known.get(&m.id).and_then(|k| k.charge_since);
+            // A charge we were watching that is gone: the beam went out.
+            if prev_charge.is_some() && !m.charging {
+                self.laser_fired.insert(m.id, o.t);
+            }
             let prev_vel = self.known.get(&m.id).filter(|k| o.t - k.seen_t < 0.35 && o.t > k.seen_t).map(|k| (k.vel, k.seen_t));
             self.known.insert(
                 m.id,
@@ -1551,6 +1594,13 @@ impl Brain {
         self.known.retain(|_, k| o.t - k.seen_t < mem);
         self.attackers.retain(|_, t| o.t - *t < 10.0);
         self.drone_attackers.retain(|_, t| o.t - *t < 6.0);
+        for b in o.beams.iter().filter(|b| b.kind == "laser") {
+            let t = o.t - b.age;
+            if self.laser_fired.get(&b.by).map_or(true, |x| *x < t) {
+                self.laser_fired.insert(b.by, t);
+            }
+        }
+        self.laser_fired.retain(|_, t| o.t - *t < 10.0);
         self.dodged_charge.retain(|_, t| o.t - *t < 3.0);
 
         // --- loot memory: remember what we saw, forget what should be in view but is not
@@ -1616,7 +1666,9 @@ impl Brain {
             let hpf = if m.max_hp > 0.0 { m.hp / m.max_hp } else { 1.0 };
             let attacker = self.attackers.get(&m.id).map_or(false, |t| o.t - t < 4.0);
             let loot = if no_laser && m.weapons.iter().any(|w| w == "laser") { p.loot_target } else { 0.0 };
-            d + hpf * p.focus_hp - if attacker { 40.0 } else { 0.0 } - loot
+            // Its torso (and so its next shot) is pointed at us.
+            let aimer = if p.focus_aimer > 0.0 && wrap(m.aim[0] - yaw_to(&m.pos, &pos)).abs() < 0.2 { p.focus_aimer } else { 0.0 };
+            d + hpf * p.focus_hp - if attacker { 40.0 } else { 0.0 } - loot - aimer
         };
         let best = enemies
             .iter()
@@ -1658,7 +1710,21 @@ impl Brain {
         } else {
             None
         };
-        let drone_target = if target.is_none() {
+        // A drone close enough to open fire on us, or one that hurt us lately: shoot it while no mech is in view
+        // or shooting at us, the most damaged first.
+        let threat_drone = if p.drone_threat > 0.0 && target.is_none() && o.t - self.last_mech_hurt_t > 3.0 {
+            let sc = |d: &Actor| d2(&d.pos, &pos) + 60.0 * if d.max_hp > 0.0 { d.hp / d.max_hp } else { 1.0 };
+            drones
+                .iter()
+                .filter(|d| d2(&d.pos, &pos) < self.npc_aggro + 5.0 || self.drone_attackers.get(&d.id).map_or(false, |t| o.t - t < 4.0))
+                .min_by(|x, y| sc(x).partial_cmp(&sc(y)).unwrap_or(std::cmp::Ordering::Equal).then(x.id.cmp(&y.id)))
+                .copied()
+        } else {
+            None
+        };
+        let drone_target = if threat_drone.is_some() {
+            threat_drone
+        } else if target.is_none() {
             match hostile_drone {
                 Some(d) if hp_frac > 0.35 => Some(d),
                 _ => farm_drone,
@@ -1716,6 +1782,8 @@ impl Brain {
         }
 
         // --- laser: track how long a full charge has been held; charge ahead for an enemy about to show
+        // Aim that a held charge needs kept whatever the movement mode does with the torso.
+        let mut laser_aim: Option<[f32; 2]> = None;
         if let Some((li, lw)) = me.weapons.iter().enumerate().take(2).find_map(|(i, w)| w.as_ref().filter(|w| w.kind == "laser").map(|w| (i, w))) {
             let full = lw.charge >= lw.stat("charge", 0.75) - 0.01;
             if !full {
@@ -1727,25 +1795,38 @@ impl Brain {
             // Without a mech to shoot at, never start a charge; hold one only for a mech seen within the last
             // second, aimed where it should be now, and let it go before it would fire on its own.
             if !shoot_at.map_or(false, |t| t.kind == "mech") {
+                // With `laser_hold`: the mech seen last (any time we still remember it), held until the charge
+                // fires by itself.
+                let hold = p.laser_hold > 0.0;
                 let recent = self
                     .known
                     .values()
-                    .filter(|k| o.t - k.seen_t < 1.0)
-                    .min_by(|x, y| d2(&x.pos, &pos).partial_cmp(&d2(&y.pos, &pos)).unwrap_or(std::cmp::Ordering::Equal))
+                    .filter(|k| hold || o.t - k.seen_t < 1.0)
+                    .min_by(|x, y| {
+                        if hold {
+                            y.seen_t.partial_cmp(&x.seen_t).unwrap_or(std::cmp::Ordering::Equal).then(d2(&x.pos, &pos).partial_cmp(&d2(&y.pos, &pos)).unwrap_or(std::cmp::Ordering::Equal))
+                        } else {
+                            d2(&x.pos, &pos).partial_cmp(&d2(&y.pos, &pos)).unwrap_or(std::cmp::Ordering::Equal)
+                        }
+                    })
                     .map(|k| {
-                        let dt = o.t - k.seen_t;
+                        let dt = (o.t - k.seen_t).min(if hold { 1.5 } else { f32::MAX });
                         [k.pos[0] + k.vel[0] * dt, k.pos[1] + k.vel[1] * dt, k.pos[2] + 4.5]
                     });
                 match recent {
-                    Some(q) if lw.charge > 0.0 && held_full < lw.stat("hold_s", 2.0) - 0.25 => {
+                    Some(q) if lw.charge > 0.0 && (hold || held_full < lw.stat("hold_s", 2.0) - 0.25) => {
                         a.fire[li] = true;
                         let muzzle = [pos[0], pos[1], pos[2] + me.stat("muzzle_height", 7.0)];
                         a.aim = [yaw_to(&muzzle, &q), (q[2] - muzzle[2]).atan2(d2(&q, &muzzle).max(0.1))];
+                        if hold {
+                            laser_aim = Some(a.aim);
+                        }
                     }
                     _ => a.fire[li] = false,
                 }
             }
             let soon = p.precharge > 0.0
+                && p.laser_hold <= 0.0
                 && !engaged
                 && lw.cooldown <= 0.0
                 && self.known.iter().any(|(id, k)| o.t - k.seen_t < 2.0 && d2(&k.pos, &pos) < p.precharge && !enemies.iter().any(|m| m.id == *id));
@@ -1895,7 +1976,15 @@ impl Brain {
                 let e_ok = if cont { me.energy > p.arc_energy * 0.5 } else { me.energy > p.rush_energy };
                 let hp_ok = hp_frac > p.rush_hp || tf < me.hp * 0.7;
                 let reach = if cont { p.rush_start + 20.0 } else { p.rush_start };
-                if d < reach && e_ok && hp_ok && others <= p.rush_crowd {
+                // A laser holder is closed on from afar only while its laser is cooling down; an empty
+                // magazine leaves nothing to cover a long approach with.
+                let guard_ok = p.rush_guard <= 0.0 || {
+                    let arc_r = arc_w.map_or(45.0, |w| w.stat("range", 45.0));
+                    let laser_ready = t.weapons.iter().any(|w| w == "laser") && self.laser_fired.get(&t.id).map_or(true, |x| o.t - x > 1.5);
+                    let empty = me.weapons.iter().flatten().any(|w| w.kind == "gun" && w.ammo <= 0.0);
+                    !(laser_ready && d > arc_r + 15.0) && !(empty && d > 60.0)
+                };
+                if d < reach && e_ok && hp_ok && others <= p.rush_crowd && guard_ok {
                     Some(t)
                 } else {
                     None
@@ -1984,6 +2073,17 @@ impl Brain {
             label = "arm";
             mv = self.go(&pos, [g[0], g[1]]);
             boost = me.energy > 30.0 && d2(&g, &pos) > 12.0;
+            // On the way, break crates in view with the gun while no mech is around.
+            let gun_ready = me.weapons.iter().flatten().any(|w| w.kind == "gun" && w.ammo > 0.0 && w.reload <= 0.0);
+            if p.arm_crates > 0.0 && gun_ready && shoot_at.is_none() && enemies.is_empty() && o.t - self.last_mech_hurt_t > 3.0 {
+                let mut near: Vec<[f32; 3]> = o.crates.iter().map(|c| c.pos).filter(|q| d3(q, &pos) < 100.0).collect();
+                near.sort_by(|x, y| d3(x, &pos).partial_cmp(&d3(y, &pos)).unwrap_or(std::cmp::Ordering::Equal));
+                for c in &near {
+                    if self.aim_crate(o, &mut a, &pos, c) {
+                        break;
+                    }
+                }
+            }
             if p.roof > 0.0 && (g[2] - pos[2] > 2.5 || (self.label == "climb" && !me.grounded)) {
                 // Up on a roof: walk to the wall below it, then jump and jet up and over the edge.
                 let hd = d2(&g, &pos);
@@ -2181,7 +2281,7 @@ impl Brain {
             match lw {
                 Some((li, full, cd)) if !full => {
                     label = "hide";
-                    a.fire[li] = cd <= 0.0 || me.weapons[li].as_ref().map_or(false, |w| w.charge > 0.0);
+                    a.fire[li] = (cd <= 0.0 && p.laser_hold <= 0.0) || me.weapons[li].as_ref().map_or(false, |w| w.charge > 0.0);
                     mv = [0.0, 0.0];
                 }
                 Some((li, _, _)) => {
@@ -2326,6 +2426,10 @@ impl Brain {
             }
         }
 
+        // A held laser charge keeps its aim whatever the mode did with the torso.
+        if let Some(la) = laser_aim {
+            a.aim = la;
+        }
         // A laser about to fire at us: duck out of its line if a step away does it.
         let mut ducked = false;
         if let (Some(src), true) = (laser_on, p.laser_hide > 0.0 && label != "zone") {
@@ -2628,6 +2732,27 @@ impl Brain {
         }
     }
 
+    /// Aim the gun at a crate and fire once lined up, if the line to it is clear. Returns whether it was.
+    fn aim_crate(&self, o: &Obs, a: &mut Action, pos: &[f32; 3], c: &[f32; 3]) -> bool {
+        let me = &o.me;
+        let muzzle = [pos[0], pos[1], pos[2] + me.stat("muzzle_height", 7.0)];
+        let cc = [c[0], c[1], c[2] + 1.2];
+        if !self.clear(muzzle, cc) {
+            return false;
+        }
+        let want = [yaw_to(&muzzle, &cc), (cc[2] - muzzle[2]).atan2(d2(&cc, &muzzle).max(0.1))];
+        a.aim = want;
+        let dd = d3(&cc, &muzzle).max(1.0);
+        let lined = wrap(want[0] - me.aim[0]).abs() < (1.0 / dd).atan() && (want[1] - me.aim[1]).abs() < (0.9 / dd).atan();
+        for (i, w) in me.weapons.iter().enumerate().take(2) {
+            if w.as_ref().map_or(false, |w| w.kind == "gun") {
+                a.fire[i] = lined;
+                a.reload = false;
+            }
+        }
+        true
+    }
+
     /// No fight: loot, drops and crates, otherwise drift around a sheltered post.
     #[allow(clippy::too_many_arguments)]
     fn quiet(
@@ -2688,23 +2813,12 @@ impl Brain {
             .min_by(|x, y| d3(x, pos).partial_cmp(&d3(y, pos)).unwrap_or(std::cmp::Ordering::Equal));
         let mut aimed = false;
         if let Some(c) = crate_target {
-            let muzzle = [pos[0], pos[1], pos[2] + me.stat("muzzle_height", 7.0)];
-            let cc = [c[0], c[1], c[2] + 1.2];
-            if !self.clear(muzzle, cc) || d2(c, pos) > 90.0 {
+            let shot = self.aim_crate(o, a, pos, c);
+            if !shot || d2(c, pos) > 90.0 {
                 consider(&mut goal, c, 70.0, reach, true);
             }
-            if self.clear(muzzle, cc) {
-                let want = [yaw_to(&muzzle, &cc), (cc[2] - muzzle[2]).atan2(d2(&cc, &muzzle).max(0.1))];
-                a.aim = want;
+            if shot {
                 aimed = true;
-                let dd = d3(&cc, &muzzle).max(1.0);
-                let lined = wrap(want[0] - me.aim[0]).abs() < (1.0 / dd).atan() && (want[1] - me.aim[1]).abs() < (0.9 / dd).atan();
-                for (i, w) in me.weapons.iter().enumerate().take(2) {
-                    if w.as_ref().map_or(false, |w| w.kind == "gun") {
-                        a.fire[i] = lined;
-                        a.reload = false;
-                    }
-                }
                 if d2(c, pos) > 35.0 {
                     consider(&mut goal, c, 70.0, reach, true);
                 }
@@ -2825,5 +2939,121 @@ mod tests {
     fn drones_are_left_alone_unless_they_shoot() {
         let a = brain().decide(&obs(DRONE, ""), [0.0; 3]);
         assert!(!a.fire[0] && !a.fire[1]);
+    }
+
+    fn with(params: Params) -> Brain {
+        Brain::with_params(&Hello::default(), None, None, params)
+    }
+
+    #[test]
+    fn held_laser_is_not_let_go_unaimed() {
+        // Full charge held almost to the limit, torso pointed away from the mech.
+        let mut o = obs(MECH, "");
+        o.me.aim = [1.5, 0.0];
+        o.me.weapons[1].as_mut().unwrap().charge = 0.75;
+        let mut b = brain();
+        b.laser_full_t = Some(3.0);
+        assert!(!b.decide(&o, [0.0; 3]).fire[1], "default lets a charge go near the limit");
+        let mut b = with(Params { laser_hold: 1.0, ..Params::default() });
+        b.laser_full_t = Some(3.0);
+        let a = b.decide(&o, [0.0; 3]);
+        assert!(a.fire[1], "unaimed charge let go");
+        // Lined up: let go.
+        o.me.aim = b.solve(&o, o.me.weapons[1].as_ref().unwrap(), &o.mechs[0]).aim;
+        let mut b = with(Params { laser_hold: 1.0, ..Params::default() });
+        assert!(!b.decide(&o, [0.0; 3]).fire[1], "lined-up charge held");
+    }
+
+    #[test]
+    fn held_laser_follows_a_mech_out_of_view() {
+        let mut o = obs(MECH, "");
+        let mut b = with(Params { laser_hold: 1.0, ..Params::default() });
+        b.decide(&o, [0.0; 3]);
+        o.mechs.clear();
+        o.t += 1.5;
+        o.me.aim = [2.0, 0.0];
+        o.me.weapons[1].as_mut().unwrap().charge = 0.5;
+        let a = b.decide(&o, [0.0; 3]);
+        assert!(a.fire[1], "charge dumped after losing the mech");
+        assert!(a.aim[0].abs() < 0.2, "aim {:?}", a.aim);
+        let mut b = brain();
+        let mut o2 = obs(MECH, "");
+        b.decide(&o2, [0.0; 3]);
+        o2.mechs.clear();
+        o2.t += 1.5;
+        o2.me.weapons[1].as_mut().unwrap().charge = 0.5;
+        assert!(!b.decide(&o2, [0.0; 3]).fire[1]);
+    }
+
+    #[test]
+    fn drones_in_attack_range_are_shot() {
+        let a = with(Params { drone_threat: 1.0, ..Params::default() }).decide(&obs(DRONE, ""), [0.0; 3]);
+        assert!(a.fire[0] && !a.fire[1], "fire {:?}", a.fire);
+        let far = r#"{"id": 104, "kind": "npc", "pos": [80, 0, 0], "hp": 350, "max_hp": 350}"#;
+        let a = with(Params { drone_threat: 1.0, ..Params::default() }).decide(&obs(far, ""), [0.0; 3]);
+        assert!(!a.fire[0]);
+    }
+
+    #[test]
+    fn an_enemy_aimed_at_us_is_preferred() {
+        let two = r#"{"id": 3, "kind": "mech", "pos": [40, 0, 0], "aim": [1.0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]},
+                     {"id": 4, "kind": "mech", "pos": [-60, 0, 0], "aim": [0.05, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let o = obs(two, "");
+        let mut b = brain();
+        b.decide(&o, [0.0; 3]);
+        assert_eq!(b.focus, Some(3));
+        let mut b = with(Params { focus_aimer: 40.0, ..Params::default() });
+        b.decide(&o, [0.0; 3]);
+        assert_eq!(b.focus, Some(4));
+    }
+
+    #[test]
+    fn crates_are_shot_on_the_way_to_a_weapon() {
+        let mut o = obs("", "");
+        o.mechs.clear();
+        o.me.weapons = vec![Some(Weapon { kind: "gun".into(), ammo: 12.0, ..Default::default() }), None];
+        o.pickups = vec![crate::proto::Item { id: 8000, kind: "laser".into(), pos: [100.0, 0.0, 0.0], ..Default::default() }];
+        o.crates = vec![crate::proto::Item { id: 1000, pos: [0.0, 30.0, 0.0], hp: 300.0, ..Default::default() }];
+        let mut b = with(Params { arm_crates: 1.0, ..Params::default() });
+        let a = b.decide(&o, [0.0; 3]);
+        assert_eq!(b.label, "arm");
+        assert!((a.aim[0] - 1.5708).abs() < 0.05, "aim {:?}", a.aim);
+        let mut b = brain();
+        let a = b.decide(&o, [0.0; 3]);
+        assert_eq!(b.label, "arm");
+        assert!(a.aim[0].abs() < 0.05, "aim {:?}", a.aim);
+    }
+
+    #[test]
+    fn no_long_rush_into_a_ready_laser() {
+        let lz = r#"{"id": 3, "kind": "mech", "pos": [70, 0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun", "laser"]}"#;
+        let mut o = obs(lz, "");
+        o.me.weapons[1] = Some(Weapon { kind: "lightning".into(), ..Default::default() });
+        let mut b = brain();
+        b.decide(&o, [0.0; 3]);
+        assert_eq!(b.label, "rush");
+        let mut b = with(Params { rush_guard: 1.0, ..Params::default() });
+        b.decide(&o, [0.0; 3]);
+        assert_ne!(b.label, "rush");
+        // Its laser just fired: it is cooling down.
+        o.beams = vec![crate::proto::Beam { by: 3, kind: "laser".into(), path: vec![], age: 0.1 }];
+        let mut b = with(Params { rush_guard: 1.0, ..Params::default() });
+        b.decide(&o, [0.0; 3]);
+        assert_eq!(b.label, "rush");
+        // Empty magazine from beyond 60 m.
+        o.me.weapons[0].as_mut().unwrap().ammo = 0.0;
+        let mut b = with(Params { rush_guard: 1.0, ..Params::default() });
+        b.decide(&o, [0.0; 3]);
+        assert_ne!(b.label, "rush");
+    }
+
+    #[test]
+    fn survival_upgrades_come_before_damage() {
+        let pos = |id: &str| UPGRADES.iter().position(|u| *u == id).unwrap();
+        for s in ["plating", "armor", "nanites", "servos"] {
+            for d in ["gun_damage", "laser_damage", "lightning_efficiency", "gun_rate"] {
+                assert!(pos(s) < pos(d), "{s} after {d}");
+            }
+        }
     }
 }
