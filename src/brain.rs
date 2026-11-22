@@ -423,7 +423,7 @@ impl Default for Params {
             drone_threat: 0.0,
             focus_aimer: 0.0,
             arm_crates: 0.0,
-            rush_guard: 0.0,
+            rush_guard: 1.0,
         }
     }
 }
