@@ -225,7 +225,7 @@ fn swarm_triggers_escape() {
             })
             .sum()
     };
-    let on = count(&Params::default());
+    let on = count(&Params { esc: 1.0, ..Params::default() });
     let off = count(&Params { esc: 0.0, ..Params::default() });
     eprintln!("escapes started: {on} of {} swarms (off: {off})", sc.len());
     assert!(on as usize >= sc.len() - 1 && off == 0);

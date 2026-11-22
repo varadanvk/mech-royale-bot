@@ -574,7 +574,7 @@ impl Default for Params {
             dodge_reach: 3.5,
             contacts: 1.0,
             infer: 1.0,
-            esc: 1.0,
+            esc: 0.0,
             esc_r: 150.0,
             esc_hunters: 3.0,
             esc_low_hp: 0.55,
