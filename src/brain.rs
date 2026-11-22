@@ -404,6 +404,8 @@ pub struct Params {
     pub duel_glance: f32,
     /// A duel is started on an enemy with up to this many times our hit points.
     pub duel_ratio: f32,
+    /// Start a duel only on an enemy in view (1), or also on one only heard (0).
+    pub duel_seen: f32,
 }
 
 impl Default for Params {
@@ -586,7 +588,8 @@ impl Default for Params {
             duel_r: 120.0,
             duel_hp: 0.6,
             duel_glance: 2.5,
-            duel_ratio: 1.25,
+            duel_ratio: 1.0,
+            duel_seen: 1.0,
         }
     }
 }
@@ -774,6 +777,7 @@ impl Params {
         p.duel_hp = g("duel_hp", p.duel_hp);
         p.duel_glance = g("duel_glance", p.duel_glance);
         p.duel_ratio = g("duel_ratio", p.duel_ratio);
+        p.duel_seen = g("duel_seen", p.duel_seen);
         p
     }
 
