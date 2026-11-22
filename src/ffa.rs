@@ -332,6 +332,11 @@ impl Brain {
         self.ffa_why = why;
     }
 
+    /// Where the current break-off is heading, if anywhere.
+    pub fn break_off_goal(&self) -> Option<[f32; 2]> {
+        self.cr_goal
+    }
+
     /// Whether the free-for-all modes are steering this decision.
     pub(super) fn ffa_on(&self) -> bool {
         self.ffa_mode != FfaMode::Practice

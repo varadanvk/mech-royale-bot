@@ -20,7 +20,7 @@ fn fnv(h: &mut u64, bytes: &[u8]) {
 /// one of them killed by us. Nothing a free-for-all would show. Returns the hash of every action and the brain.
 fn practice_scene(world: Arc<World>, nav: Nav) -> (u64, Brain) {
     let hello: Hello = serde_json::from_str(r#"{"type":"hello","slot":0,"seed":77,"map":{"dir":""},"config":{}}"#).unwrap();
-    let mut b = Brain::with_params(&hello, Some(world), Some(nav.clone()), Params::default());
+    let mut b = Brain::with_params(&hello, Some(world), Some(nav.clone()), earlier());
     let c = nav.nearest_walkable(41.3, -72.8).unwrap();
     let mut me = nav.center(c);
     let mut aim = [0.0f32, 0.0];
@@ -136,6 +136,11 @@ fn load() -> Option<(Arc<World>, Nav)> {
     };
     let nav = Nav::build(&world, 2.5, 9.0, 1.2, 50.0);
     Some((Arc::new(world), nav))
+}
+
+/// The settings the practice scene was recorded with: backing away in the open instead of breaking off.
+fn earlier() -> Params {
+    Params { crowd_retreat: 0.0, kite: 1.0, stay_fight: 0.0, ..Params::default() }
 }
 
 /// The practice scene's actions, as the build without the free-for-all side makes them.
