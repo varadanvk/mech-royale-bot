@@ -486,7 +486,7 @@ pub struct Params {
     pub cr_strafe: f32,
     /// In a free-for-all, break off, reload and sidestep laser shots as before: cr_max_d, cr_laser, cr_strafe, reload_laser and dodge_after take their earlier values there (0 = the same in every kind of match).
     pub ffa_plain: f32,
-    /// In a live fight (a target in view while engaged, or hurt by a mech in the last 6 s), keep fighting instead of breaking off, backing away or hiding to heal; a break-off to hidden ground within stay_cover m still goes ahead (practice matches only; 0 = off).
+    /// In a live fight (a target in view while engaged, or hurt by a mech in the last 6 s), keep fighting instead of breaking off, backing away or hiding to heal; a break-off to hidden ground within stay_cover m still goes ahead (practice matches only; 0 = off; 2 = also never break off outside a live fight).
     pub stay_fight: f32,
     /// See stay_fight.
     pub stay_cover: f32,
@@ -715,8 +715,8 @@ impl Default for Params {
             pred_tan: 1.0,
             cr_strafe: 1.0,
             ffa_plain: 1.0,
-            stay_fight: 1.0,
-            stay_cover: 15.0,
+            stay_fight: 2.0,
+            stay_cover: 0.0,
         }
     }
 }
@@ -2867,7 +2867,8 @@ impl Brain {
                 cb_all = all;
             }
         }
-        if stay && (cr_goal.is_some() || cb_cornered) && cr_goal.map_or(true, |g| d2(&g, &pos) > p.stay_cover) {
+        let stay_all = p.stay_fight >= 2.0 && !ffa_on;
+        if (stay || stay_all) && (cr_goal.is_some() || cb_cornered) && (stay_all || cr_goal.map_or(true, |g| d2(&g, &pos) > p.stay_cover)) {
             cr_goal = None;
             cb_cornered = false;
             self.cr_until = -1.0;
