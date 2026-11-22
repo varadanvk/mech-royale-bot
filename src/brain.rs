@@ -340,6 +340,9 @@ pub struct Params {
     pub home_speed: f32,
     /// Before the late game, take on only enemies that are close, come for us or are weak (0 = off).
     pub engage_filter: f32,
+    /// Before the late game, outside a free-for-all: also take on any mech in view within 60 m, or a lone one
+    /// within 90 m with no other enemy within 120 m, even if it is not coming for us (0 = off).
+    pub eng_view: f32,
     /// Laser: count the cook-off on mortar holders when releasing early for a kill, and never charge outside
     /// the zone (0 = off).
     pub laser_fix: f32,
@@ -547,6 +550,7 @@ impl Default for Params {
             home_s: 12.0,
             home_speed: 4.6,
             engage_filter: 1.0,
+            eng_view: 1.0,
             laser_fix: 1.0,
             fight_cubes: 1.0,
             fight_cube_r: 70.0,
@@ -730,6 +734,7 @@ impl Params {
         p.home_s = g("home_s", p.home_s);
         p.home_speed = g("home_speed", p.home_speed);
         p.engage_filter = g("engage_filter", p.engage_filter);
+        p.eng_view = g("eng_view", p.eng_view);
         p.laser_fix = g("laser_fix", p.laser_fix);
         p.fight_cubes = g("fight_cubes", p.fight_cubes);
         p.fight_cube_r = g("fight_cube_r", p.fight_cube_r);
@@ -2055,10 +2060,24 @@ impl Brain {
         self.hunters.retain(|_, t| o.t - *t < 10.0);
         // Free-for-all modes (only once a free-for-all is settled): who is worth shooting, and the fight we join.
         let ffa_on = self.ffa_on();
+        // Mechs in view fair game whether or not they come for us (`eng_view`).
+        let in_view: Vec<u32> = if p.eng_view > 0.0 && !late && !ffa_on {
+            enemies
+                .iter()
+                .filter(|m| {
+                    let d = d2(&m.pos, &pos);
+                    let others = self.known.iter().any(|(id, k)| *id != m.id && o.t - k.seen_t < 4.0 && d2(&k.pos, &pos) < 120.0);
+                    d < 60.0 || (d < 90.0 && !others)
+                })
+                .map(|m| m.id)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let cands: Vec<&Actor> = enemies
             .iter()
-            .filter(|m| !counter || self.hunters.get(&m.id).map_or(false, |t| o.t - t < 4.0))
-            .filter(|m| !(hold_late || filter_early) || self.engage_ok(o, m, hold_late))
+            .filter(|m| !counter || in_view.contains(&m.id) || self.hunters.get(&m.id).map_or(false, |t| o.t - t < 4.0))
+            .filter(|m| !(hold_late || filter_early) || in_view.contains(&m.id) || self.engage_ok(o, m, hold_late))
             .filter(|m| !ffa_on || self.ffa_engage(o, m, hp_frac))
             .copied()
             .collect();
@@ -3917,6 +3936,22 @@ mod tests {
         let mut b = with(Params { counter: 0.0, ..base() });
         b.decide(&obs(away, ""), [0.0; 3]);
         assert_eq!(b.focus, Some(3));
+    }
+
+    #[test]
+    fn a_lone_mech_in_view_is_taken_on() {
+        let lone = r#"{"id": 3, "kind": "mech", "pos": [85, 0, 0], "aim": [0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let two = r#"{"id": 3, "kind": "mech", "pos": [85, 0, 0], "aim": [0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]},
+                     {"id": 4, "kind": "mech", "pos": [0, 110, 0], "aim": [0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let mut b = with(Params { counter: 1.0, engage_filter: 1.0, eng_view: 1.0, ..base() });
+        b.decide(&obs(lone, ""), [0.0; 3]);
+        assert_eq!(b.focus, Some(3));
+        let mut b = with(Params { counter: 1.0, engage_filter: 1.0, eng_view: 1.0, ..base() });
+        b.decide(&obs(two, ""), [0.0; 3]);
+        assert_eq!(b.focus, None);
+        let mut b = with(Params { counter: 1.0, engage_filter: 1.0, eng_view: 0.0, ..base() });
+        b.decide(&obs(lone, ""), [0.0; 3]);
+        assert_eq!(b.focus, None);
     }
 
     #[test]
