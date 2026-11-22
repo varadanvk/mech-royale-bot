@@ -205,7 +205,7 @@ fn pressed_bot_fights_from_shelter_within_budget() {
     let w = Arc::new(w);
     let mut r = Rng(0xabcdef12345);
     for level in [1.0f32, 2.0] {
-        let params = Params { spot: level, ..Params::default() };
+        let params = Params { spot: level, stop_t: 0.0, ..Params::default() };
         let t0 = Instant::now();
         let mut b = Brain::with_params(&Hello::default(), Some(w.clone()), Some(nav.clone()), params);
         let build = t0.elapsed().as_secs_f32() * 1000.0;

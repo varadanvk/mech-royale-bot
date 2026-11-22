@@ -744,6 +744,11 @@ impl Brain {
         self.cr_goal
     }
 
+    /// The den being held or walked to, if any.
+    pub fn den_goal(&self) -> Option<[f32; 2]> {
+        self.den_spot.map(|d| d.0)
+    }
+
     /// Decisions spent in each mode: practice, fight, third, avoid, hide, late.
     pub fn ffa_ticks(&self) -> [u32; 6] {
         self.ffa_ticks

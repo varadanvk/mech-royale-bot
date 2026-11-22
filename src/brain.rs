@@ -5,7 +5,7 @@ use crate::nav::Nav;
 use crate::proto::{Action, Actor, Hello, Obs, Weapon};
 use crate::sight::{Foe, Pick, SightTable, Zone};
 use crate::world::{PrismKind, World};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
 
@@ -395,6 +395,10 @@ pub struct Params {
     pub cb_known: f32,
     pub cb_corner: f32,
     pub cb_turn: f32,
+    /// Outside a free-for-all, from this match time on (seconds) hide as with a den: hold the least exposed
+    /// sheltered spot inside the zone and the next circle, walk there quietly, never chase; shoot only a mech
+    /// within 45 m or one that hit us in the last 3 s, then go back to the spot (0 = off).
+    pub stop_t: f32,
 }
 
 impl Default for Params {
@@ -574,6 +578,7 @@ impl Default for Params {
             cb_known: 1.0,
             cb_corner: 1.0,
             cb_turn: 1.0,
+            stop_t: 120.0,
         }
     }
 }
@@ -757,6 +762,7 @@ impl Params {
         p.cb_known = g("cb_known", p.cb_known);
         p.cb_corner = g("cb_corner", p.cb_corner);
         p.cb_turn = g("cb_turn", p.cb_turn);
+        p.stop_t = g("stop_t", p.stop_t);
         p
     }
 
@@ -1014,6 +1020,8 @@ pub struct Brain {
     focus_t: f32,
     /// Late-game home spot and when it was chosen.
     home: Option<([f32; 2], f32)>,
+    /// The den (`stop_t`) and the next circle (centre, radius) it was chosen for.
+    den_spot: Option<([f32; 2], [f32; 3])>,
     /// Mechs we hit recently: id -> time.
     hit_t: BTreeMap<u32, f32>,
     /// Bearing and time of the last hit taken from a mech, and of the last weapon or step sound heard.
@@ -1047,6 +1055,8 @@ pub struct Brain {
     pub dbg_kills: Vec<(f32, Option<u32>, Option<u32>)>,
     pub dbg_mode: String,
     pub dbg_enemies: Vec<ffa::EnemyInfo>,
+    /// Per-match counts, kept only when `TINMAN_TALLY` is set (tracing; no decision reads them).
+    tally: Option<Tally>,
 }
 
 impl Brain {
@@ -1160,6 +1170,7 @@ impl Brain {
             fp_until: -1.0,
             focus_t: -1.0,
             home: None,
+            den_spot: None,
             hit_t: BTreeMap::new(),
             hit_bearing: None,
             sound_bearing: None,
@@ -1183,6 +1194,7 @@ impl Brain {
             dbg_kills: Vec::new(),
             dbg_mode: String::new(),
             dbg_enemies: Vec::new(),
+            tally: std::env::var("TINMAN_TALLY").is_ok().then(Tally::default),
         }
     }
 
@@ -1664,6 +1676,34 @@ impl Brain {
         (c[0] - z.next_center[0]).hypot(c[1] - z.next_center[1]) < z.next_radius - margin && (c[0] - z.center[0]).hypot(c[1] - z.center[1]) < z.radius - margin
     }
 
+    /// The den: the least exposed reachable sheltered spot inside the zone and the next circle (0.05 per metre
+    /// away from us added to its exposure in percent). Kept until a new next circle is announced or the zone
+    /// leaves it outside; without a sight table, the late-game home spot.
+    fn den_spot(&mut self, o: &Obs) -> [f32; 2] {
+        let pos = o.me.pos;
+        let z = &o.zone;
+        let key = [z.next_center[0], z.next_center[1], z.next_radius];
+        if let Some((d, k)) = self.den_spot {
+            if k == key && self.in_next(o, &d, 15.0) {
+                return d;
+            }
+        }
+        let best = self.sight.as_ref().and_then(|st| {
+            st.spots
+                .iter()
+                .filter(|sp| st.reach[sp.cell] && self.in_next(o, &sp.pos, 15.0))
+                .map(|sp| (sp.pos, sp.exposure * 100.0 + 0.05 * d2(&sp.pos, &pos)))
+                .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|b| b.0)
+        });
+        let d = match best {
+            Some(d) => d,
+            None => self.home_spot(o),
+        };
+        self.den_spot = Some((d, key));
+        d
+    }
+
     /// A walkable spot near us inside the next circle that as little of the surrounding ground as
     /// possible can see (attackers come into view one or two at a time), but that sees out a little.
     fn hold_spot(&self, o: &Obs, pos: &[f32; 3]) -> [f32; 2] {
@@ -2055,8 +2095,11 @@ impl Brain {
         self.hunters.retain(|_, t| o.t - *t < 10.0);
         // Free-for-all modes (only once a free-for-all is settled): who is worth shooting, and the fight we join.
         let ffa_on = self.ffa_on();
+        // Hiding in a den (`stop_t`): only a mech within 45 m or one that hit us in the last 3 s is shot at.
+        let den_on = p.stop_t > 0.0 && !ffa_on && o.t >= p.stop_t;
         let cands: Vec<&Actor> = enemies
             .iter()
+            .filter(|m| !den_on || d2(&m.pos, &pos) < 45.0 || self.attackers.get(&m.id).map_or(false, |t| o.t - t < 3.0))
             .filter(|m| !counter || self.hunters.get(&m.id).map_or(false, |t| o.t - t < 4.0))
             .filter(|m| !(hold_late || filter_early) || self.engage_ok(o, m, hold_late))
             .filter(|m| !ffa_on || self.ffa_engage(o, m, hp_frac))
@@ -2557,6 +2600,22 @@ impl Brain {
             label = "zone";
             mv = self.go(&pos, zone_goal);
             boost = !me.in_zone && me.energy > 5.0;
+        } else if den_on {
+            // Walk quietly to the den and hold it, never chasing; no boost.
+            label = "den";
+            let d = self.den_spot(o);
+            mv = if d2(&pos, &d) < 2.0 { [0.0, 0.0] } else { self.go(&pos, d) };
+            let slow = (p.ffa_quiet / walk_speed.max(0.1)).min(1.0);
+            mv = [mv[0] * slow, mv[1] * slow];
+            if shoot_at.is_none() {
+                if let Some(b) = self.alert_bearing(o) {
+                    a.aim = [b, 0.0];
+                } else if let Some(th) = threats.first() {
+                    a.aim = [yaw_to(&pos, th), 0.0];
+                } else {
+                    self.scan(&mut a);
+                }
+            }
         } else if let Some(f) = ffa_mv {
             label = f.label;
             mv = f.mv;
@@ -3010,7 +3069,7 @@ impl Brain {
         }
         // A laser about to fire at us: duck out of its line if a step away does it.
         let mut ducked = false;
-        if let (Some(src), true) = (laser_on, p.laser_hide > 0.0 && label != "zone") {
+        if let (Some(src), true) = (laser_on, p.laser_hide > 0.0 && label != "zone" && label != "den") {
             if let Some(h) = self.hide_step(&pos, &[[src[0], src[1], src[2] + 7.0]], p.laser_hide) {
                 mv = h;
                 boost = me.energy > 5.0;
@@ -3018,7 +3077,7 @@ impl Brain {
             }
         }
         // Outside a fight, still weave across the line of the nearest shooter.
-        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "ring" || label == "spot" || label == "iso" || label == "fight" || label == "rush" || label == "climb" || (label == "hold" && p.hold_fight <= 0.0) || label == "drone" || label == "reload" || label == "stand" || label == "peek" || label == "hide" || label == "repeek" || label == "home" || label == "cbreak" || label.starts_with("ffa")) {
+        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "ring" || label == "spot" || label == "iso" || label == "fight" || label == "rush" || label == "climb" || (label == "hold" && p.hold_fight <= 0.0) || label == "drone" || label == "reload" || label == "stand" || label == "peek" || label == "hide" || label == "repeek" || label == "home" || label == "cbreak" || label == "den" || label.starts_with("ffa")) {
             if o.t >= self.strafe_until {
                 self.next_strafe(o.t);
             }
@@ -3037,7 +3096,7 @@ impl Brain {
         }
 
         // Sidestep an incoming shot.
-        if p.dodge > 0.0 && label != "zone" && label != "climb" && o.t >= self.unstick_until && self.dodge_check(o, target, mv, &threats) {
+        if p.dodge > 0.0 && label != "zone" && label != "climb" && label != "den" && o.t >= self.unstick_until && self.dodge_check(o, target, mv, &threats) {
             mv = self.dodge_dir;
             boost = me.energy > 3.0;
         }
@@ -3123,6 +3182,38 @@ impl Brain {
             }
         }
         a.boost = boost;
+        if let Some(tl) = self.tally.as_mut() {
+            tl.dec += 1;
+            tl.t = o.t;
+            if enemies.is_empty() {
+                tl.unseen += 1;
+            }
+            for m in enemies.iter().filter(|m| d2(&m.pos, &pos) < 45.0) {
+                tl.near.insert(m.id);
+            }
+            for _ in o.events.iter().filter(|e| e.kind == "kill") {
+                if o.t < 120.0 {
+                    tl.kills_early += 1;
+                } else {
+                    tl.kills_late += 1;
+                }
+            }
+            if let Some(t) = shoot_at.filter(|t| engaged && t.kind == "mech" && (a.fire[0] || a.fire[1])) {
+                tl.fire += 1;
+                if a.mv[0].hypot(a.mv[1]) > 0.1 {
+                    tl.fire_mv += 1;
+                }
+                if d2(&t.pos, &pos) > 40.0 {
+                    tl.far += 1;
+                    if !self.attackers.get(&t.id).map_or(false, |x| o.t - x < 2.0) {
+                        tl.far_cold += 1;
+                    }
+                }
+            }
+            if label == "den" {
+                tl.den += 1;
+            }
+        }
         if !a.aim.iter().all(|v| v.is_finite()) {
             a.aim = me.aim;
         }
@@ -3614,8 +3705,32 @@ mod tactics;
 #[path = "ffa.rs"]
 pub mod ffa;
 
+/// Per-match counts for tracing: decisions; decisions shooting at a mech, moving while doing so, at one
+/// farther than 40 m, and of those at one that had not hit us in the last 2 s; decisions with no mech in view;
+/// decisions holding the den; mechs seen within 45 m; our kills before and from 120 s.
+#[derive(Default)]
+struct Tally {
+    t: f32,
+    dec: u32,
+    fire: u32,
+    fire_mv: u32,
+    far: u32,
+    far_cold: u32,
+    unseen: u32,
+    den: u32,
+    near: BTreeSet<u32>,
+    kills_early: u32,
+    kills_late: u32,
+}
+
 impl Drop for Brain {
     fn drop(&mut self) {
+        if let Some(tl) = &self.tally {
+            eprintln!(
+                "TALLY seed {} t {:.1} dec {} fire {} fire_mv {} far {} far_cold {} unseen {} den {} near45 {} kills_early {} kills_late {}",
+                self.ffa_seed, tl.t, tl.dec, tl.fire, tl.fire_mv, tl.far, tl.far_cold, tl.unseen, tl.den, tl.near.len(), tl.kills_early, tl.kills_late
+            );
+        }
         if self.trace_ffa {
             let t = self.ffa_ticks;
             eprintln!(
@@ -3645,6 +3760,7 @@ mod tests {
             ext_fpos: 0.0,
             ext_late: 0.0,
             ext_finish: 0.0,
+            stop_t: 0.0,
             ..Params::default()
         }
     }
@@ -3954,6 +4070,36 @@ mod tests {
         let mut b = with(Params { laser_fix: 1.0, ..base() });
         let a = b.decide(&o, [0.0; 3]);
         assert!(!a.fire[1]);
+    }
+
+    #[test]
+    fn after_the_stop_only_close_or_hurting_mechs_are_shot() {
+        let far = r#"{"id": 3, "kind": "mech", "pos": [80, 0, 0], "aim": [3.14159, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let near = r#"{"id": 3, "kind": "mech", "pos": [35, 0, 0], "aim": [3.14159, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let hit = r#"{"type": "damaged", "amount": 45, "weapon": "gun", "by": 3, "bearing": 0}"#;
+        let at = |m: &str, e: &str, t: f32| {
+            let mut o = obs(m, e);
+            o.t = t;
+            o
+        };
+        let until = || with(Params { stop_t: 120.0, ..base() });
+        let mut b = until();
+        let a = b.decide(&at(far, "", 5.0), [0.0; 3]);
+        assert_eq!((b.label, b.focus), ("fight", Some(3)), "before the stop the fight goes on");
+        assert!(a.fire[0] || a.fire[1]);
+        let mut b = until();
+        let a = b.decide(&at(far, "", 130.0), [0.0; 3]);
+        assert_eq!((b.label, b.focus), ("den", None), "a mech 80 m away taken as a target after the stop");
+        assert!(!a.fire[0] && !a.fire[1] && !a.boost);
+        assert!(a.mv[0].hypot(a.mv[1]) <= 4.6 / 11.7 + 1e-3, "walked at {:?}", a.mv);
+        let mut b = until();
+        let a = b.decide(&at(far, hit, 130.0), [0.0; 3]);
+        assert_eq!((b.label, b.focus), ("den", Some(3)));
+        assert!(a.fire[0] || a.fire[1], "no answer to a hit");
+        let mut b = until();
+        let a = b.decide(&at(near, "", 130.0), [0.0; 3]);
+        assert_eq!((b.label, b.focus), ("den", Some(3)));
+        assert!(a.fire[0] || a.fire[1], "no fire within 45 m");
     }
 
     #[test]
