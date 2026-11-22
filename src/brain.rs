@@ -459,7 +459,7 @@ impl Default for Params {
             focus_aimer: 0.0,
             arm_crates: 0.0,
             rush_guard: 0.0,
-            ring: 0.0,
+            ring: 1.0,
             counter: 0.0,
             counter_range: 60.0,
             spot: 0.0,
@@ -469,7 +469,7 @@ impl Default for Params {
             ghost_s: 6.0,
             ghost_r: 120.0,
             los_fire: 0.0,
-            contacts: 0.0,
+            contacts: 1.0,
         }
     }
 }
