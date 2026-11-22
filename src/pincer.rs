@@ -4,7 +4,7 @@
 use super::{d2, yaw_to, Brain};
 use crate::predict;
 use crate::proto::{Actor, Obs};
-use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
+use std::f32::consts::{FRAC_PI_2, FRAC_PI_3, FRAC_PI_4, FRAC_PI_6, PI};
 
 /// Believed enemies out of sight count from this confidence on.
 const SURE: f32 = 0.4;
@@ -152,10 +152,12 @@ impl Brain {
         let mut s = 0.0;
         let mut yaws = vec![aim];
         for th in self.pin.threats.iter().filter(|x| !x.target) {
-            // Backing off the target toward the others walks into them.
+            // Backing off the target toward one off to the side or behind walks into it (closing on one in
+            // front with the target is no worse than closing on the target).
+            let side = ((predict::off(yaw_to(&here, &th.pred), yaw_to(&here, &t)) - FRAC_PI_3) / FRAC_PI_6).clamp(0.0, 1.0);
             let closer = d2(&here, &th.pred) - d2(&q, &th.pred);
             if closer > 0.0 {
-                s -= p.pin_close * closer;
+                s -= p.pin_close * closer * side;
             }
             for (at, w) in [(th.now, 0.4f32), (th.pred, 0.6)] {
                 let y = yaw_to(&q, &at);
@@ -167,6 +169,10 @@ impl Brain {
             }
         }
         s -= p.pin_spread * ((predict::spread(&yaws) - FRAC_PI_2) / FRAC_PI_2).max(0.0);
+        // Where to stand once they have us between them: a wall behind, not out in the open, inside the next circle.
+        if !self.pin.pincered {
+            return s;
+        }
         if let Some(c) = self.sight.as_ref().and_then(|st| st.cell_at(q[0], q[1]).map(|c| (st, c))) {
             let (st, c) = c;
             let back = aim + PI;

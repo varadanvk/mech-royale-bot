@@ -418,14 +418,14 @@ pub struct Params {
     pub pred_hunt: f32,
     pub pred_stop: f32,
     /// Keeping enemies on one side while fighting (0 = off). Enemies within `pin_r` (in view, sure believed ones,
-    /// and where they are expected to be) count. Two or more spread over more than half the circle round us,
+    /// and where they are expected to be) count. Two or more spread over more than 144 degrees round us,
     /// or one expected to come round more than 90 degrees off the target, is a pincer. With two or more about,
     /// a fight position loses `pin_rear` for each enemy (now and expected) behind it as we face the target,
-    /// `pin_spread` per quarter circle the enemies spread over beyond the first, `pin_open` per tenth more
-    /// open ground than here and `pin_zone` per metre outside the next circle, and gains up to `pin_cover` for
-    /// a wall close behind it, and loses `pin_close` per metre it brings us closer to an enemy other than the
-    /// target. While pincered, points up to `pin_ring` m away are weighed too, and a far one
-    /// chosen is kept for a moment.
+    /// `pin_spread` per quarter circle the enemies spread over beyond the first, and `pin_close` per metre it
+    /// brings us closer to an enemy off to the side of the target or behind us. While pincered it also loses
+    /// `pin_open` per tenth more open ground than here and `pin_zone` per metre outside the next circle, and
+    /// gains up to `pin_cover` for a wall close behind it; points up to `pin_ring` m away are weighed too, and
+    /// a far one chosen is kept for a moment.
     pub pincer: f32,
     pub pin_r: f32,
     pub pin_rear: f32,
