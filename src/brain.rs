@@ -479,7 +479,7 @@ impl Default for Params {
             counter_range: 60.0,
             spot: 0.0,
             spot_crowd: 3.0,
-            dodge: 0.0,
+            dodge: 1.0,
             dodge_hold: 0.35,
             dodge_energy: 20.0,
             crowd_retreat: 0.0,
