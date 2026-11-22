@@ -529,10 +529,15 @@ impl Brain {
         if me.energy < self.params.dodge_energy || !me.grounded {
             return false;
         }
-        let rad = 2.5 * (1.0 + 0.05 * me.cubes) + 0.8;
+        // `dodge_tight`: only shots due soon that pass close, stepping to the side they already miss on.
+        let tight = self.params.dodge_tight > 0.0 && !self.ffa_on();
+        let (look, margin) = if tight { (self.params.dodge_look.min(0.7), 1.1) } else { (self.params.dodge_look, 0.8) };
+        let rad = 2.5 * (1.0 + 0.05 * me.cubes) + margin;
         let height = 9.0 * (1.0 + 0.05 * me.cubes);
-        // Incoming direction (horizontal unit vector of travel) of the most urgent threat.
+        // Incoming direction (horizontal unit vector of travel) of the most urgent threat, and where it passes
+        // us (offset from our centre at its closest).
         let mut incoming: Option<[f32; 2]> = None;
+        let mut passes: Option<[f32; 2]> = None;
         let mut soonest = f32::MAX;
         for pr in o.projectiles.iter().filter(|p| p.kind == "gun" || p.kind == "npc") {
             let r = [pr.pos[0] - pos[0], pr.pos[1] - pos[1]];
@@ -542,14 +547,16 @@ impl Brain {
                 continue;
             }
             let tc = -(r[0] * v[0] + r[1] * v[1]) / vv;
-            if !(0.0..=self.params.dodge_look).contains(&tc) {
+            if !(0.0..=look).contains(&tc) {
                 continue;
             }
-            let miss = ((r[0] + v[0] * tc).powi(2) + (r[1] + v[1] * tc).powi(2)).sqrt();
+            let at = [r[0] + v[0] * tc, r[1] + v[1] * tc];
+            let miss = (at[0] * at[0] + at[1] * at[1]).sqrt();
             let zc = pr.pos[2] + pr.vel[2] * tc;
             if miss < rad && zc > pos[2] - 0.5 && zc < pos[2] + height + 0.5 && tc < soonest {
                 soonest = tc;
                 incoming = Some(norm2(pr.vel[0], pr.vel[1]));
+                passes = Some(at);
             }
         }
         if incoming.is_none() && o.projectiles.is_empty() {
@@ -589,6 +596,10 @@ impl Brain {
             }
             if d2(&q, &z.center) > z.radius - 3.0 {
                 s -= 5.0;
+            }
+            // Away from where the shot passes: the step only widens the miss.
+            if let Some(c) = passes.filter(|_| tight) {
+                s -= 4.0 * (d[0] * c[0] + d[1] * c[1]).clamp(-1.0, 1.0);
             }
             if best.map_or(true, |b| s > b.1) {
                 best = Some((d, s));
