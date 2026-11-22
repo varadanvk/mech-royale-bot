@@ -2319,8 +2319,16 @@ impl Brain {
         // --- what hurt us
         for e in &o.events {
             if e.kind == "kill" {
-                if let Some(k) = e.target.and_then(|id| self.known.get(&id)) {
-                    self.kill_spot = Some((k.pos, o.t));
+                // The dead mech is no longer an enemy to face, hide from or walk to.
+                if let Some(id) = e.target {
+                    if let Some(k) = self.known.remove(&id) {
+                        self.kill_spot = Some((k.pos, o.t));
+                        if self.threat.map_or(false, |(q, _)| d2(&q, &k.pos) < 30.0) {
+                            self.threat = None;
+                        }
+                    }
+                    self.attackers.remove(&id);
+                    self.hunters.remove(&id);
                 }
                 self.seeking = true;
             }
@@ -3586,6 +3594,11 @@ impl Brain {
                     boost = false;
                 }
             }
+        }
+        // In the air boost is the jet: it lifts us (and keeps us up for as long as it is held) instead of speeding
+        // us along the ground. Only climbing and getting unstuck want that.
+        if !me.grounded && label != "climb" && o.t >= self.unstick_until {
+            boost = false;
         }
         a.boost = boost;
         if !a.aim.iter().all(|v| v.is_finite()) {
