@@ -17,7 +17,7 @@ fn load() -> Option<(Arc<World>, Nav)> {
 }
 
 fn off() -> Params {
-    Params { cb_away: 0.0, cb_path: 0.0, cb_known: 0.0, cb_corner: 0.0, cb_turn: 0.0, ..Params::default() }
+    Params { cb_away: 0.0, cb_path: 0.0, cb_known: 0.0, cb_corner: 0.0, cb_turn: 0.0, den: 0.0, ..Params::default() }
 }
 
 fn d2(a: [f32; 2], b: [f32; 2]) -> f32 {
@@ -91,7 +91,7 @@ fn check_away(world: Arc<World>, nav: Nav, sh: [f32; 2]) -> f32 {
         dir[0] * to7[0] + dir[1] * to7[1]
     };
     let (before, _) = crowd_scene_at(world.clone(), nav.clone(), off(), sh);
-    let (goal, acts) = crowd_scene_at(world, nav, Params::default(), sh);
+    let (goal, acts) = crowd_scene_at(world, nav, Params { den: 0.0, ..Params::default() }, sh);
     eprintln!("moved {sh:?}: goal without the switches {before:?}, now {goal:?} ({} break-off decisions)", acts.len());
     let g = goal.expect("a goal away from the enemies exists here");
     let cen = [(253.1 + 212.8 + 164.7 + 168.6 + 164.3) / 5.0 + sh[0], (35.3 - 46.2 + 28.6 - 41.2 - 45.4) / 5.0 + sh[1]];
@@ -216,7 +216,7 @@ fn scan() {
             let to7 = [(e7[0] - me[0]) / d2(e7, me), (e7[1] - me[1]) / d2(e7, me)];
             let dir = [(g0[0] - me[0]) / d2(g0, me).max(1e-3), (g0[1] - me[1]) / d2(g0, me).max(1e-3)];
             if d2(g0, me) > 3.0 && dir[0] * to7[0] + dir[1] * to7[1] > 0.5 {
-                let (g1, _) = crowd_scene_at(world.clone(), nav.clone(), Params::default(), sh);
+                let (g1, _) = crowd_scene_at(world.clone(), nav.clone(), Params { den: 0.0, ..Params::default() }, sh);
                 eprintln!("off {sh:?}: before {g0:?} now {g1:?}");
             }
         }
