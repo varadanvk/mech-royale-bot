@@ -3160,20 +3160,20 @@ mod tests {
         let lz = r#"{"id": 3, "kind": "mech", "pos": [70, 0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun", "laser"]}"#;
         let mut o = obs(lz, "");
         o.me.weapons[1] = Some(Weapon { kind: "lightning".into(), ..Default::default() });
-        let mut b = with(Params { rush_guard: 0.0, ..Params::default() });
+        let mut b = with(Params { rush_guard: 0.0, counter: 0.0, ..Params::default() });
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "rush");
-        let mut b = with(Params { rush_guard: 1.0, ..Params::default() });
+        let mut b = with(Params { rush_guard: 1.0, counter: 0.0, ..Params::default() });
         b.decide(&o, [0.0; 3]);
         assert_ne!(b.label, "rush");
         // Its laser just fired: it is cooling down.
         o.beams = vec![crate::proto::Beam { by: 3, kind: "laser".into(), path: vec![], age: 0.1 }];
-        let mut b = with(Params { rush_guard: 1.0, ..Params::default() });
+        let mut b = with(Params { rush_guard: 1.0, counter: 0.0, ..Params::default() });
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "rush");
         // Empty magazine from beyond 60 m.
         o.me.weapons[0].as_mut().unwrap().ammo = 0.0;
-        let mut b = with(Params { rush_guard: 1.0, ..Params::default() });
+        let mut b = with(Params { rush_guard: 1.0, counter: 0.0, ..Params::default() });
         b.decide(&o, [0.0; 3]);
         assert_ne!(b.label, "rush");
     }
