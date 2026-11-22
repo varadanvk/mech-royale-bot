@@ -2937,7 +2937,7 @@ mod tests {
 
     #[test]
     fn drones_are_left_alone_unless_they_shoot() {
-        let a = brain().decide(&obs(DRONE, ""), [0.0; 3]);
+        let a = with(Params { drone_threat: 0.0, ..Params::default() }).decide(&obs(DRONE, ""), [0.0; 3]);
         assert!(!a.fire[0] && !a.fire[1]);
     }
 
@@ -2951,7 +2951,7 @@ mod tests {
         let mut o = obs(MECH, "");
         o.me.aim = [1.5, 0.0];
         o.me.weapons[1].as_mut().unwrap().charge = 0.75;
-        let mut b = brain();
+        let mut b = with(Params { laser_hold: 0.0, ..Params::default() });
         b.laser_full_t = Some(3.0);
         assert!(!b.decide(&o, [0.0; 3]).fire[1], "default lets a charge go near the limit");
         let mut b = with(Params { laser_hold: 1.0, ..Params::default() });
@@ -2976,7 +2976,7 @@ mod tests {
         let a = b.decide(&o, [0.0; 3]);
         assert!(a.fire[1], "charge dumped after losing the mech");
         assert!(a.aim[0].abs() < 0.2, "aim {:?}", a.aim);
-        let mut b = brain();
+        let mut b = with(Params { laser_hold: 0.0, ..Params::default() });
         let mut o2 = obs(MECH, "");
         b.decide(&o2, [0.0; 3]);
         o2.mechs.clear();
@@ -2999,7 +2999,7 @@ mod tests {
         let two = r#"{"id": 3, "kind": "mech", "pos": [40, 0, 0], "aim": [1.0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]},
                      {"id": 4, "kind": "mech", "pos": [-60, 0, 0], "aim": [0.05, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
         let o = obs(two, "");
-        let mut b = brain();
+        let mut b = with(Params { focus_aimer: 0.0, ..Params::default() });
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.focus, Some(3));
         let mut b = with(Params { focus_aimer: 40.0, ..Params::default() });
@@ -3018,7 +3018,7 @@ mod tests {
         let a = b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "arm");
         assert!((a.aim[0] - 1.5708).abs() < 0.05, "aim {:?}", a.aim);
-        let mut b = brain();
+        let mut b = with(Params { arm_crates: 0.0, ..Params::default() });
         let a = b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "arm");
         assert!(a.aim[0].abs() < 0.05, "aim {:?}", a.aim);
@@ -3029,7 +3029,7 @@ mod tests {
         let lz = r#"{"id": 3, "kind": "mech", "pos": [70, 0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun", "laser"]}"#;
         let mut o = obs(lz, "");
         o.me.weapons[1] = Some(Weapon { kind: "lightning".into(), ..Default::default() });
-        let mut b = brain();
+        let mut b = with(Params { rush_guard: 0.0, ..Params::default() });
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "rush");
         let mut b = with(Params { rush_guard: 1.0, ..Params::default() });
