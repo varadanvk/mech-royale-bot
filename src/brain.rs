@@ -338,8 +338,8 @@ impl Default for Params {
             focus_stick: 50.0,
             farm_until: 0.0,
             farm_reach: 160.0,
-            heal_lo: 0.0,
-            heal_hi: 0.7,
+            heal_lo: 0.5,
+            heal_hi: 0.85,
             expose_weight: 1.0,
             cube_grab: 45.0,
             reload_hide: 16.0,
@@ -432,8 +432,8 @@ impl Default for Params {
             focus_aimer: 0.0,
             arm_crates: 0.0,
             rush_guard: 0.0,
-            ring: 0.0,
-            counter: 0.0,
+            ring: 1.0,
+            counter: 1.0,
             counter_range: 60.0,
         }
     }
