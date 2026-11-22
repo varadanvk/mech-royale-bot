@@ -310,6 +310,18 @@ pub struct Params {
     /// a position nearby where exactly one known enemy has a line to us and the others do not.
     pub spot: f32,
     pub spot_crowd: f32,
+    /// Seconds a remembered enemy counts toward being pressed (for `ring` and `spot`).
+    pub ring_mem: f32,
+    /// With no target and outside the late game, loop and sheltered-ground modes: guard against an enemy that
+    /// came for us (aimed at us, hurt us, or one we took on) and was seen within `ghost_s` and `ghost_r`. Hold
+    /// cover from where it was last seen, aimed at that spot, without starting a laser charge, looting or
+    /// wandering (0 = off).
+    pub ghost: f32,
+    pub ghost_s: f32,
+    pub ghost_r: f32,
+    /// In a fight, never shoot the gun or let a laser charge go while the target is out of line of sight; keep
+    /// the aim on it (0 = off).
+    pub los_fire: f32,
 }
 
 impl Default for Params {
@@ -445,6 +457,11 @@ impl Default for Params {
             counter_range: 60.0,
             spot: 0.0,
             spot_crowd: 3.0,
+            ring_mem: 4.0,
+            ghost: 0.0,
+            ghost_s: 6.0,
+            ghost_r: 120.0,
+            los_fire: 0.0,
         }
     }
 }
@@ -584,6 +601,11 @@ impl Params {
         p.counter_range = g("counter_range", p.counter_range);
         p.spot = g("spot", p.spot);
         p.spot_crowd = g("spot_crowd", p.spot_crowd);
+        p.ring_mem = g("ring_mem", p.ring_mem);
+        p.ghost = g("ghost", p.ghost);
+        p.ghost_s = g("ghost_s", p.ghost_s);
+        p.ghost_r = g("ghost_r", p.ghost_r);
+        p.los_fire = g("los_fire", p.los_fire);
         p
     }
 
@@ -1277,6 +1299,15 @@ impl Brain {
         }
     }
 
+    /// Enemies pressing us: seen within `ring_mem` and 150 m, or hurting us in the last 3 s.
+    fn pressing(&self, o: &Obs, pos: &[f32; 3]) -> usize {
+        let mut ids: Vec<u32> = self.known.iter().filter(|(_, k)| o.t - k.seen_t < self.params.ring_mem && d2(&k.pos, pos) < 150.0).map(|(id, _)| *id).collect();
+        ids.extend(self.attackers.iter().filter(|(_, t)| o.t - **t < 3.0).map(|(id, _)| *id));
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
+    }
+
     /// Positions of enemies we should hide from (recently known), nearest first, at most four.
     fn threats(&self, o: &Obs) -> Vec<[f32; 3]> {
         let me = o.me.pos;
@@ -1732,24 +1763,16 @@ impl Brain {
         let near_enemies = enemies.iter().filter(|m| d2(&m.pos, &pos) < p.crowd_radius).count();
         let no_laser = !me.weapons.iter().flatten().any(|w| w.kind == "laser");
         let late = (p.wall_t > 0.0 && o.t >= p.wall_t) || (p.wall_t > 0.0 && o.zone.radius <= p.wall_r);
-        // Loop mode: late, or pressed by three or more enemies (close by, or hurting us).
-        if p.ring > 0.0 {
-            let mut pressing: Vec<u32> = self.known.iter().filter(|(_, k)| o.t - k.seen_t < 4.0 && d2(&k.pos, &pos) < 150.0).map(|(id, _)| *id).collect();
-            pressing.extend(self.attackers.iter().filter(|(_, t)| o.t - **t < 3.0).map(|(id, _)| *id));
-            pressing.sort_unstable();
-            pressing.dedup();
-            if late || pressing.len() >= 3 {
-                self.ring_until = o.t + 5.0;
-            }
+        // Pressed: how many enemies are close by (seen within `ring_mem`) or hurting us.
+        let pressing = if p.ring > 0.0 || p.spot > 0.0 { self.pressing(o, &pos) } else { 0 };
+        // Loop mode: late, or pressed by three or more enemies.
+        if p.ring > 0.0 && (late || pressing >= 3) {
+            self.ring_until = o.t + 5.0;
         }
         let ring_on = p.ring > 0.0 && o.t < self.ring_until;
         // Sheltered-ground mode: same trigger as the loop, with its own crowd size.
         if p.spot > 0.0 {
-            let mut pressing: Vec<u32> = self.known.iter().filter(|(_, k)| o.t - k.seen_t < 4.0 && d2(&k.pos, &pos) < 150.0).map(|(id, _)| *id).collect();
-            pressing.extend(self.attackers.iter().filter(|(_, t)| o.t - **t < 3.0).map(|(id, _)| *id));
-            pressing.sort_unstable();
-            pressing.dedup();
-            if late || pressing.len() as f32 >= p.spot_crowd {
+            if late || pressing as f32 >= p.spot_crowd {
                 self.spot_until = o.t + 5.0;
             }
             self.hp_hist.push_back((o.t, me.hp));
@@ -2182,6 +2205,22 @@ impl Brain {
         let mut mv: [f32; 2];
         let mut label = "idle";
         let zone_stand = p.stand_zone > 0.0 && stand_from.is_some() && me.in_zone && d2(&pos, &z.center) < z.radius - p.stand_zone_m;
+        // Guard: nothing to shoot at, but an enemy that came for us (aimed at us, hurt us, or one we took on) was
+        // seen lately close by: the place it was last seen, the latest first.
+        let ghost = if p.ghost > 0.0 && target.is_none() && shoot_at.is_none() && !late && !ring_on && !spot_on && !self.fleeing && !must_rotate {
+            self.known
+                .iter()
+                .filter(|(id, k)| {
+                    let came = wrap(k.aim_yaw - yaw_to(&k.pos, &pos)).abs() < 0.2 || self.attackers.contains_key(*id) || self.hunters.contains_key(*id);
+                    came && o.t - k.seen_t < p.ghost_s && d2(&k.pos, &pos) < p.ghost_r
+                })
+                .max_by(|x, y| {
+                    x.1.seen_t.partial_cmp(&y.1.seen_t).unwrap_or(std::cmp::Ordering::Equal).then(d2(&y.1.pos, &pos).partial_cmp(&d2(&x.1.pos, &pos)).unwrap_or(std::cmp::Ordering::Equal))
+                })
+                .map(|(_, k)| k.pos)
+        } else {
+            None
+        };
         if !me.in_zone || (must_rotate && out_next > 25.0 && !zone_stand) {
             label = "zone";
             mv = self.go(&pos, zone_goal);
@@ -2208,6 +2247,31 @@ impl Brain {
             mv = m;
             boost = b;
             label = l;
+        } else if let Some(g) = ghost {
+            // Stay in (or get to) cover from where that enemy was last seen, aimed at the spot it would come
+            // back from; no laser charge is started.
+            label = "guard";
+            if self.hidden_from([pos[0], pos[1]], pos[2], &[g]) == 1 {
+                mv = [0.0, 0.0];
+            } else {
+                if self.cover.map_or(true, |(_, until)| o.t > until) {
+                    let c = self.find_cover(o, &[g]);
+                    self.cover = Some((c, o.t + 1.0));
+                }
+                let c = self.cover.unwrap().0;
+                mv = self.go(&pos, c);
+                if d2(&pos, &c) < 2.5 {
+                    mv = [0.0, 0.0];
+                }
+            }
+            let mz = [pos[0], pos[1], pos[2] + me.stat("muzzle_height", 7.0)];
+            let q = [g[0], g[1], g[2] + 4.5];
+            a.aim = [yaw_to(&mz, &q), (q[2] - mz[2]).atan2(d2(&q, &mz).max(0.1))];
+            for (i, w) in me.weapons.iter().enumerate().take(2) {
+                if w.as_ref().map_or(false, |w| w.kind == "laser" && w.charge <= 0.0) {
+                    a.fire[i] = false;
+                }
+            }
         } else if let Some(g) = arm_goal.filter(|_| !(p.stand_first > 0.0 && stand_from.is_some())) {
             label = "arm";
             mv = self.go(&pos, [g[0], g[1]]);
@@ -2493,6 +2557,24 @@ impl Brain {
                 boost = me.energy > 30.0;
             } else if p.expose_weight > 0.0 {
                 mv = self.less_exposed(o, &pos, t, mv, p.expose_weight);
+            }
+            // Out of sight (still listed for a while after): hold the gun and any laser charge, keep the aim.
+            if p.los_fire > 0.0 {
+                let st = shoot_at.filter(|s| s.kind == "mech").unwrap_or(t);
+                let eye = [pos[0], pos[1], pos[2] + me.stat("eye_height", 8.0)];
+                let sc = 1.0 + 0.05 * st.cubes;
+                let seen = self.world.as_ref().map_or(true, |w| {
+                    w.sees(eye, [st.pos[0], st.pos[1], st.pos[2] + 4.5 * sc]) || w.sees(eye, [st.pos[0], st.pos[1], st.pos[2] + 9.0 * sc])
+                });
+                if !seen {
+                    for (i, w) in me.weapons.iter().enumerate().take(2) {
+                        match w.as_ref().map(|w| (w.kind.as_str(), w.charge)) {
+                            Some(("gun", _)) => a.fire[i] = false,
+                            Some(("laser", c)) => a.fire[i] = c > 0.0,
+                            _ => {}
+                        }
+                    }
+                }
             }
             mv = [mv[0] * p.fight_speed, mv[1] * p.fight_speed];
             boost = boost || (laser_on.is_some() && me.energy > 10.0);
@@ -3425,5 +3507,30 @@ mod tests {
                 assert!(pos(s) < pos(d), "{s} after {d}");
             }
         }
+    }
+
+    #[test]
+    fn guard_against_an_enemy_that_came_for_us() {
+        let aimer = r#"{"id": 3, "kind": "mech", "pos": [40, 0, 0], "aim": [3.14159, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let mut b = with(Params { ghost: 1.0, ring: 0.0, spot: 0.0, ..Params::default() });
+        b.decide(&obs(aimer, ""), [0.0; 3]);
+        assert_eq!(b.label, "fight");
+        let mut o = obs("", "");
+        o.mechs.clear();
+        o.t = 8.0;
+        o.tick = 160;
+        let a = b.decide(&o, [0.0; 3]);
+        assert_eq!(b.label, "guard");
+        assert!(a.aim[0].abs() < 0.1, "aim {:?}", a.aim);
+        assert!(!a.fire[1], "laser charge started while guarding");
+        o.t = 12.0;
+        o.tick = 240;
+        b.decide(&o, [0.0; 3]);
+        assert_ne!(b.label, "guard");
+        let mut b = with(Params { ghost: 0.0, ring: 0.0, spot: 0.0, ..Params::default() });
+        b.decide(&obs(aimer, ""), [0.0; 3]);
+        o.t = 8.0;
+        b.decide(&o, [0.0; 3]);
+        assert_ne!(b.label, "guard");
     }
 }
