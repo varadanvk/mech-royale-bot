@@ -159,6 +159,7 @@ fn practice_scene_is_played_as_before() {
         cb_known: 0.0,
         cb_corner: 0.0,
         cb_turn: 0.0,
+        stay_fight: 0.0,
         cr_max_d: 0.0,
         cr_laser: 0.0,
         cr_strafe: 0.0,

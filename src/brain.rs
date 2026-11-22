@@ -484,6 +484,12 @@ pub struct Params {
     pub pred_tan: f32,
     /// Having broken off to ground that turns out to be in an enemy's view, sidestep across its line while shooting back instead of standing still (0 = stand).
     pub cr_strafe: f32,
+    /// In a free-for-all, break off, reload and sidestep laser shots as before: cr_max_d, cr_laser, cr_strafe, reload_laser and dodge_after take their earlier values there (0 = the same in every kind of match).
+    pub ffa_plain: f32,
+    /// In a live fight (a target in view while engaged, or hurt by a mech in the last 6 s), keep fighting instead of breaking off, backing away or hiding to heal; a break-off to hidden ground within stay_cover m still goes ahead (practice matches only; 0 = off).
+    pub stay_fight: f32,
+    /// See stay_fight.
+    pub stay_cover: f32,
 }
 
 impl Default for Params {
@@ -708,6 +714,9 @@ impl Default for Params {
             seek_idle: 1.0,
             pred_tan: 1.0,
             cr_strafe: 1.0,
+            ffa_plain: 1.0,
+            stay_fight: 1.0,
+            stay_cover: 15.0,
         }
     }
 }
@@ -951,6 +960,9 @@ impl Params {
         p.seek_idle = g("seek_idle", p.seek_idle);
         p.pred_tan = g("pred_tan", p.pred_tan);
         p.cr_strafe = g("cr_strafe", p.cr_strafe);
+        p.ffa_plain = g("ffa_plain", p.ffa_plain);
+        p.stay_fight = g("stay_fight", p.stay_fight);
+        p.stay_cover = g("stay_cover", p.stay_cover);
         p
     }
 
@@ -2345,6 +2357,9 @@ impl Brain {
         self.hunters.retain(|_, t| o.t - *t < 10.0);
         // Free-for-all modes (only once a free-for-all is settled): who is worth shooting, and the fight we join.
         let ffa_on = self.ffa_on();
+        // In a free-for-all placing counts for more than kills: the earlier, more careful settings (`ffa_plain`).
+        let (cr_max_d, cr_laser, cr_strafe, reload_laser, dodge_after) =
+            if ffa_on && p.ffa_plain > 0.0 { (0.0, 0.0, 0.0, 1.0, 9.0) } else { (p.cr_max_d, p.cr_laser, p.cr_strafe, p.reload_laser, p.dodge_after) };
         let cands: Vec<&Actor> = enemies
             .iter()
             .filter(|m| !counter || self.hunters.get(&m.id).map_or(false, |t| o.t - t < 4.0))
@@ -2625,6 +2640,12 @@ impl Brain {
         if hp_frac >= p.heal_hi || p.heal_lo <= 0.0 {
             self.healing = false;
         }
+        // Stay in a live fight rather than break off (`stay_fight`).
+        let stay = p.stay_fight > 0.0 && !ffa_on && target.is_some() && (engaged || recently_hurt_by_mech);
+        if stay {
+            self.fleeing = false;
+            self.healing = false;
+        }
 
         // A laser charging and pointed at us: keep moving across its line until it fires.
         // Several charging at once: track the nearest (ties broken by id).
@@ -2640,7 +2661,7 @@ impl Brain {
                         laser_d = d;
                         laser_on = Some(k.pos);
                     }
-                    if o.t - since >= p.dodge_after && !self.dodged_charge.contains_key(id) {
+                    if o.t - since >= dodge_after && !self.dodged_charge.contains_key(id) {
                         flip_now = true;
                         flips.push(*id);
                     }
@@ -2813,7 +2834,7 @@ impl Brain {
                     }
                     let prev = self.cr_goal;
                     let mut g = self.retreat_cell(o, &eyes, if p.cb_away > 0.0 || p.cb_path > 0.0 { &all } else { &[] });
-                    if p.cr_max_d > 0.0 && g.map_or(false, |g| d2(&g, &pos) > p.cr_max_d) {
+                    if cr_max_d > 0.0 && g.map_or(false, |g| d2(&g, &pos) > cr_max_d) {
                         g = None;
                     }
                     if p.cb_turn > 0.0 {
@@ -2846,6 +2867,11 @@ impl Brain {
                 cb_all = all;
             }
         }
+        if stay && (cr_goal.is_some() || cb_cornered) && cr_goal.map_or(true, |g| d2(&g, &pos) > p.stay_cover) {
+            cr_goal = None;
+            cb_cornered = false;
+            self.cr_until = -1.0;
+        }
         let mut boost = false;
         let mut mv: [f32; 2];
         let mut label = "idle";
@@ -2877,7 +2903,7 @@ impl Brain {
             // Break off to hidden ground; stand still once there.
             label = "cbreak";
             let dg = d2(&pos, &g);
-            let seen_by = shoot_at.filter(|t| p.cr_strafe > 0.0 && t.kind == "mech");
+            let seen_by = shoot_at.filter(|t| cr_strafe > 0.0 && t.kind == "mech");
             mv = if dg >= 2.0 {
                 self.go(&pos, g)
             } else if let Some(t) = seen_by {
@@ -2896,7 +2922,7 @@ impl Brain {
                 [0.0, 0.0]
             };
             boost = me.energy > p.retreat_boost_energy && dg > 5.0;
-            if dg > 6.0 && p.cr_laser <= 0.0 {
+            if dg > 6.0 && cr_laser <= 0.0 {
                 for (i, w) in me.weapons.iter().enumerate().take(2) {
                     if w.as_ref().map_or(false, |w| w.kind == "laser" && w.charge <= 0.0) {
                         a.fire[i] = false;
@@ -3223,7 +3249,7 @@ impl Brain {
                 .filter(|k| o.t - k.seen_t < 4.0 && d2(&k.pos, &pos) < 200.0)
                 .map(|k| [k.pos[0], k.pos[1], k.pos[2] + 8.0])
                 .collect();
-            let laser_up = has_laser && p.reload_laser <= 0.0 && me.weapons.iter().flatten().any(|w| w.kind == "laser" && w.cooldown < 0.8);
+            let laser_up = has_laser && reload_laser <= 0.0 && me.weapons.iter().flatten().any(|w| w.kind == "laser" && w.cooldown < 0.8);
             let hide = if p.reload_hide > 0.0 && reloading && !(has_arc && dist < 45.0) && !finishing && !laser_up {
                 self.hide_step(&pos, &eyes, p.reload_hide)
             } else {
@@ -4663,6 +4689,22 @@ mod tests {
                 assert_eq!(a.mv[0].hypot(a.mv[1]) > 0.5, moving, "{:?}", a.mv);
                 assert!(a.mv[0].abs() < 0.3, "{:?}", a.mv);
             }
+        }
+    }
+
+    #[test]
+    fn a_live_fight_is_not_left_for_hidden_ground_far_off() {
+        let foes = r#"{"id": 3, "kind": "mech", "pos": [40, 0, 0], "aim": [3.14, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]},
+                      {"id": 4, "kind": "mech", "pos": [50, 20, 0], "aim": [3.5, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let hit = r#"{"type": "damaged", "amount": 45, "weapon": "gun", "bearing": 0.0, "by": 3}"#;
+        for (stay, goal, broke) in [(0.0, [-60.0, 0.0], true), (1.0, [-60.0, 0.0], false), (1.0, [-10.0, 0.0], true)] {
+            let mut b = with(Params { crowd_retreat: 1.0, stay_fight: stay, cr_max_d: 0.0, ..base() });
+            let mut o = obs(foes, hit);
+            o.me.hp = 500.0;
+            b.cr_until = 100.0;
+            b.cr_goal = Some(goal);
+            b.decide(&o, [0.0; 3]);
+            assert_eq!(b.label == "cbreak", broke, "stay {stay} goal {goal:?}: {}", b.label);
         }
     }
 }
