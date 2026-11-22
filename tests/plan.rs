@@ -37,8 +37,12 @@ fn open_spot(w: &World, nav: &Nav) -> Option<[f32; 3]> {
 }
 
 fn obs(tick: u64, me: [f32; 3], projectiles: &str) -> Obs {
+    obs_with(tick, me, projectiles, false)
+}
+
+fn obs_with(tick: u64, me: [f32; 3], projectiles: &str, charging: bool) -> Obs {
     let s = format!(
-        r#"{{"tick":{tick},"t":{:.2},"alive":16,"self":{{"id":0,"pos":[{:.2},{:.2},{:.2}],"vel":[0,0,0],"aim":[0,0],"hp":1400,"max_hp":1400,"energy":100,"max_energy":100,"grounded":true,"cubes":0,"in_zone":true,"weapons":[{{"kind":"gun","cooldown":0,"ammo":12,"reload":0,"charge":0,"stats":{{}}}},null],"stats":{{}}}},"mechs":[{{"id":3,"kind":"mech","pos":[{:.2},{:.2},{:.2}],"vel":[0,0,0],"aim":[3.1416,0],"hp":1400,"max_hp":1400,"cubes":0,"weapons":["gun"],"charging":false}}],"projectiles":[{projectiles}],"zone":{{"center":[{:.2},{:.2}],"radius":560,"next_center":[{:.2},{:.2}],"next_radius":380,"shrink_start":200,"shrink_end":260,"dps":10}}}}"#,
+        r#"{{"tick":{tick},"t":{:.2},"alive":16,"self":{{"id":0,"pos":[{:.2},{:.2},{:.2}],"vel":[0,0,0],"aim":[0,0],"hp":1400,"max_hp":1400,"energy":100,"max_energy":100,"grounded":true,"cubes":0,"in_zone":true,"weapons":[{{"kind":"gun","cooldown":0,"ammo":12,"reload":0,"charge":0,"stats":{{}}}},null],"stats":{{}}}},"mechs":[{{"id":3,"kind":"mech","pos":[{:.2},{:.2},{:.2}],"vel":[0,0,0],"aim":[3.1416,0],"hp":1400,"max_hp":1400,"cubes":0,"weapons":["gun"],"charging":{charging}}}],"projectiles":[{projectiles}],"zone":{{"center":[{:.2},{:.2}],"radius":560,"next_center":[{:.2},{:.2}],"next_radius":380,"shrink_start":200,"shrink_end":260,"dps":10}}}}"#,
         tick as f32 * 0.05,
         me[0], me[1], me[2],
         me[0] + 150.0, me[1], me[2],
@@ -111,4 +115,30 @@ fn planning_under_heavy_fire_is_fast() {
     }
     eprintln!("decision ms: quiet max {base:.2}, under fire max {worst:.2}");
     assert!(worst < 5.0, "decision under fire took {worst:.2} ms");
+}
+
+#[test]
+fn a_laser_charged_at_us_changes_the_move_only() {
+    let Some((world, nav)) = load() else { return };
+    let Some(me) = open_spot(&world, &nav) else { return };
+    let run = |params: Params| {
+        let mut b = brain(world.clone(), nav.clone(), params);
+        let (mut out, mut worst) = (Vec::new(), 0.0f32);
+        for k in 0..12u64 {
+            let me = [me[0], me[1] + (k % 4) as f32 * 0.5, me[2]];
+            let t0 = Instant::now();
+            let a = b.act(&obs_with(40 + 2 * k, me, "", k >= 4));
+            worst = worst.max(t0.elapsed().as_secs_f32() * 1000.0);
+            out.push(a);
+        }
+        (out, worst)
+    };
+    let (on, worst) = run(Params::default());
+    let (off, _) = run(Params { plan_laser: 0.0, ..Params::default() });
+    assert!(worst < 5.0, "decision took {worst:.2} ms");
+    for (a, a0) in on.iter().zip(&off) {
+        assert_eq!((a.aim, a.fire), (a0.aim, a0.fire));
+    }
+    // The enemy aims straight at us along x: by the time the charge is full we mean to be off that line.
+    assert!(on[5..9].iter().any(|a| a.mv[1].abs() > 0.5), "stays on the line: {:?}", on.iter().map(|a| a.mv).collect::<Vec<_>>());
 }

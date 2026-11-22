@@ -381,6 +381,8 @@ pub struct Params {
     pub dodge_look: f32,
     /// With shots in the air that can reach us, choose the fight move by scoring candidate moves against them; the value weighs progress along the wanted move (0 = off).
     pub plan: f32,
+    /// In that scoring, a laser being charged at us counts as its beam's damage wherever its owner will still see us when the charge is full, a little less off the line it is aimed along now (0 = off).
+    pub plan_laser: f32,
     pub dodge_reach: f32,
     /// Tell a free-for-all from a practice match (see `detect`) and keep a picture of every enemy alongside the
     /// usual logic; nothing it learns changes a decision unless `ffa_play` is on and a free-for-all is settled
@@ -671,6 +673,7 @@ impl Default for Params {
             cube_r_low: 40.0,
             dodge_look: 1.2,
             plan: 2.0,
+            plan_laser: 1.0,
             dodge_reach: 3.5,
             ffa_detect: 1.0,
             ffa_play: 1.0,
@@ -920,6 +923,7 @@ impl Params {
         p.cube_r_low = g("cube_r_low", p.cube_r_low);
         p.dodge_look = g("dodge_look", p.dodge_look);
         p.plan = g("plan", p.plan);
+        p.plan_laser = g("plan_laser", p.plan_laser);
         p.dodge_reach = g("dodge_reach", p.dodge_reach);
         p.ffa_detect = g("ffa_detect", p.ffa_detect);
         p.ffa_play = g("ffa_play", p.ffa_play);

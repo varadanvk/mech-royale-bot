@@ -1,5 +1,5 @@
 //! Fight movement planner: score candidate moves against incoming fire and pick the best one.
-use super::Brain;
+use super::{d2, wrap, yaw_to, Brain};
 use crate::proto::Obs;
 
 /// A projectile that may reach us.
@@ -117,10 +117,27 @@ impl Brain {
         let scale = 1.0 + 0.05 * me.cubes;
         let (radius, height) = (2.5 * scale, 9.0 * scale);
         let mut threats = self.incoming(o, radius);
-        if threats.is_empty() {
+        let face = [aim_yaw.cos(), aim_yaw.sin()];
+        // Lasers being charged at us: (muzzle, aim direction, seconds until the charge is full, damage).
+        let mut beams: Vec<([f32; 3], [f32; 2], f32, f32)> = Vec::new();
+        if self.params.plan_laser > 0.0 {
+            let cook = if me.weapons.iter().flatten().any(|w| w.kind == "mortar") { 1.6 } else { 1.0 };
+            for k in self.known.values() {
+                let Some(since) = k.charge_since else { continue };
+                if o.t - k.seen_t > 0.25 || d2(&k.pos, &pos) > 280.0 || wrap(k.aim_yaw - yaw_to(&k.pos, &pos)).abs() > 0.5 {
+                    continue;
+                }
+                let rear = if (k.pos[0] - pos[0]) * face[0] + (k.pos[1] - pos[1]) * face[1] < 0.0 { 1.5 } else { 1.0 };
+                let left = (0.75 - (o.t - since)).clamp(0.1, 0.75);
+                beams.push(([k.pos[0], k.pos[1], k.pos[2] + 7.0], [k.aim_yaw.cos(), k.aim_yaw.sin()], left, 315.0 * cook * rear));
+                if beams.len() >= 3 {
+                    break;
+                }
+            }
+        }
+        if threats.is_empty() && beams.is_empty() {
             return None;
         }
-        let face = [aim_yaw.cos(), aim_yaw.sin()];
         for th in threats.iter_mut().filter(|t| !t.mortar) {
             if th.vel[0] * face[0] + th.vel[1] * face[1] > 0.0 {
                 th.dmg *= 1.5;
@@ -171,6 +188,7 @@ impl Brain {
             let mut score = 0.0f32;
             let mut blocked = false;
             let mut at = q;
+            let mut beam_at = [q; 3];
             for k in 1..=steps {
                 v = approach(v, tv, accel * STEP);
                 let mut n = [q[0] + v[0] * STEP, q[1] + v[1] * STEP];
@@ -185,6 +203,11 @@ impl Brain {
                 q = n;
                 if k == PROGRESS_STEP {
                     at = q;
+                }
+                for (i, b) in beams.iter().enumerate() {
+                    if k <= (b.2 / STEP).ceil() as usize {
+                        beam_at[i] = q;
+                    }
                 }
                 let (t0, t1) = ((k - 1) as f32 * STEP, k as f32 * STEP);
                 for th in &threats {
@@ -215,6 +238,19 @@ impl Brain {
             }
             if steps < PROGRESS_STEP {
                 at = q;
+            }
+            // A beam goes where its owner aims when the charge is let go: out of its sight nothing lands, and on
+            // the line it is aimed along now it lands surest.
+            for (i, b) in beams.iter().enumerate() {
+                let c = beam_at[i];
+                if !self.clear(b.0, [c[0], c[1], pos[2] + height * 0.6]) {
+                    continue;
+                }
+                let r = [c[0] - b.0[0], c[1] - b.0[1]];
+                let along = r[0] * b.1[0] + r[1] * b.1[1];
+                let off = (r[0] * b.1[1] - r[1] * b.1[0]).abs();
+                let sure = if along > 0.0 && off < radius + 1.5 { 1.0 } else { 0.85 };
+                score -= b.3 * sure * self.params.plan_laser;
             }
             score += ((at[0] - pos[0]) * want[0] + (at[1] - pos[1]) * want[1]) * weight;
             if blocked {
