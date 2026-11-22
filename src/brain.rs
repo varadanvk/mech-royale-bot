@@ -1,4 +1,6 @@
 //! Decision logic: one `act` per observation.
+use crate::contacts::{Belief, Contacts};
+use crate::detect::Detector;
 use crate::nav::Nav;
 use crate::proto::{Action, Actor, Hello, Obs, Weapon};
 use crate::sight::{Foe, Pick, SightTable, Zone};
@@ -369,6 +371,19 @@ pub struct Params {
     /// Sidestep tuning: how far ahead a bullet is tracked and how far we step.
     pub dodge_look: f32,
     pub dodge_reach: f32,
+    /// Tell a free-for-all from a practice match (see `detect`) and keep a picture of every enemy alongside the
+    /// usual logic; nothing it learns changes a decision unless `ffa_play` is on and a free-for-all is settled
+    /// (0 = off).
+    pub ffa_detect: f32,
+    /// Once a free-for-all is settled, play it in the modes of `ffa` (0 = off).
+    pub ffa_play: f32,
+    /// Free-for-all mode distances: an enemy coming for us within `ffa_avoid_r` is avoided; a fight between two
+    /// others within `ffa_third_r` is joined; the late game starts once the next circle is at most
+    /// `ffa_late_r` across. `ffa_quiet`: walking speed when keeping quiet (below the step-sound speed).
+    pub ffa_avoid_r: f32,
+    pub ffa_third_r: f32,
+    pub ffa_late_r: f32,
+    pub ffa_quiet: f32,
 }
 
 impl Default for Params {
@@ -537,6 +552,12 @@ impl Default for Params {
             cube_r_low: 40.0,
             dodge_look: 1.2,
             dodge_reach: 3.5,
+            ffa_detect: 1.0,
+            ffa_play: 1.0,
+            ffa_avoid_r: 150.0,
+            ffa_third_r: 220.0,
+            ffa_late_r: 140.0,
+            ffa_quiet: 4.6,
         }
     }
 }
@@ -709,6 +730,12 @@ impl Params {
         p.cube_r_low = g("cube_r_low", p.cube_r_low);
         p.dodge_look = g("dodge_look", p.dodge_look);
         p.dodge_reach = g("dodge_reach", p.dodge_reach);
+        p.ffa_detect = g("ffa_detect", p.ffa_detect);
+        p.ffa_play = g("ffa_play", p.ffa_play);
+        p.ffa_avoid_r = g("ffa_avoid_r", p.ffa_avoid_r);
+        p.ffa_third_r = g("ffa_third_r", p.ffa_third_r);
+        p.ffa_late_r = g("ffa_late_r", p.ffa_late_r);
+        p.ffa_quiet = g("ffa_quiet", p.ffa_quiet);
         p
     }
 
@@ -971,6 +998,34 @@ pub struct Brain {
     /// Bearing and time of the last hit taken from a mech, and of the last weapon or step sound heard.
     hit_bearing: Option<(f32, f32)>,
     sound_bearing: Option<(f32, f32)>,
+    /// Free-for-all side (`ffa_detect`): match-type detector, enemy picture, this tick's beliefs, our position
+    /// every half second over the last five seconds, and recent kills (time, killer, victim).
+    detector: Detector,
+    contacts: Contacts,
+    beliefs: Vec<Belief>,
+    me_hist: VecDeque<(f32, [f32; 2])>,
+    kill_log: VecDeque<(f32, Option<u32>, Option<u32>)>,
+    /// Current free-for-all mode, since when, why; the pair being third-partied (weaker, stronger); the place
+    /// the mode is heading for and when it was chosen; decisions spent per mode.
+    ffa_mode: ffa::FfaMode,
+    ffa_since: f32,
+    ffa_why: String,
+    ffa_third: Option<(u32, u32)>,
+    ffa_goal: Option<[f32; 2]>,
+    ffa_goal_t: f32,
+    ffa_ticks: [u32; 6],
+    ffa_slot: u32,
+    ffa_seed: u64,
+    trace_ffa: bool,
+    /// Slowest decision so far in ms (only measured while tracing).
+    ffa_slowest: f32,
+    /// For a viewer only, never read by decisions: believed enemies as x, y, radius, confidence; the current
+    /// mode and why; what we believe about each enemy; the last kills seen (time, killer, victim; our own kills
+    /// name our slot as the killer, deaths we only counted name neither).
+    pub dbg_contacts: Vec<[f32; 4]>,
+    pub dbg_kills: Vec<(f32, Option<u32>, Option<u32>)>,
+    pub dbg_mode: String,
+    pub dbg_enemies: Vec<ffa::EnemyInfo>,
 }
 
 impl Brain {
@@ -1087,6 +1142,26 @@ impl Brain {
             hit_t: BTreeMap::new(),
             hit_bearing: None,
             sound_bearing: None,
+            detector: Detector::default(),
+            contacts: Contacts::default(),
+            beliefs: Vec::new(),
+            me_hist: VecDeque::new(),
+            kill_log: VecDeque::new(),
+            ffa_mode: ffa::FfaMode::Practice,
+            ffa_since: 0.0,
+            ffa_why: String::new(),
+            ffa_third: None,
+            ffa_goal: None,
+            ffa_goal_t: -100.0,
+            ffa_ticks: [0; 6],
+            ffa_slot: hello.slot,
+            ffa_seed: hello.seed,
+            trace_ffa: std::env::var("TFFA").is_ok(),
+            ffa_slowest: 0.0,
+            dbg_contacts: Vec::new(),
+            dbg_kills: Vec::new(),
+            dbg_mode: String::new(),
+            dbg_enemies: Vec::new(),
         }
     }
 
@@ -1675,6 +1750,10 @@ impl Brain {
     }
 
     pub fn act(&mut self, o: &Obs) -> Action {
+        let t0 = self.trace_ffa.then(std::time::Instant::now);
+        if self.params.ffa_detect > 0.0 {
+            self.ffa_observe(o);
+        }
         let raw = o.me.pos;
         let mut kin = self.kin;
         kin.walk = o.me.stat("walk_speed", kin.walk);
@@ -1708,6 +1787,9 @@ impl Brain {
         self.sent.push_back(Sent { mv: a.mv, boost: a.boost, aim: a.aim, fire: a.fire });
         while self.sent.len() > 6 {
             self.sent.pop_front();
+        }
+        if let Some(t0) = t0 {
+            self.ffa_slowest = self.ffa_slowest.max(t0.elapsed().as_secs_f32() * 1000.0);
         }
         a
     }
@@ -1950,10 +2032,13 @@ impl Brain {
             }
         }
         self.hunters.retain(|_, t| o.t - *t < 10.0);
+        // Free-for-all modes (only once a free-for-all is settled): who is worth shooting, and the fight we join.
+        let ffa_on = self.ffa_on();
         let cands: Vec<&Actor> = enemies
             .iter()
             .filter(|m| !counter || self.hunters.get(&m.id).map_or(false, |t| o.t - t < 4.0))
             .filter(|m| !(hold_late || filter_early) || self.engage_ok(o, m, hold_late))
+            .filter(|m| !ffa_on || self.ffa_engage(o, m, hp_frac))
             .copied()
             .collect();
         let muzzle = [pos[0], pos[1], pos[2] + me.stat("muzzle_height", 7.0)];
@@ -1979,6 +2064,10 @@ impl Brain {
             (Some((_, bs)), Some(f)) if p.focus_stick > 0.0 && score(*f) - p.focus_stick < bs && d2(&f.pos, &pos) < p.open_fire_range => Some(*f),
             (Some((b, _)), _) => Some(b),
             _ => None,
+        };
+        let target = match self.ffa_third.filter(|_| ffa_on) {
+            Some((w, _)) => enemies.iter().find(|m| m.id == w).copied().or(target),
+            None => target,
         };
         let new_focus = target.map(|t| t.id);
         if new_focus != self.focus || o.t - self.focus_t >= 2.0 {
@@ -2006,7 +2095,9 @@ impl Brain {
         let early = o.t < p.farm_until;
         let drone_reach = if early { p.drone_range.max(p.farm_reach.min(120.0)) } else { p.drone_range };
         let farm_on = p.farm_stop <= 0.0 || o.t < p.farm_stop;
-        let farm_drone = if p.drone_fight > 0.0 && calm && farm_on && hp_frac > p.farm_hp && !self.healing {
+        // In a free-for-all, drones are farmed only with no believed enemy within 150 m.
+        let ffa_busy = ffa_on && self.beliefs.iter().any(|b| b.conf >= 0.3 && d2(&b.pos, &pos) < 150.0);
+        let farm_drone = if p.drone_fight > 0.0 && calm && farm_on && hp_frac > p.farm_hp && !self.healing && !ffa_busy {
             drones
                 .iter()
                 .filter(|d| d2(&d.pos, &pos) < drone_reach)
@@ -2400,10 +2491,29 @@ impl Brain {
         let mut mv: [f32; 2];
         let mut label = "idle";
         let zone_stand = p.stand_zone > 0.0 && stand_from.is_some() && me.in_zone && d2(&pos, &z.center) < z.radius - p.stand_zone_m;
-        if !me.in_zone || (must_rotate && out_next > 25.0 && !zone_stand) {
+        let zone_now = !me.in_zone || (must_rotate && out_next > 25.0 && !zone_stand);
+        let ffa_mv = if ffa_on && !zone_now { self.ffa_move(o, &pos, hp_frac, shoot_at.is_some(), &enemies, arm_goal) } else { None };
+        if zone_now {
             label = "zone";
             mv = self.go(&pos, zone_goal);
             boost = !me.in_zone && me.energy > 5.0;
+        } else if let Some(f) = ffa_mv {
+            label = f.label;
+            mv = f.mv;
+            boost = f.boost;
+            if f.no_charge {
+                for (i, w) in me.weapons.iter().enumerate().take(2) {
+                    if w.as_ref().map_or(false, |w| w.kind == "laser" && w.charge <= 0.0) {
+                        a.fire[i] = false;
+                    }
+                }
+            }
+            if shoot_at.is_none() {
+                match f.face {
+                    Some(y) => a.aim = [y, 0.0],
+                    None => self.scan(&mut a),
+                }
+            }
         } else if let Some(g) = cr_goal {
             // Break off to hidden ground; stand still once there.
             label = "cbreak";
@@ -2848,7 +2958,7 @@ impl Brain {
             }
         }
         // Outside a fight, still weave across the line of the nearest shooter.
-        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "ring" || label == "spot" || label == "iso" || label == "fight" || label == "rush" || label == "climb" || (label == "hold" && p.hold_fight <= 0.0) || label == "drone" || label == "reload" || label == "stand" || label == "peek" || label == "hide" || label == "repeek" || label == "home" || label == "cbreak") {
+        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "ring" || label == "spot" || label == "iso" || label == "fight" || label == "rush" || label == "climb" || (label == "hold" && p.hold_fight <= 0.0) || label == "drone" || label == "reload" || label == "stand" || label == "peek" || label == "hide" || label == "repeek" || label == "home" || label == "cbreak" || label.starts_with("ffa")) {
             if o.t >= self.strafe_until {
                 self.next_strafe(o.t);
             }
@@ -3428,6 +3538,20 @@ impl Brain {
 
 #[path = "tactics.rs"]
 mod tactics;
+#[path = "ffa.rs"]
+pub mod ffa;
+
+impl Drop for Brain {
+    fn drop(&mut self) {
+        if self.trace_ffa {
+            let t = self.ffa_ticks;
+            eprintln!(
+                "FFA sum slot {} seed {} latched {} at {:.1} practice {} fight {} third {} avoid {} hide {} late {} slowest_ms {:.1}",
+                self.ffa_slot, self.ffa_seed, self.detector.latched as u8, self.detector.latch_t, t[0], t[1], t[2], t[3], t[4], t[5], self.ffa_slowest
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
