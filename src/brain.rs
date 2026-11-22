@@ -12,7 +12,7 @@ use std::sync::Arc;
 /// Aim: enemies farther than this are led along the ground they can walk.
 const PATH_MIN: f32 = 45.0;
 /// Aim: share of the walk toward us in the lead of an enemy coming for us.
-const PATH_HUNT: f32 = 0.35;
+const PATH_HUNT: f32 = 0.7;
 /// Aim: distance short of us where an enemy coming for us stops.
 const PATH_STOP: f32 = 25.0;
 
