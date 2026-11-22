@@ -233,6 +233,11 @@ impl SightTable {
         self.range[c * SECTORS + s] as f32
     }
 
+    /// Mean clear-line distance from cell `c` over all sectors (metres, up to `RANGE`).
+    pub fn mean_range(&self, c: usize) -> f32 {
+        self.range[c * SECTORS..(c + 1) * SECTORS].iter().map(|&r| r as f32).sum::<f32>() / SECTORS as f32
+    }
+
     /// Whether a mech standing at `from` has a line to a mech at `at` (approximately; unknown ground counts as
     /// seen).
     pub fn visible(&self, at: [f32; 2], from: [f32; 2]) -> bool {

@@ -310,6 +310,40 @@ pub struct Params {
     /// a position nearby where exactly one known enemy has a line to us and the others do not.
     pub spot: f32,
     pub spot_crowd: f32,
+    /// Sidestep an incoming bullet (or a shot from an enemy aimed at us), boosting perpendicular to its path
+    /// for `dodge_hold` seconds (0 = off). A new sidestep starts only above `dodge_energy`.
+    pub dodge: f32,
+    pub dodge_hold: f32,
+    pub dodge_energy: f32,
+    /// Outnumbered or losing: break off in bursts of `cr_burst` seconds to the nearest walkable cell hidden
+    /// from the closest enemies, or fight in place when there is none (0 = off; replaces the low-health
+    /// retreat and backing-away rules).
+    pub crowd_retreat: f32,
+    pub cr_radius: f32,
+    pub cr_burst: f32,
+    pub cr_steps: f32,
+    /// In a fight, step to whichever nearby point best combines the preferred distance, a line to the target
+    /// and few other enemies with a line to it (0 = off).
+    pub fight_pos: f32,
+    pub pref_gun: f32,
+    pub pref_laser: f32,
+    /// Distances kept from enemies holding lightning and mortars.
+    pub keep_ltg: f32,
+    pub keep_mortar: f32,
+    /// Late game (next circle radius at most `late_r`): hold a sheltered home spot inside the next circle,
+    /// walking there quietly, and take on only enemies that are close or come for us (0 = off).
+    pub late_hold: f32,
+    pub late_r: f32,
+    pub home_s: f32,
+    pub home_speed: f32,
+    /// Before the late game, take on only enemies that are close, come for us or are weak (0 = off).
+    pub engage_filter: f32,
+    /// Laser: count the cook-off on mortar holders when releasing early for a kill, and never charge outside
+    /// the zone (0 = off).
+    pub laser_fix: f32,
+    /// Pick up cubes within `fight_cube_r` during a fight when no other enemy watches the way (0 = off).
+    pub fight_cubes: f32,
+    pub fight_cube_r: f32,
 }
 
 impl Default for Params {
@@ -445,6 +479,26 @@ impl Default for Params {
             counter_range: 60.0,
             spot: 0.0,
             spot_crowd: 3.0,
+            dodge: 0.0,
+            dodge_hold: 0.35,
+            dodge_energy: 20.0,
+            crowd_retreat: 0.0,
+            cr_radius: 160.0,
+            cr_burst: 1.5,
+            cr_steps: 50.0,
+            fight_pos: 0.0,
+            pref_gun: 85.0,
+            pref_laser: 115.0,
+            keep_ltg: 64.0,
+            keep_mortar: 80.0,
+            late_hold: 0.0,
+            late_r: 140.0,
+            home_s: 12.0,
+            home_speed: 4.6,
+            engage_filter: 0.0,
+            laser_fix: 0.0,
+            fight_cubes: 0.0,
+            fight_cube_r: 70.0,
         }
     }
 }
@@ -584,6 +638,26 @@ impl Params {
         p.counter_range = g("counter_range", p.counter_range);
         p.spot = g("spot", p.spot);
         p.spot_crowd = g("spot_crowd", p.spot_crowd);
+        p.dodge = g("dodge", p.dodge);
+        p.dodge_hold = g("dodge_hold", p.dodge_hold);
+        p.dodge_energy = g("dodge_energy", p.dodge_energy);
+        p.crowd_retreat = g("crowd_retreat", p.crowd_retreat);
+        p.cr_radius = g("cr_radius", p.cr_radius);
+        p.cr_burst = g("cr_burst", p.cr_burst);
+        p.cr_steps = g("cr_steps", p.cr_steps);
+        p.fight_pos = g("fight_pos", p.fight_pos);
+        p.pref_gun = g("pref_gun", p.pref_gun);
+        p.pref_laser = g("pref_laser", p.pref_laser);
+        p.keep_ltg = g("keep_ltg", p.keep_ltg);
+        p.keep_mortar = g("keep_mortar", p.keep_mortar);
+        p.late_hold = g("late_hold", p.late_hold);
+        p.late_r = g("late_r", p.late_r);
+        p.home_s = g("home_s", p.home_s);
+        p.home_speed = g("home_speed", p.home_speed);
+        p.engage_filter = g("engage_filter", p.engage_filter);
+        p.laser_fix = g("laser_fix", p.laser_fix);
+        p.fight_cubes = g("fight_cubes", p.fight_cubes);
+        p.fight_cube_r = g("fight_cube_r", p.fight_cube_r);
         p
     }
 
@@ -821,6 +895,22 @@ pub struct Brain {
     iso_t: f32,
     /// Our health over the last few seconds: (time, hp).
     hp_hist: VecDeque<(f32, f32)>,
+    /// Sidestep in progress: direction and end time; when the last one started.
+    dodge_dir: [f32; 2],
+    dodge_until: f32,
+    /// Retreat burst in progress until this time, toward this cell (None: none found, fight in place).
+    cr_until: f32,
+    cr_goal: Option<[f32; 2]>,
+    /// Fight-position strafe: direction sign and when it next reverses.
+    fp_side: f32,
+    fp_until: f32,
+    /// Late-game home spot and when it was chosen.
+    home: Option<([f32; 2], f32)>,
+    /// Mechs we hit recently: id -> time.
+    hit_t: BTreeMap<u32, f32>,
+    /// Bearing and time of the last hit taken from a mech, and of the last weapon or step sound heard.
+    hit_bearing: Option<(f32, f32)>,
+    sound_bearing: Option<(f32, f32)>,
 }
 
 impl Brain {
@@ -844,7 +934,9 @@ impl Brain {
         let cfg = &hello.config;
         let f = |a: &str, b: &str, d: f32| cfg.get(a).and_then(|v| v.get(b)).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d);
         let sight = match (&world, &nav) {
-            (Some(w), Some(n)) if params.spot > 0.0 => Some(Arc::new(SightTable::build(w, n))),
+            (Some(w), Some(n)) if params.spot > 0.0 || params.crowd_retreat > 0.0 || params.fight_pos > 0.0 || params.late_hold > 0.0 || params.fight_cubes > 0.0 => {
+                Some(Arc::new(SightTable::build(w, n)))
+            }
             _ => None,
         };
         Brain {
@@ -924,6 +1016,16 @@ impl Brain {
             iso_pick: None,
             iso_t: -1.0,
             hp_hist: VecDeque::new(),
+            dodge_dir: [0.0, 0.0],
+            dodge_until: -1.0,
+            cr_until: -1.0,
+            cr_goal: None,
+            fp_side: 1.0,
+            fp_until: -1.0,
+            home: None,
+            hit_t: BTreeMap::new(),
+            hit_bearing: None,
+            sound_bearing: None,
         }
     }
 
@@ -1066,7 +1168,10 @@ impl Brain {
                 let mut full = w.charge >= full_c - 0.01;
                 if !full && p.laser_finish > 0.0 && t.max_hp > 0.0 && w.charge >= w.stat("min_charge", 0.15) {
                     let frac = w.stat("min_frac", 0.35);
-                    let dmg = w.stat("damage", 315.0) * (frac + (1.0 - frac) * (w.charge / full_c).min(1.0)) * (1.0 + 0.04 * me.cubes.min(10.0));
+                    let mut dmg = w.stat("damage", 315.0) * (frac + (1.0 - frac) * (w.charge / full_c).min(1.0)) * (1.0 + 0.04 * me.cubes.min(10.0));
+                    if p.laser_fix > 0.0 && t.weapons.iter().any(|k| k == "mortar") {
+                        dmg *= 1.0 + w.stat("cookoff", 0.6);
+                    }
                     full = t.hp < dmg * 0.95;
                 }
                 if full {
@@ -1720,6 +1825,8 @@ impl Brain {
             }
         }
 
+        self.track_contacts(o);
+
         // --- upgrades
         if let Some(offer) = &o.offer {
             let list = if p.upg_dmg > 0.0 { UPGRADES_DMG } else { UPGRADES };
@@ -1731,7 +1838,14 @@ impl Brain {
         let enemies: Vec<&Actor> = o.mechs.iter().filter(|m| m.kind == "mech" && !(m.max_hp > 0.0 && m.hp <= 0.0)).collect();
         let near_enemies = enemies.iter().filter(|m| d2(&m.pos, &pos) < p.crowd_radius).count();
         let no_laser = !me.weapons.iter().flatten().any(|w| w.kind == "laser");
-        let late = (p.wall_t > 0.0 && o.t >= p.wall_t) || (p.wall_t > 0.0 && o.zone.radius <= p.wall_r);
+        // With `late_hold`, the late game starts once the next circle is small.
+        let late = if p.late_hold > 0.0 {
+            o.zone.next_radius <= p.late_r
+        } else {
+            (p.wall_t > 0.0 && o.t >= p.wall_t) || (p.wall_t > 0.0 && o.zone.radius <= p.wall_r)
+        };
+        let hold_late = p.late_hold > 0.0 && late;
+        let filter_early = p.engage_filter > 0.0 && !late;
         // Loop mode: late, or pressed by three or more enemies (close by, or hurting us).
         if p.ring > 0.0 {
             let mut pressing: Vec<u32> = self.known.iter().filter(|(_, k)| o.t - k.seen_t < 4.0 && d2(&k.pos, &pos) < 150.0).map(|(id, _)| *id).collect();
@@ -1775,7 +1889,12 @@ impl Brain {
             }
         }
         self.hunters.retain(|_, t| o.t - *t < 10.0);
-        let cands: Vec<&Actor> = enemies.iter().filter(|m| !counter || self.hunters.get(&m.id).map_or(false, |t| o.t - t < 4.0)).copied().collect();
+        let cands: Vec<&Actor> = enemies
+            .iter()
+            .filter(|m| !counter || self.hunters.get(&m.id).map_or(false, |t| o.t - t < 4.0))
+            .filter(|m| !(hold_late || filter_early) || self.engage_ok(o, m, hold_late))
+            .copied()
+            .collect();
         let muzzle = [pos[0], pos[1], pos[2] + me.stat("muzzle_height", 7.0)];
         let score = |m: &Actor| {
             let d = d2(&m.pos, &pos);
@@ -1793,6 +1912,9 @@ impl Brain {
             .map(|m| (*m, score(*m)))
             .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
         let target = match (best, self.focus.and_then(|f| cands.iter().find(|m| m.id == f))) {
+            _ if p.engage_filter > 0.0 => {
+                cands.iter().map(|m| (*m, self.engage_score(o, m))).min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal)).map(|x| x.0)
+            }
             (Some((_, bs)), Some(f)) if p.focus_stick > 0.0 && score(*f) - p.focus_stick < bs && d2(&f.pos, &pos) < p.open_fire_range => Some(*f),
             (Some((b, _)), _) => Some(b),
             _ => None,
@@ -2025,10 +2147,10 @@ impl Brain {
             let tf = if t.max_hp > 0.0 { t.hp / t.max_hp } else { 1.0 };
             tf < p.finish_hp && tf * t.max_hp < me.hp * 0.8 && near_enemies <= 2
         });
-        if finishing {
+        if finishing || p.crowd_retreat > 0.0 {
             self.fleeing = false;
         }
-        let crowded = near_enemies >= p.crowd_count && !finishing;
+        let crowded = near_enemies >= p.crowd_count && !finishing && p.crowd_retreat <= 0.0;
         if p.heal_lo > 0.0 && enemies.is_empty() && hp_frac < p.heal_lo && o.t - self.last_mech_hurt_t > 1.0 {
             self.healing = true;
         }
@@ -2110,13 +2232,14 @@ impl Brain {
             }
             _ => None,
         };
+        let rush_t = rush_t.filter(|_| !hold_late);
         self.rushing = rush_t.map(|t| t.id);
         if rush_t.is_some() {
             self.fleeing = false;
         }
         // An empty slot: the nearest good weapon on the ground comes first.
         let worst_rank = worst_slot.map_or(0, |(_, r)| r);
-        let arm_goal = if p.arm > 0.0 && farm_on && (empty_slot || p.arm_better > 0.0 || p.laser_seek > 0.0) && hp_frac > p.arm_hp {
+        let arm_goal = if p.arm > 0.0 && farm_on && !hold_late && (empty_slot || p.arm_better > 0.0 || p.laser_seek > 0.0) && hp_frac > p.arm_hp {
             let reach = if empty_slot { p.arm_reach } else { p.arm_better };
             let cands: Vec<(u32, [f32; 3], f32)> = self
                 .picks_mem
@@ -2145,7 +2268,7 @@ impl Brain {
         };
         // Cubes dropped by a kill: the nearest one known around the spot, or the spot itself until we have looked.
         let collect_goal = match self.kill_spot {
-            Some((ks, kt)) if p.collect > 0.0 && o.t - kt < p.collect_s && hp_frac > p.collect_hp && (enemies.len() as f32) < p.collect_seen => {
+            Some((ks, kt)) if p.collect > 0.0 && !hold_late && o.t - kt < p.collect_s && hp_frac > p.collect_hp && (enemies.len() as f32) < p.collect_seen => {
                 let c = self
                     .cubes_mem
                     .values()
@@ -2178,6 +2301,31 @@ impl Brain {
             None
         };
         let live_fight = p.hold_fight > 0.0 && target.is_some() && (engaged || recently_hurt_by_mech);
+        // Finishing a weak target up close (`engage_filter`).
+        let close_kill = p.engage_filter > 0.0 && target.map_or(false, |t| t.max_hp > 0.0 && t.hp / t.max_hp < 0.38);
+        // Outnumbered or losing: break off in bursts to the nearest hidden cell (`crowd_retreat`).
+        let mut cr_goal: Option<[f32; 2]> = None;
+        if p.crowd_retreat > 0.0 {
+            let near = enemies.iter().filter(|m| d2(&m.pos, &pos) < p.cr_radius).count();
+            let tf = target.map_or(1.0, |t| if t.max_hp > 0.0 { t.hp / t.max_hp } else { 1.0 });
+            let t_hp = target.map_or(0.0, |t| if t.max_hp > 0.0 { t.hp } else { 1400.0 });
+            let trigger = (near >= 2 && hp_frac < 0.55) || (near >= 3 && hp_frac < 0.8) || (hp_frac < 0.35 && target.is_some() && t_hp > me.hp);
+            let veto = late || finishing || close_kill || (target.is_some() && tf < 0.25 && near <= 2) || threats.is_empty();
+            if veto {
+                self.cr_until = -1.0;
+            } else if o.t < self.cr_until || trigger {
+                let at_exposed = self.cr_goal.map_or(false, |g| {
+                    d2(&g, &pos) < 2.5 && self.hidden_from(g, pos[2], &threats[..threats.len().min(4)]) < threats.len().min(4)
+                });
+                if o.t >= self.cr_until || at_exposed {
+                    if o.t >= self.cr_until {
+                        self.cr_until = o.t + p.cr_burst;
+                    }
+                    self.cr_goal = self.retreat_cell(o, &threats);
+                }
+                cr_goal = self.cr_goal;
+            }
+        }
         let mut boost = false;
         let mut mv: [f32; 2];
         let mut label = "idle";
@@ -2186,6 +2334,24 @@ impl Brain {
             label = "zone";
             mv = self.go(&pos, zone_goal);
             boost = !me.in_zone && me.energy > 5.0;
+        } else if let Some(g) = cr_goal {
+            // Break off to hidden ground; stand still once there.
+            label = "cbreak";
+            let dg = d2(&pos, &g);
+            mv = if dg < 2.0 { [0.0, 0.0] } else { self.go(&pos, g) };
+            boost = me.energy > p.retreat_boost_energy && dg > 5.0;
+            if dg > 6.0 {
+                for (i, w) in me.weapons.iter().enumerate().take(2) {
+                    if w.as_ref().map_or(false, |w| w.kind == "laser" && w.charge <= 0.0) {
+                        a.fire[i] = false;
+                    }
+                }
+            }
+            if shoot_at.is_none() {
+                if let Some(th) = threats.first() {
+                    a.aim = [yaw_to(&pos, th), 0.0];
+                }
+            }
         } else if ring_on {
             // Keep going round a building, on the side away from the enemies; boost only to get out of the
             // sight of two or more.
@@ -2312,6 +2478,23 @@ impl Brain {
             if shoot_at.is_none() {
                 if let Some(th) = all.first() {
                     a.aim = [yaw_to(&pos, th), 0.0];
+                }
+            }
+        } else if hold_late && !live_fight {
+            // Hold a quiet, sheltered home spot inside the next circle.
+            label = "home";
+            let h = self.home_spot(o);
+            let dh = d2(&pos, &h);
+            mv = if dh < 2.5 { [0.0, 0.0] } else { self.go(&pos, h) };
+            let slow = (p.home_speed / walk_speed.max(0.1)).min(1.0);
+            mv = [mv[0] * slow, mv[1] * slow];
+            if shoot_at.is_none() {
+                if let Some(b) = self.alert_bearing(o) {
+                    a.aim = [b, 0.0];
+                } else if let Some(th) = threats.first() {
+                    a.aim = [yaw_to(&pos, th), 0.0];
+                } else {
+                    self.scan(&mut a);
                 }
             }
         } else if late && !self.fleeing && !live_fight {
@@ -2442,8 +2625,15 @@ impl Brain {
             let has_arc = me.weapons.iter().flatten().any(|w| w.kind == "lightning") && me.energy > p.arc_energy;
             let they_arc = t.weapons.iter().any(|w| w == "lightning");
             let has_laser = me.weapons.iter().flatten().any(|w| w.kind == "laser");
-            let pref = if finishing {
+            let pref = if close_kill {
+                20.0
+            } else if finishing {
                 p.finish_range
+            } else if p.fight_pos > 0.0 && !(has_arc && hp_frac > p.arc_min_hp && near_enemies as f32 <= p.arc_crowd) {
+                let base = if has_laser { p.pref_laser } else { p.pref_gun };
+                let ltg = if they_arc { p.keep_ltg } else { 0.0 };
+                let mtr = if t.weapons.iter().any(|w| w == "mortar") { p.keep_mortar } else { 0.0 };
+                base.max(ltg).max(mtr)
             } else if has_arc && hp_frac > p.arc_min_hp && near_enemies as f32 <= p.arc_crowd {
                 p.arc_range
             } else if they_arc {
@@ -2457,7 +2647,16 @@ impl Brain {
             let off = dist - pref;
             let radial = if off.abs() < p.gun_band && pref > 50.0 { 0.0 } else { (off / 15.0).clamp(-1.0, 1.0) };
             let radial = if laser_on.is_some() { radial * 0.2 } else { radial };
-            mv = self.strafe_dir(o, &pos, to, radial, false);
+            mv = if p.fight_pos > 0.0 {
+                let ready = me.weapons.iter().flatten().any(|w| match w.kind.as_str() {
+                    "gun" => w.ammo > 0.0 && w.reload <= 0.0 && w.cooldown <= 0.3,
+                    "lightning" => dist < w.stat("range", 45.0) && me.energy >= w.stat("energy", 3.0),
+                    _ => w.cooldown <= 0.3,
+                });
+                self.fight_pos_move(o, t, pref, ready)
+            } else {
+                self.strafe_dir(o, &pos, to, radial, false)
+            };
             let reloading = me.weapons.iter().flatten().any(|w| w.kind == "gun" && (w.reload > 0.4 || w.ammo <= 0.0));
             let eyes: Vec<[f32; 3]> = self
                 .known
@@ -2486,12 +2685,12 @@ impl Brain {
                 label = "reload";
                 mv = h;
                 boost = me.energy > 25.0;
-            } else if let Some(c) = near_cube.filter(|_| !finishing || dist < 20.0) {
+            } else if let Some(c) = (if p.fight_cubes > 0.0 { self.fight_cube(o, t) } else { near_cube }).filter(|_| !finishing || dist < 20.0) {
                 label = "fcube";
                 let g = self.go(&pos, [c[0], c[1]]);
                 mv = norm2(g[0] + mv[0] * 0.35, g[1] + mv[1] * 0.35);
                 boost = me.energy > 30.0;
-            } else if p.expose_weight > 0.0 {
+            } else if p.expose_weight > 0.0 && p.fight_pos <= 0.0 {
                 mv = self.less_exposed(o, &pos, t, mv, p.expose_weight);
             }
             mv = [mv[0] * p.fight_speed, mv[1] * p.fight_speed];
@@ -2499,7 +2698,7 @@ impl Brain {
             if p.fight_boost > 0.0 && me.energy > p.fight_boost {
                 boost = true;
             }
-            if p.close_boost > 0.0 && off > 15.0 && me.energy > p.close_boost && label == "fight" {
+            if p.close_boost > 0.0 && p.fight_pos <= 0.0 && off > 15.0 && me.energy > p.close_boost && label == "fight" {
                 boost = true;
             }
         } else if let (Some(d), true) = (drone_target, p.drone_fight > 0.0) {
@@ -2579,7 +2778,7 @@ impl Brain {
             }
         }
         // Outside a fight, still weave across the line of the nearest shooter.
-        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "ring" || label == "spot" || label == "iso" || label == "fight" || label == "rush" || label == "climb" || (label == "hold" && p.hold_fight <= 0.0) || label == "drone" || label == "reload" || label == "stand" || label == "peek" || label == "hide" || label == "repeek") {
+        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "ring" || label == "spot" || label == "iso" || label == "fight" || label == "rush" || label == "climb" || (label == "hold" && p.hold_fight <= 0.0) || label == "drone" || label == "reload" || label == "stand" || label == "peek" || label == "hide" || label == "repeek" || label == "home" || label == "cbreak") {
             if o.t >= self.strafe_until {
                 self.next_strafe(o.t);
             }
@@ -2595,6 +2794,12 @@ impl Brain {
             if laser_on.is_some() && me.energy > 10.0 {
                 boost = true;
             }
+        }
+
+        // Sidestep an incoming shot.
+        if p.dodge > 0.0 && label != "zone" && label != "climb" && o.t >= self.unstick_until && self.dodge_check(o, target, mv, &threats) {
+            mv = self.dodge_dir;
+            boost = me.energy > 3.0;
         }
 
         // --- stuck: wanting to move but not moving means a ledge or a wall; hop and jet over it
@@ -2655,6 +2860,14 @@ impl Brain {
         }
         if p.arc_save > 0.0 && arc_w.is_some() && me.energy < p.arc_save && !(label == "rush" || label == "zone" || o.t < self.unstick_until) {
             boost = false;
+        }
+        // Charging halves our speed: never charge outside the zone.
+        if p.laser_fix > 0.0 && !me.in_zone {
+            for (i, w) in me.weapons.iter().enumerate().take(2) {
+                if w.as_ref().map_or(false, |w| w.kind == "laser") {
+                    a.fire[i] = false;
+                }
+            }
         }
         a.boost = boost;
         if !a.aim.iter().all(|v| v.is_finite()) {
@@ -3143,12 +3356,29 @@ impl Brain {
     }
 }
 
+#[path = "tactics.rs"]
+mod tactics;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Defaults with the optional tactics off: the checks below are about the behaviour underneath them.
+    fn base() -> Params {
+        Params {
+            dodge: 0.0,
+            crowd_retreat: 0.0,
+            fight_pos: 0.0,
+            late_hold: 0.0,
+            engage_filter: 0.0,
+            laser_fix: 0.0,
+            fight_cubes: 0.0,
+            ..Params::default()
+        }
+    }
+
     fn brain() -> Brain {
-        Brain::with_params(&Hello::default(), None, None, Params::default())
+        Brain::with_params(&Hello::default(), None, None, base())
     }
 
     fn obs(other: &str, events: &str) -> Obs {
@@ -3192,10 +3422,10 @@ mod tests {
     fn late_fights_are_fought_moving() {
         let mut o = obs(MECH, "");
         o.t = 200.0;
-        let mut b = with(Params { ring: 0.0, ..Params::default() });
+        let mut b = with(Params { ring: 0.0, ..base() });
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "fight");
-        let mut b = with(Params { hold_fight: 0.0, ring: 0.0, ..Params::default() });
+        let mut b = with(Params { hold_fight: 0.0, ring: 0.0, ..base() });
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "hold");
     }
@@ -3210,7 +3440,7 @@ mod tests {
         let a = b.decide(&o, [0.0; 3]);
         assert!(b.label != "loot", "looting while under fire");
         assert!((a.aim[0] - 1.5708).abs() < 0.05, "aim {:?}", a.aim);
-        let mut b = Brain::with_params(&Hello::default(), None, None, Params { threat_face: 0.0, ..Params::default() });
+        let mut b = Brain::with_params(&Hello::default(), None, None, Params { threat_face: 0.0, ..base() });
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "loot");
     }
@@ -3220,7 +3450,7 @@ mod tests {
         let arc = r#"{"id": 3, "kind": "mech", "pos": [40, 0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun", "lightning"]}"#;
         let mut o = obs(arc, "");
         o.t = 200.0;
-        let params = Params { hold_fight: 0.0, ring: 0.0, ..Params::default() };
+        let params = Params { hold_fight: 0.0, ring: 0.0, ..base() };
         let mut b = Brain::with_params(&Hello::default(), None, None, params.clone());
         let a = b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "hold");
@@ -3232,7 +3462,7 @@ mod tests {
 
     #[test]
     fn drones_are_left_alone_unless_they_shoot() {
-        let a = with(Params { drone_threat: 0.0, ..Params::default() }).decide(&obs(DRONE, ""), [0.0; 3]);
+        let a = with(Params { drone_threat: 0.0, ..base() }).decide(&obs(DRONE, ""), [0.0; 3]);
         assert!(!a.fire[0] && !a.fire[1]);
     }
 
@@ -3246,23 +3476,23 @@ mod tests {
         let mut o = obs(MECH, "");
         o.me.aim = [1.5, 0.0];
         o.me.weapons[1].as_mut().unwrap().charge = 0.75;
-        let mut b = with(Params { laser_hold: 0.0, ..Params::default() });
+        let mut b = with(Params { laser_hold: 0.0, ..base() });
         b.laser_full_t = Some(3.0);
         assert!(!b.decide(&o, [0.0; 3]).fire[1], "default lets a charge go near the limit");
-        let mut b = with(Params { laser_hold: 1.0, ..Params::default() });
+        let mut b = with(Params { laser_hold: 1.0, ..base() });
         b.laser_full_t = Some(3.0);
         let a = b.decide(&o, [0.0; 3]);
         assert!(a.fire[1], "unaimed charge let go");
         // Lined up: let go.
         o.me.aim = b.solve(&o, o.me.weapons[1].as_ref().unwrap(), &o.mechs[0]).aim;
-        let mut b = with(Params { laser_hold: 1.0, ..Params::default() });
+        let mut b = with(Params { laser_hold: 1.0, ..base() });
         assert!(!b.decide(&o, [0.0; 3]).fire[1], "lined-up charge held");
     }
 
     #[test]
     fn held_laser_follows_a_mech_out_of_view() {
         let mut o = obs(MECH, "");
-        let mut b = with(Params { laser_hold: 1.0, ..Params::default() });
+        let mut b = with(Params { laser_hold: 1.0, ..base() });
         b.decide(&o, [0.0; 3]);
         o.mechs.clear();
         o.t += 1.5;
@@ -3271,7 +3501,7 @@ mod tests {
         let a = b.decide(&o, [0.0; 3]);
         assert!(a.fire[1], "charge dumped after losing the mech");
         assert!(a.aim[0].abs() < 0.2, "aim {:?}", a.aim);
-        let mut b = with(Params { laser_hold: 0.0, ..Params::default() });
+        let mut b = with(Params { laser_hold: 0.0, ..base() });
         let mut o2 = obs(MECH, "");
         b.decide(&o2, [0.0; 3]);
         o2.mechs.clear();
@@ -3282,10 +3512,10 @@ mod tests {
 
     #[test]
     fn drones_in_attack_range_are_shot() {
-        let a = with(Params { drone_threat: 1.0, ..Params::default() }).decide(&obs(DRONE, ""), [0.0; 3]);
+        let a = with(Params { drone_threat: 1.0, ..base() }).decide(&obs(DRONE, ""), [0.0; 3]);
         assert!(a.fire[0] && !a.fire[1], "fire {:?}", a.fire);
         let far = r#"{"id": 104, "kind": "npc", "pos": [80, 0, 0], "hp": 350, "max_hp": 350}"#;
-        let a = with(Params { drone_threat: 1.0, ..Params::default() }).decide(&obs(far, ""), [0.0; 3]);
+        let a = with(Params { drone_threat: 1.0, ..base() }).decide(&obs(far, ""), [0.0; 3]);
         assert!(!a.fire[0]);
     }
 
@@ -3294,10 +3524,10 @@ mod tests {
         let two = r#"{"id": 3, "kind": "mech", "pos": [40, 0, 0], "aim": [1.0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]},
                      {"id": 4, "kind": "mech", "pos": [-60, 0, 0], "aim": [0.05, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
         let o = obs(two, "");
-        let mut b = with(Params { focus_aimer: 0.0, ..Params::default() });
+        let mut b = with(Params { focus_aimer: 0.0, ..base() });
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.focus, Some(3));
-        let mut b = with(Params { focus_aimer: 40.0, ..Params::default() });
+        let mut b = with(Params { focus_aimer: 40.0, ..base() });
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.focus, Some(4));
     }
@@ -3309,11 +3539,11 @@ mod tests {
         o.me.weapons = vec![Some(Weapon { kind: "gun".into(), ammo: 12.0, ..Default::default() }), None];
         o.pickups = vec![crate::proto::Item { id: 8000, kind: "laser".into(), pos: [100.0, 0.0, 0.0], ..Default::default() }];
         o.crates = vec![crate::proto::Item { id: 1000, pos: [0.0, 30.0, 0.0], hp: 300.0, ..Default::default() }];
-        let mut b = with(Params { arm_crates: 1.0, ..Params::default() });
+        let mut b = with(Params { arm_crates: 1.0, ..base() });
         let a = b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "arm");
         assert!((a.aim[0] - 1.5708).abs() < 0.05, "aim {:?}", a.aim);
-        let mut b = with(Params { arm_crates: 0.0, ..Params::default() });
+        let mut b = with(Params { arm_crates: 0.0, ..base() });
         let a = b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "arm");
         assert!(a.aim[0].abs() < 0.05, "aim {:?}", a.aim);
@@ -3324,20 +3554,20 @@ mod tests {
         let lz = r#"{"id": 3, "kind": "mech", "pos": [70, 0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun", "laser"]}"#;
         let mut o = obs(lz, "");
         o.me.weapons[1] = Some(Weapon { kind: "lightning".into(), ..Default::default() });
-        let mut b = with(Params { rush_guard: 0.0, counter: 0.0, ..Params::default() });
+        let mut b = with(Params { rush_guard: 0.0, counter: 0.0, ..base() });
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "rush");
-        let mut b = with(Params { rush_guard: 1.0, counter: 0.0, ..Params::default() });
+        let mut b = with(Params { rush_guard: 1.0, counter: 0.0, ..base() });
         b.decide(&o, [0.0; 3]);
         assert_ne!(b.label, "rush");
         // Its laser just fired: it is cooling down.
         o.beams = vec![crate::proto::Beam { by: 3, kind: "laser".into(), path: vec![], age: 0.1 }];
-        let mut b = with(Params { rush_guard: 1.0, counter: 0.0, ..Params::default() });
+        let mut b = with(Params { rush_guard: 1.0, counter: 0.0, ..base() });
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "rush");
         // Empty magazine from beyond 60 m.
         o.me.weapons[0].as_mut().unwrap().ammo = 0.0;
-        let mut b = with(Params { rush_guard: 1.0, counter: 0.0, ..Params::default() });
+        let mut b = with(Params { rush_guard: 1.0, counter: 0.0, ..base() });
         b.decide(&o, [0.0; 3]);
         assert_ne!(b.label, "rush");
     }
@@ -3346,7 +3576,7 @@ mod tests {
     fn late_game_keeps_moving() {
         let mut o = obs(MECH, "");
         o.t = 200.0;
-        let mut b = with(Params { ring: 1.0, ..Params::default() });
+        let mut b = with(Params { ring: 1.0, ..base() });
         let a = b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "ring");
         assert!(a.mv[0].abs() + a.mv[1].abs() > 0.3, "mv {:?}", a.mv);
@@ -3355,10 +3585,10 @@ mod tests {
         let three = r#"{"id": 3, "kind": "mech", "pos": [40, 0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]},
                        {"id": 4, "kind": "mech", "pos": [0, 60, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]},
                        {"id": 5, "kind": "mech", "pos": [-80, 0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
-        let mut b = with(Params { ring: 1.0, ..Params::default() });
+        let mut b = with(Params { ring: 1.0, ..base() });
         b.decide(&obs(three, ""), [0.0; 3]);
         assert_eq!(b.label, "ring");
-        let mut b = with(Params { ring: 1.0, ..Params::default() });
+        let mut b = with(Params { ring: 1.0, ..base() });
         b.decide(&obs(MECH, ""), [0.0; 3]);
         assert_ne!(b.label, "ring");
     }
@@ -3371,7 +3601,7 @@ mod tests {
         let Ok(w) = World::load(std::path::Path::new(&dir)) else { return };
         let nav = Nav::build(&w, 2.5, 9.0, 1.2, 50.0);
         let w = Arc::new(w);
-        let mut b = Brain::with_params(&Hello::default(), Some(w.clone()), Some(nav), Params { ring: 1.0, ..Params::default() });
+        let mut b = Brain::with_params(&Hello::default(), Some(w.clone()), Some(nav), Params { ring: 1.0, ..base() });
         let mut o = obs(r#"{"id": 3, "kind": "mech", "pos": [140, 0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#, "");
         o.mechs[0].pos[2] = w.ground(140.0, 0.0);
         o.t = 200.0;
@@ -3406,15 +3636,52 @@ mod tests {
     fn counter_puncher_leaves_distant_mechs_alone() {
         let away = r#"{"id": 3, "kind": "mech", "pos": [100, 0, 0], "aim": [0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
         let at_us = r#"{"id": 3, "kind": "mech", "pos": [100, 0, 0], "aim": [3.1, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
-        let mut b = with(Params { counter: 1.0, ..Params::default() });
+        let mut b = with(Params { counter: 1.0, ..base() });
         b.decide(&obs(away, ""), [0.0; 3]);
         assert_eq!(b.focus, None);
-        let mut b = with(Params { counter: 1.0, ..Params::default() });
+        let mut b = with(Params { counter: 1.0, ..base() });
         b.decide(&obs(at_us, ""), [0.0; 3]);
         assert_eq!(b.focus, Some(3));
-        let mut b = with(Params { counter: 0.0, ..Params::default() });
+        let mut b = with(Params { counter: 0.0, ..base() });
         b.decide(&obs(away, ""), [0.0; 3]);
         assert_eq!(b.focus, Some(3));
+    }
+
+    #[test]
+    fn engage_filter_leaves_distant_mechs_alone() {
+        let away = r#"{"id": 3, "kind": "mech", "pos": [100, 0, 0], "aim": [0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let weak = r#"{"id": 3, "kind": "mech", "pos": [100, 0, 0], "aim": [0, 0], "hp": 400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let mut b = with(Params { engage_filter: 1.0, ..base() });
+        b.decide(&obs(away, ""), [0.0; 3]);
+        assert_eq!(b.focus, None);
+        let mut b = with(Params { engage_filter: 1.0, ..base() });
+        b.decide(&obs(weak, ""), [0.0; 3]);
+        assert_eq!(b.focus, Some(3));
+    }
+
+    #[test]
+    fn incoming_bullet_is_sidestepped() {
+        let bullet = r#"{"id": 280, "kind": "gun", "pos": [60, 0, 5], "vel": [-252, 0, 0]}"#;
+        let s = format!(
+            r#"{{"tick": 100, "t": 5.0,
+              "self": {{"pos": [0,0,0], "aim": [0,0], "hp": 1400, "max_hp": 1400, "energy": 100, "grounded": true, "in_zone": true,
+                        "weapons": [{{"kind": "gun", "ammo": 12}}, null]}},
+              "mechs": [{MECH}], "projectiles": [{bullet}],
+              "zone": {{"center": [0,0], "radius": 500, "next_center": [0,0], "next_radius": 400, "shrink_start": 100}}}}"#
+        );
+        let o: Obs = serde_json::from_str(&s).unwrap();
+        let mut b = with(Params { dodge: 1.0, ..base() });
+        let a = b.decide(&o, [0.0; 3]);
+        assert!(a.boost && a.mv[0].abs() < 0.1 && a.mv[1].abs() > 0.9, "move {:?} boost {}", a.mv, a.boost);
+    }
+
+    #[test]
+    fn laser_is_not_charged_outside_the_zone() {
+        let mut o = obs(MECH, "");
+        o.me.in_zone = false;
+        let mut b = with(Params { laser_fix: 1.0, ..base() });
+        let a = b.decide(&o, [0.0; 3]);
+        assert!(!a.fire[1]);
     }
 
     #[test]

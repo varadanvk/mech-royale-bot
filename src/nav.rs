@@ -272,6 +272,13 @@ impl Nav {
         dist
     }
 
+    /// Walkable cells one step from `c` (no corner cutting).
+    pub fn neighbors(&self, c: usize) -> impl Iterator<Item = usize> + '_ {
+        let nx = self.nx as isize;
+        let mask = self.steps[c];
+        STEPS.iter().enumerate().filter(move |(k, _)| mask & (1 << k) != 0).map(move |(_, (di, dj))| (c as isize + dj * nx + di) as usize)
+    }
+
     /// Path length from (x, y) to the goal along the grid, or None if unreachable.
     pub fn path_len(&self, x: f32, y: f32) -> Option<f32> {
         let c = self.nearest_walkable(x, y)?;
