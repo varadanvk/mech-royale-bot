@@ -149,9 +149,12 @@ fn no_practice_map() -> Params {
 #[test]
 fn practice_scene_is_played_as_before() {
     let Some((world, nav)) = load() else { return };
-    let (h, b) = practice_scene(world, nav, no_practice_map());
-    eprintln!("practice scene hash {h:#018x}");
+    let (_, b) = practice_scene(world.clone(), nav.clone(), Params::default());
     assert!(!b.ffa_latched(), "detector latched in a practice scene: {}", b.dbg_mode);
+    // The break-off goal choice (`cb_*`) is newer than this scene's hash: off here.
+    let p = Params { cb_away: 0.0, cb_path: 0.0, cb_known: 0.0, cb_corner: 0.0, cb_turn: 0.0, ..no_practice_map() };
+    let (h, _) = practice_scene(world, nav, p);
+    eprintln!("practice scene hash {h:#018x}");
     assert_eq!(h, PRACTICE_HASH, "actions differ from the build without the free-for-all side");
 }
 
