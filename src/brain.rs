@@ -4710,7 +4710,7 @@ mod tests {
                       {"id": 4, "kind": "mech", "pos": [50, 20, 0], "aim": [3.5, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
         let hit = r#"{"type": "damaged", "amount": 45, "weapon": "gun", "bearing": 0.0, "by": 3}"#;
         for (stay, goal, broke) in [(0.0, [-60.0, 0.0], true), (1.0, [-60.0, 0.0], false), (1.0, [-10.0, 0.0], true)] {
-            let mut b = with(Params { crowd_retreat: 1.0, stay_fight: stay, cr_max_d: 0.0, ..base() });
+            let mut b = with(Params { crowd_retreat: 1.0, stay_fight: stay, stay_cover: 15.0, cr_max_d: 0.0, ..base() });
             let mut o = obs(foes, hit);
             o.me.hp = 500.0;
             b.cr_until = 100.0;
