@@ -46,47 +46,69 @@ impl Brain {
         }
     }
 
-    /// Start, keep or end a duel. Returns the enemy dueled.
-    pub(super) fn update_duel(&mut self, o: &Obs, pos: &[f32; 3], hp_frac: f32, late: bool) -> Option<u32> {
+    /// Start, keep or end a duel. Returns the enemy dueled (its id once it has been listed; an enemy known only
+    /// from what we heard has none) and where it is believed to be.
+    pub(super) fn update_duel(&mut self, o: &Obs, pos: &[f32; 3], hp_frac: f32, late: bool) -> Option<(Option<u32>, [f32; 2])> {
         let p = &self.params;
         let here = [pos[0], pos[1]];
         let my_hp = o.me.hp;
-        if o.mechs.iter().any(|m| Some(m.id) == self.duel) {
-            self.duel_seen_t = o.t;
-        }
-        if let Some(id) = self.duel {
-            let cur = self.beliefs.iter().find(|b| b.id == Some(id) && b.conf >= 0.2);
-            let crowd = self.beliefs.iter().any(|b| b.id != Some(id) && b.conf >= 0.5 && d2(&b.pos, &here) < p.duel_r - 20.0);
+        if let Some(at) = self.duel_at {
+            // Follow it: its track by id, else the believed enemy nearest to where it was; an enemy listed close
+            // to where an unnamed one was believed is taken to be it.
+            let cur = match self.duel {
+                Some(id) => self.beliefs.iter().find(|b| b.id == Some(id) && b.conf >= 0.2).copied(),
+                None => self
+                    .beliefs
+                    .iter()
+                    .filter(|b| b.conf >= 0.2 && d2(&b.pos, &at) < 40.0 + b.r)
+                    .min_by(|x, y| d2(&x.pos, &at).partial_cmp(&d2(&y.pos, &at)).unwrap_or(std::cmp::Ordering::Equal))
+                    .copied(),
+            };
+            if let Some(b) = cur {
+                self.duel_at = Some(b.pos);
+                if self.duel.is_none() && b.listed {
+                    self.duel = b.id;
+                }
+                if b.listed {
+                    self.duel_seen_t = o.t;
+                }
+            }
+            let me_id = self.duel;
+            let at = self.duel_at.unwrap_or(at);
+            let crowd = self.beliefs.iter().any(|b| (me_id.is_none() || b.id != me_id) && d2(&b.pos, &at) > 25.0 && b.conf >= 0.5 && d2(&b.pos, &here) < p.duel_r - 20.0);
             let keep = cur.map_or(false, |b| d2(&b.pos, &here) < p.duel_r + 40.0)
                 && hp_frac >= 0.45
                 && !crowd
                 && !late
                 && !self.esc_on
-                && o.t - self.duel_seen_t < 10.0
+                && o.t - self.duel_seen_t < 12.0
                 && o.t - self.duel_start < 45.0;
             if !keep {
                 self.duel = None;
+                self.duel_at = None;
             }
         }
-        if self.duel.is_none() && hp_frac >= p.duel_hp && !late && !self.esc_on {
+        if self.duel_at.is_none() && hp_frac >= p.duel_hp && !late && !self.esc_on {
+            // Named enemies, or unnamed ones heard often enough to be sure of.
             let best = self
                 .beliefs
                 .iter()
-                .filter(|b| b.id.is_some() && b.alone && b.conf >= 0.5 && d2(&b.pos, &here) < p.duel_r && (b.est_hp <= my_hp * p.duel_ratio || b.cornered))
-                .filter(|b| !self.beliefs.iter().any(|c| c.id != b.id && c.conf >= 0.3 && d2(&c.pos, &here) < p.duel_r))
+                .filter(|b| b.alone && b.conf >= if b.id.is_some() { 0.5 } else { 0.6 } && d2(&b.pos, &here) < p.duel_r && (b.est_hp <= my_hp * p.duel_ratio || b.cornered))
+                .filter(|b| !self.beliefs.iter().any(|c| c != *b && c.conf >= 0.3 && d2(&c.pos, &here) < p.duel_r))
                 .min_by(|x, y| (d2(&x.pos, &here) + 0.1 * x.est_hp).partial_cmp(&(d2(&y.pos, &here) + 0.1 * y.est_hp)).unwrap_or(std::cmp::Ordering::Equal))
-                .and_then(|b| b.id);
-            if let Some(id) = best {
-                self.duel = Some(id);
+                .copied();
+            if let Some(b) = best {
+                self.duel = b.id;
+                self.duel_at = Some(b.pos);
                 self.duel_start = o.t;
                 self.duel_seen_t = o.t;
                 self.duel_n += 1;
                 if self.trace_modes {
-                    eprintln!("MODE duel t {:.1} id {id} hp {:.0}", o.t, o.me.hp);
+                    eprintln!("MODE duel t {:.1} id {:?} hp {:.0}", o.t, b.id, o.me.hp);
                 }
             }
         }
-        self.duel
+        self.duel_at.map(|at| (self.duel, at))
     }
 
     /// Believed enemies as foes for choosing a place.

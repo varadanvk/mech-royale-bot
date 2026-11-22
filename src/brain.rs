@@ -1053,6 +1053,7 @@ pub struct Brain {
     esc_pick_t: f32,
     /// Enemy being dueled, since when, and when it was last listed.
     duel: Option<u32>,
+    duel_at: Option<[f32; 2]>,
     duel_start: f32,
     duel_seen_t: f32,
     /// Look behind: until when, which way, and when next.
@@ -1190,6 +1191,7 @@ impl Brain {
             esc_pick: None,
             esc_pick_t: -100.0,
             duel: None,
+            duel_at: None,
             duel_start: -100.0,
             duel_seen_t: -100.0,
             glance_until: -1.0,
@@ -2151,7 +2153,9 @@ impl Brain {
         }
         self.hunters.retain(|_, t| o.t - *t < 10.0);
         // A lone enemy worth taking on by ourselves: committed to until it is gone or others come.
-        let duel = if infer && p.duel > 0.0 { self.update_duel(o, &pos, hp_frac, late) } else { None };
+        let duel_m = if infer && p.duel > 0.0 { self.update_duel(o, &pos, hp_frac, late) } else { None };
+        let duel = duel_m.and_then(|d| d.0);
+        let duel_on = duel_m.is_some();
         let duel_t: Option<&Actor> = duel.and_then(|id| enemies.iter().find(|m| m.id == id).copied());
         let cands: Vec<&Actor> = enemies
             .iter()
@@ -2508,7 +2512,7 @@ impl Brain {
         }
         // An empty slot: the nearest good weapon on the ground comes first.
         let worst_rank = worst_slot.map_or(0, |(_, r)| r);
-        let arm_goal = if p.arm > 0.0 && farm_on && !hold_late && duel.is_none() && (empty_slot || p.arm_better > 0.0 || p.laser_seek > 0.0) && hp_frac > p.arm_hp {
+        let arm_goal = if p.arm > 0.0 && farm_on && !hold_late && !duel_on && (empty_slot || p.arm_better > 0.0 || p.laser_seek > 0.0) && hp_frac > p.arm_hp {
             let reach = if empty_slot { p.arm_reach } else { p.arm_better };
             let cands: Vec<(u32, [f32; 3], f32)> = self
                 .picks_mem
@@ -2537,7 +2541,7 @@ impl Brain {
         };
         // Cubes dropped by a kill: the nearest one known around the spot, or the spot itself until we have looked.
         let collect_goal = match self.kill_spot {
-            Some((ks, kt)) if p.collect > 0.0 && !hold_late && duel.is_none() && o.t - kt < p.collect_s && hp_frac > p.collect_hp && (enemies.len() as f32) < p.collect_seen => {
+            Some((ks, kt)) if p.collect > 0.0 && !hold_late && !duel_on && o.t - kt < p.collect_s && hp_frac > p.collect_hp && (enemies.len() as f32) < p.collect_seen => {
                 let c = self
                     .cubes_mem
                     .values()
@@ -2689,7 +2693,7 @@ impl Brain {
             mv = m;
             boost = b;
             label = l;
-        } else if let Some(g) = duel.filter(|_| duel_t.is_none()).and_then(|id| self.beliefs.iter().find(|b| b.id == Some(id)).map(|b| b.pos)) {
+        } else if let Some(g) = duel_m.filter(|_| duel_t.is_none()).map(|d| d.1) {
             // Dueling an enemy out of sight: go to where it is believed to be, facing it.
             label = "duel";
             mv = self.go(&pos, g);
@@ -3007,7 +3011,7 @@ impl Brain {
                 label = "reload";
                 mv = h;
                 boost = me.energy > 25.0;
-            } else if let Some(c) = (if p.fight_cubes > 0.0 { self.fight_cube(o, t) } else { near_cube }).filter(|_| (!finishing || dist < 20.0) && duel.is_none()) {
+            } else if let Some(c) = (if p.fight_cubes > 0.0 { self.fight_cube(o, t) } else { near_cube }).filter(|_| (!finishing || dist < 20.0) && !duel_on) {
                 label = "fcube";
                 let g = self.go(&pos, [c[0], c[1]]);
                 mv = norm2(g[0] + mv[0] * 0.35, g[1] + mv[1] * 0.35);
@@ -3088,11 +3092,11 @@ impl Brain {
 
         // Dueling: now and then glance at anything believed behind us, never during a laser charge or with a
         // shot lined up.
-        if duel.is_some() {
+        if let Some((_, dpos)) = duel_m {
             let charging = me.weapons.iter().flatten().any(|w| w.kind == "laser" && w.charge > 0.0);
             let gun_down = me.weapons.iter().flatten().any(|w| w.kind == "gun" && (w.reload > 0.0 || w.ammo <= 0.0));
             if !charging && o.t >= self.glance_next && (!engaged || gun_down) {
-                let back = self.beliefs.iter().filter(|b| b.behind && b.id != duel).min_by(|x, y| d2(&x.pos, &pos).partial_cmp(&d2(&y.pos, &pos)).unwrap_or(std::cmp::Ordering::Equal)).map(|b| b.pos);
+                let back = self.beliefs.iter().filter(|b| b.behind && d2(&b.pos, &dpos) > 25.0 && (duel.is_none() || b.id != duel)).min_by(|x, y| d2(&x.pos, &pos).partial_cmp(&d2(&y.pos, &pos)).unwrap_or(std::cmp::Ordering::Equal)).map(|b| b.pos);
                 if let Some(q) = back {
                     self.glance_yaw = yaw_to(&pos, &q);
                     self.glance_until = o.t + 0.4;
