@@ -317,6 +317,10 @@ pub struct Params {
     pub dodge: f32,
     pub dodge_hold: f32,
     pub dodge_energy: f32,
+    /// Bullet sidestep, tighter: react only to shots due within 0.7 s that would pass within body radius + 1.1 m,
+    /// step to the side the shot already misses on, and blend the step over the planned move at two to one
+    /// (practice matches only; 0 = as before).
+    pub dodge_tight: f32,
     /// Outnumbered or losing: break off in bursts of `cr_burst` seconds to the nearest walkable cell hidden
     /// from the closest enemies, or fight in place when there is none (0 = off; replaces the low-health
     /// retreat and backing-away rules).
@@ -628,6 +632,7 @@ impl Default for Params {
             dodge: 1.0,
             dodge_hold: 0.35,
             dodge_energy: 20.0,
+            dodge_tight: 1.0,
             crowd_retreat: 1.0,
             cr_radius: 160.0,
             cr_burst: 1.5,
@@ -874,6 +879,7 @@ impl Params {
         p.dodge = g("dodge", p.dodge);
         p.dodge_hold = g("dodge_hold", p.dodge_hold);
         p.dodge_energy = g("dodge_energy", p.dodge_energy);
+        p.dodge_tight = g("dodge_tight", p.dodge_tight);
         p.crowd_retreat = g("crowd_retreat", p.crowd_retreat);
         p.cr_radius = g("cr_radius", p.cr_radius);
         p.cr_burst = g("cr_burst", p.cr_burst);
@@ -3446,7 +3452,12 @@ impl Brain {
 
         // Sidestep an incoming shot.
         if p.dodge > 0.0 && label != "zone" && label != "climb" && o.t >= self.unstick_until && self.dodge_check(o, target, mv, &threats) {
-            mv = self.dodge_dir;
+            // `dodge_tight` keeps part of the planned move (and so the strafe while firing) under the step.
+            mv = if p.dodge_tight > 0.0 && !self.ffa_on() {
+                norm2(self.dodge_dir[0] * 2.0 + mv[0], self.dodge_dir[1] * 2.0 + mv[1])
+            } else {
+                self.dodge_dir
+            };
             boost = me.energy > 3.0;
         }
 
