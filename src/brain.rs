@@ -186,6 +186,9 @@ pub struct Params {
     pub no_mortar: f32,
     /// Without a laser: go for a known laser on the ground within this distance even with both slots full (0 = off).
     pub laser_seek: f32,
+    /// With the laser ready, also shoot a mech coming for us (hurt us, closing or pointed at us) out to this
+    /// distance; past `open_fire_range` only the laser fires (0 = off).
+    pub laser_reach: f32,
     /// Without a laser and nothing else to do: walk toward the nearest part of the map not looked at yet (0 = off).
     pub explore: f32,
     /// Map cells within this distance of us count as looked at.
@@ -571,6 +574,7 @@ impl Default for Params {
             hunt_hp: 0.8,
             no_mortar: 0.0,
             laser_seek: 0.0,
+            laser_reach: 250.0,
             explore: 0.0,
             explore_r: 110.0,
             roof: 0.0,
@@ -818,6 +822,7 @@ impl Params {
         p.hunt_hp = g("hunt_hp", p.hunt_hp);
         p.no_mortar = g("no_mortar", p.no_mortar);
         p.laser_seek = g("laser_seek", p.laser_seek);
+        p.laser_reach = g("laser_reach", p.laser_reach);
         p.explore = g("explore", p.explore);
         p.explore_r = g("explore_r", p.explore_r);
         p.roof = g("roof", p.roof);
@@ -2366,10 +2371,17 @@ impl Brain {
         // In a free-for-all placing counts for more than kills: the earlier, more careful settings (`ffa_plain`).
         let (cr_max_d, cr_laser, cr_strafe, reload_laser, dodge_after) =
             if ffa_on && p.ffa_plain > 0.0 { (0.0, 0.0, 0.0, 1.0, 9.0) } else { (p.cr_max_d, p.cr_laser, p.cr_strafe, p.reload_laser, p.dodge_after) };
+        // The laser ready and the free-for-all modes off: a mech coming for us is taken on at long range.
+        let laser_far = p.laser_reach > 0.0 && !ffa_on && !late && me.weapons.iter().take(2).flatten().any(|w| w.kind == "laser" && (w.cooldown <= 0.0 || w.charge > 0.0));
         let cands: Vec<&Actor> = enemies
             .iter()
             .filter(|m| !counter || self.hunters.get(&m.id).map_or(false, |t| o.t - t < 4.0))
-            .filter(|m| !(hold_late || filter_early) || self.engage_ok(o, m, hold_late) || (p.seek > 0.0 && !late && self.seek_id == Some(m.id) && d2(&m.pos, &pos) < p.seek_fire))
+            .filter(|m| {
+                !(hold_late || filter_early)
+                    || self.engage_ok(o, m, hold_late)
+                    || (p.seek > 0.0 && !late && self.seek_id == Some(m.id) && d2(&m.pos, &pos) < p.seek_fire)
+                    || (laser_far && self.coming_for_us(o, m, p.laser_reach))
+            })
             .filter(|m| !ffa_on || self.ffa_engage(o, m, hp_frac))
             .copied()
             .collect();
@@ -2461,7 +2473,10 @@ impl Brain {
         } else {
             None
         };
-        let shoot_at = target.filter(|t| d2(&t.pos, &pos) < p.open_fire_range || self.attackers.contains_key(&t.id)).or(drone_target);
+        let near_shot = target.filter(|t| d2(&t.pos, &pos) < p.open_fire_range || self.attackers.contains_key(&t.id));
+        // Past the usual range, only the laser, and only at a mech coming for us.
+        let far_shot = target.filter(|t| near_shot.is_none() && laser_far && self.coming_for_us(o, t, p.laser_reach));
+        let shoot_at = near_shot.or(far_shot).or(drone_target);
 
         // --- weapons: solve every slot, aim with the best ready one, fire all that line up
         let mut engaged = false;
@@ -2507,6 +2522,14 @@ impl Brain {
             }
             if let Some(aim) = best.map(|b| b.1).or(fallback) {
                 a.aim = aim;
+            }
+        }
+
+        if far_shot.is_some() {
+            for (i, w) in me.weapons.iter().enumerate().take(2) {
+                if w.as_ref().map_or(false, |w| w.kind != "laser") {
+                    a.fire[i] = false;
+                }
             }
         }
 
@@ -4237,6 +4260,21 @@ mod tests {
         let mut b = with(Params { focus_aimer: 40.0, ..base() });
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.focus, Some(4));
+    }
+
+    #[test]
+    fn laser_reaches_out_to_a_mech_coming_for_us() {
+        let coming = r#"{"id": 3, "kind": "mech", "pos": [230, 0, 0], "aim": [3.1416, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let idle = r#"{"id": 3, "kind": "mech", "pos": [230, 0, 0], "aim": [0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        for p in [base(), Params { engage_filter: 1.0, ..base() }] {
+            let a = with(p.clone()).decide(&obs(coming, ""), [0.0; 3]);
+            assert!(a.fire[1], "laser not charged at a mech pointed at us");
+            assert!(!a.fire[0], "gun fired past its range");
+            let a = with(p.clone()).decide(&obs(idle, ""), [0.0; 3]);
+            assert!(!a.fire[1] && !a.fire[0], "opened fire on a bystander at range");
+            let a = with(Params { laser_reach: 0.0, ..p }).decide(&obs(coming, ""), [0.0; 3]);
+            assert!(!a.fire[1], "laser charged with laser_reach off");
+        }
     }
 
     #[test]

@@ -72,6 +72,15 @@ impl Brain {
         }
     }
 
+    /// A mech already in a fight with us: it hurt us lately, or within `reach` it is closing on us or pointed at us.
+    pub(super) fn coming_for_us(&self, o: &Obs, m: &Actor, reach: f32) -> bool {
+        let pos = o.me.pos;
+        let d = d2(&m.pos, &pos);
+        let to_me = norm2(pos[0] - m.pos[0], pos[1] - m.pos[1]);
+        let closing = m.vel[0] * to_me[0] + m.vel[1] * to_me[1];
+        self.attackers.get(&m.id).map_or(false, |t| o.t - t < 6.0) || (d < reach && (closing > 3.0 || aimed_at(m, &pos)))
+    }
+
     /// Target score for `engage_filter` (lower is better): distance plus 0.18 per HP point, much lower for a
     /// nearly dead mech and for the current target (held 2 s at a time, or while we keep hitting it), a little
     /// lower for a recent attacker and for a mech closing on us.
