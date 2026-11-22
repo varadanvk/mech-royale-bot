@@ -1,5 +1,5 @@
 //! Decision logic: one `act` per observation.
-use crate::contacts::{Belief, Contacts};
+use crate::contacts::{Belief, Contacts, MapCfg};
 use crate::detect::Detector;
 use crate::nav::Nav;
 use crate::proto::{Action, Actor, Hello, Obs, Weapon};
@@ -384,6 +384,21 @@ pub struct Params {
     pub ffa_third_r: f32,
     pub ffa_late_r: f32,
     pub ffa_quiet: f32,
+    /// Enemy-picture clean-ups (0 = off; see `contacts::MapCfg`): sounds move only the one tightly placed unseen
+    /// track they fit; faded beliefs are left out; contacts seen empty are dropped; a listed enemy takes over
+    /// the contacts it explains; a hit from an unknown enemy lands on the contact along its line; a sound joins
+    /// only a contact it mostly overlaps, and joined sounds narrow it only so far; an
+    /// estimate pushed out of a place seen empty keeps its radius; a coasting track's radius grows from the moment
+    /// it left the list.
+    pub map_strict_pull: f32,
+    pub map_prune: f32,
+    pub map_clear_seen: f32,
+    pub map_merge_seen: f32,
+    pub map_hit_line: f32,
+    pub map_tight_merge: f32,
+    pub map_keep_spread: f32,
+    pub map_hold_r: f32,
+    pub map_coast_grow: f32,
 }
 
 impl Default for Params {
@@ -558,11 +573,35 @@ impl Default for Params {
             ffa_third_r: 220.0,
             ffa_late_r: 140.0,
             ffa_quiet: 4.6,
+            map_strict_pull: 1.0,
+            map_prune: 1.0,
+            map_clear_seen: 1.0,
+            map_merge_seen: 1.0,
+            map_hit_line: 1.0,
+            map_tight_merge: 1.0,
+            map_keep_spread: 1.0,
+            map_hold_r: 1.0,
+            map_coast_grow: 1.0,
         }
     }
 }
 
 impl Params {
+    /// The enemy-picture clean-ups these parameters turn on.
+    pub fn map_cfg(&self) -> MapCfg {
+        MapCfg {
+            strict_pull: self.map_strict_pull > 0.0,
+            prune: self.map_prune > 0.0,
+            clear_seen: self.map_clear_seen > 0.0,
+            merge_seen: self.map_merge_seen > 0.0,
+            hit_line: self.map_hit_line > 0.0,
+            tight_merge: self.map_tight_merge > 0.0,
+            keep_spread: self.map_keep_spread > 0.0,
+            hold_r: self.map_hold_r > 0.0,
+            coast_grow: self.map_coast_grow > 0.0,
+        }
+    }
+
     /// Override defaults from a JSON object such as `{"gun_range": 120}`; unknown keys are ignored.
     pub fn from_json(v: &serde_json::Value) -> Params {
         let mut p = Params::default();
@@ -736,6 +775,15 @@ impl Params {
         p.ffa_third_r = g("ffa_third_r", p.ffa_third_r);
         p.ffa_late_r = g("ffa_late_r", p.ffa_late_r);
         p.ffa_quiet = g("ffa_quiet", p.ffa_quiet);
+        p.map_strict_pull = g("map_strict_pull", p.map_strict_pull);
+        p.map_prune = g("map_prune", p.map_prune);
+        p.map_clear_seen = g("map_clear_seen", p.map_clear_seen);
+        p.map_merge_seen = g("map_merge_seen", p.map_merge_seen);
+        p.map_hit_line = g("map_hit_line", p.map_hit_line);
+        p.map_tight_merge = g("map_tight_merge", p.map_tight_merge);
+        p.map_keep_spread = g("map_keep_spread", p.map_keep_spread);
+        p.map_hold_r = g("map_hold_r", p.map_hold_r);
+        p.map_coast_grow = g("map_coast_grow", p.map_coast_grow);
         p
     }
 
@@ -1023,6 +1071,8 @@ pub struct Brain {
     /// mode and why; what we believe about each enemy; the last kills seen (time, killer, victim; our own kills
     /// name our slot as the killer, deaths we only counted name neither).
     pub dbg_contacts: Vec<[f32; 4]>,
+    /// Debug only, alongside `dbg_contacts`: each belief's enemy id (if a track), where it came from and its age.
+    pub dbg_contact_src: Vec<(Option<u32>, &'static str, f32)>,
     pub dbg_kills: Vec<(f32, Option<u32>, Option<u32>)>,
     pub dbg_mode: String,
     pub dbg_enemies: Vec<ffa::EnemyInfo>,
@@ -1046,6 +1096,7 @@ impl Brain {
 
     /// Like `with_map`, with explicit parameters.
     pub fn with_params(hello: &Hello, world: Option<Arc<World>>, nav: Option<Nav>, params: Params) -> Brain {
+        let map_cfg = params.map_cfg();
         let cfg = &hello.config;
         let f = |a: &str, b: &str, d: f32| cfg.get(a).and_then(|v| v.get(b)).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d);
         let sight = match (&world, &nav) {
@@ -1143,7 +1194,7 @@ impl Brain {
             hit_bearing: None,
             sound_bearing: None,
             detector: Detector::default(),
-            contacts: Contacts::default(),
+            contacts: Contacts { cfg: map_cfg, ..Contacts::default() },
             beliefs: Vec::new(),
             me_hist: VecDeque::new(),
             kill_log: VecDeque::new(),
@@ -1159,6 +1210,7 @@ impl Brain {
             trace_ffa: std::env::var("TFFA").is_ok(),
             ffa_slowest: 0.0,
             dbg_contacts: Vec::new(),
+            dbg_contact_src: Vec::new(),
             dbg_kills: Vec::new(),
             dbg_mode: String::new(),
             dbg_enemies: Vec::new(),

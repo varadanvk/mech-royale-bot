@@ -195,6 +195,7 @@ impl Brain {
         self.contacts.settle(o.t, here, &in_view);
         self.beliefs = self.contacts.beliefs(o.t);
         self.dbg_contacts = self.beliefs.iter().map(|b| [b.pos[0], b.pos[1], b.r, b.conf]).collect();
+        self.dbg_contact_src = self.beliefs.iter().map(|b| (b.id, b.src, b.age)).collect();
         while self.kill_log.len() > 8 {
             self.kill_log.pop_front();
         }
