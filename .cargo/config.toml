@@ -1,0 +1,4 @@
+# Tests describe the default match type, so pin the clock to before open play (see `after_open_play` in src/detect.rs).
+# This only affects processes cargo starts (cargo test / cargo run), not the built binary.
+[env]
+MECH_NOW = "0"
