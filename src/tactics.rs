@@ -422,10 +422,26 @@ impl Brain {
             );
         }
         if !best.2 {
-            return norm2(best.0[0] - pos[0], best.0[1] - pos[1]);
+            let dir = norm2(best.0[0] - pos[0], best.0[1] - pos[1]);
+            if self.weave_now {
+                // Seen: weave across the line to the target on the way.
+                if o.t >= self.fp_until {
+                    self.fp_side = -self.fp_side;
+                    self.fp_until = o.t + self.params.weave_lo + (self.params.weave_hi - self.params.weave_lo).max(0.0) * self.rnd();
+                }
+                let to = norm2(t.pos[0] - pos[0], t.pos[1] - pos[1]);
+                let w = self.params.evade_weight;
+                let cand = norm2(dir[0] - to[1] * self.fp_side * w, dir[1] + to[0] * self.fp_side * w);
+                if self.walkable(pos[0] + cand[0] * 5.0, pos[1] + cand[1] * 5.0) {
+                    return cand;
+                }
+            }
+            return dir;
         }
         // Staying put wins: slow strafe across the line to the target.
-        let (lo, span) = if self.params.ext_fpos > 0.0 { (self.params.fp_flip_lo, (self.params.fp_flip_hi - self.params.fp_flip_lo).max(0.0)) } else { (3.0, 2.0) };
+        let (lo, span) = if self.weave_now {
+            (self.params.weave_lo, (self.params.weave_hi - self.params.weave_lo).max(0.0))
+        } else if self.params.ext_fpos > 0.0 { (self.params.fp_flip_lo, (self.params.fp_flip_hi - self.params.fp_flip_lo).max(0.0)) } else { (3.0, 2.0) };
         if o.t >= self.fp_until {
             self.fp_side = -self.fp_side;
             self.fp_until = o.t + lo + span * self.rnd();
@@ -440,7 +456,7 @@ impl Brain {
                 return [0.0, 0.0];
             }
         }
-        let sp = self.params.fp_strafe;
+        let sp = if self.weave_now { 1.0 } else { self.params.fp_strafe };
         [side[0] * sp, side[1] * sp]
     }
 

@@ -490,6 +490,13 @@ pub struct Params {
     pub stay_fight: f32,
     /// See stay_fight.
     pub stay_cover: f32,
+    /// While any enemy in sight is within this many metres, keep weaving across its line at full walking speed,
+    /// reversing every weave_lo..weave_hi s, and do not start a roof climb (practice matches only; 0 = off).
+    pub weave_seen: f32,
+    /// See weave_seen.
+    pub weave_lo: f32,
+    /// See weave_seen.
+    pub weave_hi: f32,
 }
 
 impl Default for Params {
@@ -717,6 +724,9 @@ impl Default for Params {
             ffa_plain: 1.0,
             stay_fight: 2.0,
             stay_cover: 0.0,
+            weave_seen: 150.0,
+            weave_lo: 0.4,
+            weave_hi: 0.7,
         }
     }
 }
@@ -963,6 +973,9 @@ impl Params {
         p.ffa_plain = g("ffa_plain", p.ffa_plain);
         p.stay_fight = g("stay_fight", p.stay_fight);
         p.stay_cover = g("stay_cover", p.stay_cover);
+        p.weave_seen = g("weave_seen", p.weave_seen);
+        p.weave_lo = g("weave_lo", p.weave_lo);
+        p.weave_hi = g("weave_hi", p.weave_hi);
         p
     }
 
@@ -1276,6 +1289,8 @@ pub struct Brain {
     /// Fight-position strafe: direction sign and when it next reverses.
     fp_side: f32,
     fp_until: f32,
+    /// An enemy in sight is close enough to keep weaving (`weave_seen`).
+    weave_now: bool,
     /// When the current target was last locked in.
     focus_t: f32,
     /// Late-game home spot and when it was chosen.
@@ -1439,6 +1454,7 @@ impl Brain {
             cr_goal: None,
             fp_side: 1.0,
             fp_until: -1.0,
+            weave_now: false,
             focus_t: -1.0,
             home: None,
             hit_t: BTreeMap::new(),
@@ -2357,6 +2373,13 @@ impl Brain {
         self.hunters.retain(|_, t| o.t - *t < 10.0);
         // Free-for-all modes (only once a free-for-all is settled): who is worth shooting, and the fight we join.
         let ffa_on = self.ffa_on();
+        // Seen at close enough range: keep weaving and stay on the ground (`weave_seen`).
+        let was_weaving = self.weave_now;
+        self.weave_now = p.weave_seen > 0.0 && !ffa_on && enemies.iter().any(|m| d2(&m.pos, &pos) < p.weave_seen);
+        if self.weave_now && !was_weaving {
+            self.strafe_until = self.strafe_until.min(o.t + p.weave_hi);
+            self.fp_until = self.fp_until.min(o.t + p.weave_hi);
+        }
         // In a free-for-all placing counts for more than kills: the earlier, more careful settings (`ffa_plain`).
         let (cr_max_d, cr_laser, cr_strafe, reload_laser, dodge_after) =
             if ffa_on && p.ffa_plain > 0.0 { (0.0, 0.0, 0.0, 1.0, 9.0) } else { (p.cr_max_d, p.cr_laser, p.cr_strafe, p.reload_laser, p.dodge_after) };
@@ -2982,7 +3005,7 @@ impl Brain {
                 let at_wall = !self.walkable(pos[0] + dir[0] * 4.0, pos[1] + dir[1] * 4.0) || hd < 4.0;
                 let climbing = !me.grounded && self.label == "climb";
                 boost = me.energy > 70.0 && hd > 20.0;
-                if climbing || (hd < 30.0 && at_wall && me.energy > p.roof_energy) {
+                if climbing || (hd < 30.0 && at_wall && me.energy > p.roof_energy && !self.weave_now) {
                     label = "climb";
                     mv = dir;
                     a.jump = me.grounded;
@@ -3427,7 +3450,7 @@ impl Brain {
             }
         }
         // Outside a fight, still weave across the line of the nearest shooter.
-        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "ring" || label == "spot" || label == "iso" || label == "fight" || label == "rush" || label == "climb" || (label == "hold" && p.hold_fight <= 0.0) || label == "drone" || label == "reload" || label == "stand" || label == "peek" || label == "hide" || label == "repeek" || label == "home" || label == "cbreak" || label.starts_with("ffa")) {
+        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "ring" || label == "spot" || label == "iso" || label == "fight" || label == "rush" || label == "climb" || (label == "hold" && p.hold_fight <= 0.0) || label == "drone" || label == "reload" || label == "stand" || label == "peek" || label == "hide" || label == "repeek" || (label == "home" && !self.weave_now) || label == "cbreak" || label.starts_with("ffa")) {
             if o.t >= self.strafe_until {
                 self.next_strafe(o.t);
             }
@@ -3668,7 +3691,11 @@ impl Brain {
     /// Sideways movement relative to `to` (unit vector toward the opponent) with random dwell.
     /// Start a new strafe dwell: reverse with probability `strafe_alt`, for a random time in [strafe_min, strafe_max].
     fn next_strafe(&mut self, now: f32) {
-        let (smin, smax, alt) = (self.params.strafe_min, self.params.strafe_max.max(self.params.strafe_min), self.params.strafe_alt);
+        let (smin, smax, alt) = if self.weave_now {
+            (self.params.weave_lo, self.params.weave_hi.max(self.params.weave_lo), 1.0)
+        } else {
+            (self.params.strafe_min, self.params.strafe_max.max(self.params.strafe_min), self.params.strafe_alt)
+        };
         if self.rnd() < alt {
             self.strafe = -self.strafe;
         }
@@ -4706,6 +4733,51 @@ mod tests {
             b.cr_goal = Some(goal);
             b.decide(&o, [0.0; 3]);
             assert_eq!(b.label == "cbreak", broke, "stay {stay} goal {goal:?}: {}", b.label);
+        }
+    }
+
+    /// Lateral move per tick against one enemy straight ahead: (label, move) for 6 s at 10 Hz.
+    fn weave_run(params: Params, d: f32, ffa: bool) -> Vec<(&'static str, [f32; 2])> {
+        let mut b = with(params);
+        if ffa {
+            b.ffa_mode = ffa::FfaMode::Fight;
+        }
+        let mut o = obs(&mech(3, [d, 0.0], [0.0, 0.0], 3.14), "");
+        (0..60)
+            .map(|i| {
+                o.t = 5.0 + i as f32 * 0.1;
+                o.tick = 100 + i;
+                let a = b.decide(&o, [0.0; 3]);
+                (b.label, a.mv)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn seen_close_we_weave_at_full_speed_and_reverse_often() {
+        for d in [60.0, 120.0] {
+            let run = weave_run(Params { fight_pos: 1.0, ..base() }, d, false);
+            // Reversals of the sideways component, and the time between them.
+            let times: Vec<usize> = run.windows(2).enumerate().filter(|(_, w)| w[0].1[1] * w[1].1[1] < 0.0).map(|(i, _)| i + 1).collect();
+            assert!(times.len() >= 7, "d {d}: {} reversals in 6 s: {:?}", times.len(), run);
+            for g in times.windows(2) {
+                let dt = (g[1] - g[0]) as f32 * 0.1;
+                assert!((0.35..=0.85).contains(&dt), "d {d}: reversal gap {dt} s");
+            }
+            for (l, mv) in &run {
+                assert!(mv[0].hypot(mv[1]) > 0.95, "d {d}: {l} {mv:?}");
+            }
+            // Off: the slow stand-and-strafe with reversals seconds apart.
+            let off = weave_run(Params { fight_pos: 1.0, weave_seen: 0.0, ..base() }, d, false);
+            let n_off = off.windows(2).filter(|w| w[0].1[1] * w[1].1[1] < 0.0).count();
+            assert!(n_off < times.len(), "d {d}: off {n_off} on {}", times.len());
+        }
+        // Beyond the range, and in a free-for-all, nothing changes.
+        let moves = |r: Vec<(&str, [f32; 2])>| r.iter().map(|x| x.1).collect::<Vec<_>>();
+        for (d, ffa) in [(180.0, false), (100.0, true)] {
+            let on = weave_run(Params { fight_pos: 1.0, ..base() }, d, ffa);
+            let off = weave_run(Params { fight_pos: 1.0, weave_seen: 0.0, ..base() }, d, ffa);
+            assert_eq!(moves(on), moves(off), "d {d} ffa {ffa}");
         }
     }
 }
