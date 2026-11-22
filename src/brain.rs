@@ -403,6 +403,8 @@ pub struct Params {
     /// `stay_cover` m still goes ahead (practice matches only; 0 = off).
     pub stay_fight: f32,
     pub stay_cover: f32,
+    /// Outside a free-for-all, take on every enemy in view within this distance and open fire out to it (0 = off).
+    pub wide_fire: f32,
 }
 
 impl Default for Params {
@@ -585,6 +587,7 @@ impl Default for Params {
             cb_turn: 1.0,
             stay_fight: 1.0,
             stay_cover: 15.0,
+            wide_fire: 230.0,
         }
     }
 }
@@ -771,6 +774,7 @@ impl Params {
         p.cb_turn = g("cb_turn", p.cb_turn);
         p.stay_fight = g("stay_fight", p.stay_fight);
         p.stay_cover = g("stay_cover", p.stay_cover);
+        p.wide_fire = g("wide_fire", p.wide_fire);
         p
     }
 
@@ -2079,10 +2083,10 @@ impl Brain {
         self.hunters.retain(|_, t| o.t - *t < 10.0);
         // Free-for-all modes (only once a free-for-all is settled): who is worth shooting, and the fight we join.
         let ffa_on = self.ffa_on();
+        let wide = if p.wide_fire > 0.0 && !ffa_on { p.wide_fire } else { 0.0 };
         let cands: Vec<&Actor> = enemies
             .iter()
-            .filter(|m| !counter || self.hunters.get(&m.id).map_or(false, |t| o.t - t < 4.0))
-            .filter(|m| !(hold_late || filter_early) || self.engage_ok(o, m, hold_late))
+            .filter(|m| d2(&m.pos, &pos) < wide || ((!counter || self.hunters.get(&m.id).map_or(false, |t| o.t - t < 4.0)) && (!(hold_late || filter_early) || self.engage_ok(o, m, hold_late))))
             .filter(|m| !ffa_on || self.ffa_engage(o, m, hp_frac))
             .copied()
             .collect();
@@ -2173,7 +2177,7 @@ impl Brain {
         } else {
             None
         };
-        let shoot_at = target.filter(|t| d2(&t.pos, &pos) < p.open_fire_range || self.attackers.contains_key(&t.id)).or(drone_target);
+        let shoot_at = target.filter(|t| d2(&t.pos, &pos) < p.open_fire_range.max(wide) || self.attackers.contains_key(&t.id)).or(drone_target);
 
         // --- weapons: solve every slot, aim with the best ready one, fire all that line up
         let mut engaged = false;
