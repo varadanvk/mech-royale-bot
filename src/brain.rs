@@ -490,6 +490,8 @@ pub struct Params {
     pub stay_fight: f32,
     /// See stay_fight.
     pub stay_cover: f32,
+    /// Outside a free-for-all, take on every enemy in view within this distance and open fire out to it (0 = off).
+    pub wide_fire: f32,
 }
 
 impl Default for Params {
@@ -717,6 +719,7 @@ impl Default for Params {
             ffa_plain: 1.0,
             stay_fight: 1.0,
             stay_cover: 15.0,
+            wide_fire: 230.0,
         }
     }
 }
@@ -963,6 +966,7 @@ impl Params {
         p.ffa_plain = g("ffa_plain", p.ffa_plain);
         p.stay_fight = g("stay_fight", p.stay_fight);
         p.stay_cover = g("stay_cover", p.stay_cover);
+        p.wide_fire = g("wide_fire", p.wide_fire);
         p
     }
 
@@ -2360,10 +2364,14 @@ impl Brain {
         // In a free-for-all placing counts for more than kills: the earlier, more careful settings (`ffa_plain`).
         let (cr_max_d, cr_laser, cr_strafe, reload_laser, dodge_after) =
             if ffa_on && p.ffa_plain > 0.0 { (0.0, 0.0, 0.0, 1.0, 9.0) } else { (p.cr_max_d, p.cr_laser, p.cr_strafe, p.reload_laser, p.dodge_after) };
+        let wide = if p.wide_fire > 0.0 && !ffa_on { p.wide_fire } else { 0.0 };
         let cands: Vec<&Actor> = enemies
             .iter()
-            .filter(|m| !counter || self.hunters.get(&m.id).map_or(false, |t| o.t - t < 4.0))
-            .filter(|m| !(hold_late || filter_early) || self.engage_ok(o, m, hold_late) || (p.seek > 0.0 && !late && self.seek_id == Some(m.id) && d2(&m.pos, &pos) < p.seek_fire))
+            .filter(|m| {
+                d2(&m.pos, &pos) < wide
+                    || ((!counter || self.hunters.get(&m.id).map_or(false, |t| o.t - t < 4.0))
+                        && (!(hold_late || filter_early) || self.engage_ok(o, m, hold_late) || (p.seek > 0.0 && !late && self.seek_id == Some(m.id) && d2(&m.pos, &pos) < p.seek_fire)))
+            })
             .filter(|m| !ffa_on || self.ffa_engage(o, m, hp_frac))
             .copied()
             .collect();
@@ -2455,7 +2463,7 @@ impl Brain {
         } else {
             None
         };
-        let shoot_at = target.filter(|t| d2(&t.pos, &pos) < p.open_fire_range || self.attackers.contains_key(&t.id)).or(drone_target);
+        let shoot_at = target.filter(|t| d2(&t.pos, &pos) < p.open_fire_range.max(wide) || self.attackers.contains_key(&t.id)).or(drone_target);
 
         // --- weapons: solve every slot, aim with the best ready one, fire all that line up
         let mut engaged = false;
