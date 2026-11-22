@@ -1,7 +1,7 @@
 //! Decision logic: one `act` per observation.
 use crate::nav::Nav;
 use crate::proto::{Action, Actor, Hello, Obs, Weapon};
-use crate::world::World;
+use crate::world::{PrismKind, World};
 use std::collections::{BTreeMap, VecDeque};
 use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
@@ -294,6 +294,14 @@ pub struct Params {
     /// No lightning rush on a laser holder from beyond the arc range + 15 m unless its laser fired within the
     /// last 1.5 s, and none from beyond 60 m with an empty magazine (0 = off).
     pub rush_guard: f32,
+    /// Late game (from `wall_t`, or while at least three enemies are close or hurting us): keep moving on a loop
+    /// around a building inside the safe area, on the side away from the known enemies, shooting whoever has a
+    /// line on us (0 = off).
+    pub ring: f32,
+    /// Before the late game, take on only enemies aimed at us, that hurt us in the last 4 s, or within
+    /// `counter_range`; leave the others alone (0 = off).
+    pub counter: f32,
+    pub counter_range: f32,
 }
 
 impl Default for Params {
@@ -424,6 +432,9 @@ impl Default for Params {
             focus_aimer: 0.0,
             arm_crates: 0.0,
             rush_guard: 0.0,
+            ring: 0.0,
+            counter: 0.0,
+            counter_range: 60.0,
         }
     }
 }
@@ -558,6 +569,9 @@ impl Params {
         p.focus_aimer = g("focus_aimer", p.focus_aimer);
         p.arm_crates = g("arm_crates", p.arm_crates);
         p.rush_guard = g("rush_guard", p.rush_guard);
+        p.ring = g("ring", p.ring);
+        p.counter = g("counter", p.counter);
+        p.counter_range = g("counter_range", p.counter_range);
         p
     }
 
@@ -769,6 +783,15 @@ pub struct Brain {
     kill_spot: Option<([f32; 3], f32)>,
     /// Spot held late in the match, and when it was chosen.
     hold: Option<([f32; 2], f32)>,
+    /// Buildings worth looping around: footprint centre and loop radius (built on first use).
+    ring_spots: Option<Vec<([f32; 2], f32)>>,
+    /// Building we are looping around, and which way round (+1 counter-clockwise).
+    ring_b: Option<([f32; 2], f32)>,
+    ring_dir: f32,
+    /// Loop mode stays on until this time.
+    ring_until: f32,
+    /// Enemies that showed they are after us (aimed at us, hurt us or came close): id -> last time.
+    hunters: BTreeMap<u32, f32>,
 }
 
 impl Brain {
@@ -855,6 +878,11 @@ impl Brain {
             arm_pick: None,
             kill_spot: None,
             hold: None,
+            ring_spots: None,
+            ring_b: None,
+            ring_dir: 1.0,
+            ring_until: -1.0,
+            hunters: BTreeMap::new(),
         }
     }
 
@@ -1661,6 +1689,32 @@ impl Brain {
         let enemies: Vec<&Actor> = o.mechs.iter().filter(|m| m.kind == "mech" && !(m.max_hp > 0.0 && m.hp <= 0.0)).collect();
         let near_enemies = enemies.iter().filter(|m| d2(&m.pos, &pos) < p.crowd_radius).count();
         let no_laser = !me.weapons.iter().flatten().any(|w| w.kind == "laser");
+        let late = (p.wall_t > 0.0 && o.t >= p.wall_t) || (p.wall_t > 0.0 && o.zone.radius <= p.wall_r);
+        // Loop mode: late, or pressed by three or more enemies (close by, or hurting us).
+        if p.ring > 0.0 {
+            let mut pressing: Vec<u32> = self.known.iter().filter(|(_, k)| o.t - k.seen_t < 4.0 && d2(&k.pos, &pos) < 150.0).map(|(id, _)| *id).collect();
+            pressing.extend(self.attackers.iter().filter(|(_, t)| o.t - **t < 3.0).map(|(id, _)| *id));
+            pressing.sort_unstable();
+            pressing.dedup();
+            if late || pressing.len() >= 3 {
+                self.ring_until = o.t + 5.0;
+            }
+        }
+        let ring_on = p.ring > 0.0 && o.t < self.ring_until;
+        // Counter-punching: before the late game only enemies that came for us are targets.
+        let counter = p.counter > 0.0 && !late && !ring_on;
+        if counter {
+            for m in &enemies {
+                let aimed = wrap(m.aim[0] - yaw_to(&m.pos, &pos)).abs() < 0.2;
+                let hurt = self.attackers.get(&m.id).map_or(false, |t| o.t - t < 4.0);
+                if aimed || hurt || d2(&m.pos, &pos) < p.counter_range {
+                    self.hunters.insert(m.id, o.t);
+                }
+            }
+        }
+        self.hunters.retain(|_, t| o.t - *t < 10.0);
+        let cands: Vec<&Actor> = enemies.iter().filter(|m| !counter || self.hunters.get(&m.id).map_or(false, |t| o.t - t < 4.0)).copied().collect();
+        let muzzle = [pos[0], pos[1], pos[2] + me.stat("muzzle_height", 7.0)];
         let score = |m: &Actor| {
             let d = d2(&m.pos, &pos);
             let hpf = if m.max_hp > 0.0 { m.hp / m.max_hp } else { 1.0 };
@@ -1668,13 +1722,15 @@ impl Brain {
             let loot = if no_laser && m.weapons.iter().any(|w| w == "laser") { p.loot_target } else { 0.0 };
             // Its torso (and so its next shot) is pointed at us.
             let aimer = if p.focus_aimer > 0.0 && wrap(m.aim[0] - yaw_to(&m.pos, &pos)).abs() < 0.2 { p.focus_aimer } else { 0.0 };
-            d + hpf * p.focus_hp - if attacker { 40.0 } else { 0.0 } - loot - aimer
+            // Looping: whoever has a line on us now comes first.
+            let unseen = if ring_on && !self.clear(muzzle, [m.pos[0], m.pos[1], m.pos[2] + 4.5]) { 150.0 } else { 0.0 };
+            d + hpf * p.focus_hp - if attacker { 40.0 } else { 0.0 } - loot - aimer + unseen
         };
-        let best = enemies
+        let best = cands
             .iter()
             .map(|m| (*m, score(*m)))
             .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
-        let target = match (best, self.focus.and_then(|f| enemies.iter().find(|m| m.id == f))) {
+        let target = match (best, self.focus.and_then(|f| cands.iter().find(|m| m.id == f))) {
             (Some((_, bs)), Some(f)) if p.focus_stick > 0.0 && score(*f) - p.focus_stick < bs && d2(&f.pos, &pos) < p.open_fire_range => Some(*f),
             (Some((b, _)), _) => Some(b),
             _ => None,
@@ -2059,7 +2115,6 @@ impl Brain {
         } else {
             None
         };
-        let late = (p.wall_t > 0.0 && o.t >= p.wall_t) || (p.wall_t > 0.0 && o.zone.radius <= p.wall_r);
         let live_fight = p.hold_fight > 0.0 && target.is_some() && (engaged || recently_hurt_by_mech);
         let mut boost = false;
         let mut mv: [f32; 2];
@@ -2069,6 +2124,21 @@ impl Brain {
             label = "zone";
             mv = self.go(&pos, zone_goal);
             boost = !me.in_zone && me.energy > 5.0;
+        } else if ring_on {
+            // Keep going round a building, on the side away from the enemies; boost only to get out of the
+            // sight of two or more.
+            label = "ring";
+            mv = self.ring_move(o, &pos);
+            let chest = [pos[0], pos[1], pos[2] + 5.0];
+            let sighted = enemies.iter().filter(|m| self.world.as_ref().map_or(true, |w| w.sees([m.pos[0], m.pos[1], m.pos[2] + 8.0], chest))).count();
+            boost = sighted >= 2 && me.energy > 10.0;
+            if shoot_at.is_none() {
+                if let Some(th) = threats.first() {
+                    a.aim = [yaw_to(&pos, th), 0.0];
+                } else {
+                    self.scan(&mut a);
+                }
+            }
         } else if let Some(g) = arm_goal.filter(|_| !(p.stand_first > 0.0 && stand_from.is_some())) {
             label = "arm";
             mv = self.go(&pos, [g[0], g[1]]);
@@ -2440,7 +2510,7 @@ impl Brain {
             }
         }
         // Outside a fight, still weave across the line of the nearest shooter.
-        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "fight" || label == "rush" || label == "climb" || (label == "hold" && p.hold_fight <= 0.0) || label == "drone" || label == "reload" || label == "stand" || label == "peek" || label == "hide" || label == "repeek") {
+        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "ring" || label == "fight" || label == "rush" || label == "climb" || (label == "hold" && p.hold_fight <= 0.0) || label == "drone" || label == "reload" || label == "stand" || label == "peek" || label == "hide" || label == "repeek") {
             if o.t >= self.strafe_until {
                 self.next_strafe(o.t);
             }
@@ -2730,6 +2800,67 @@ impl Brain {
         } else {
             mv
         }
+    }
+
+    /// Loop around the nearest suitable building inside the safe area, sweeping back and forth across the side
+    /// away from the enemies we know of. Always returns a move.
+    fn ring_move(&mut self, o: &Obs, pos: &[f32; 3]) -> [f32; 2] {
+        if self.ring_spots.is_none() {
+            let spots = self.world.as_ref().map_or(Vec::new(), |w| {
+                w.prisms
+                    .iter()
+                    .filter(|p| matches!(p.kind, PrismKind::Building))
+                    .filter_map(|p| {
+                        let (sx, sy) = (p.max[0] - p.min[0], p.max[1] - p.min[1]);
+                        let c = [(p.min[0] + p.max[0]) * 0.5, (p.min[1] + p.max[1]) * 0.5];
+                        let r = 0.5 * sx.hypot(sy) + 7.0;
+                        let tall = p.top - w.ground(c[0], c[1]) >= 9.0;
+                        (sx * sy >= 300.0 && sx.min(sy) >= 10.0 && tall && r <= 45.0).then_some((c, r))
+                    })
+                    .collect()
+            });
+            self.ring_spots = Some(spots);
+        }
+        let z = &o.zone;
+        let soon = o.t >= z.shrink_start - 15.0;
+        let valid = |c: &[f32; 2], r: f32| d2(c, &z.center) + r < z.radius - 5.0 && (!soon || d2(c, &z.next_center) + r * 0.5 < z.next_radius);
+        if self.ring_b.map_or(true, |(c, r)| !valid(&c, r)) {
+            self.ring_b = self
+                .ring_spots
+                .as_ref()
+                .and_then(|v| v.iter().filter(|(c, r)| valid(c, *r) && d2(c, pos) < 250.0).min_by(|x, y| (d2(&x.0, pos) - x.1).partial_cmp(&(d2(&y.0, pos) - y.1)).unwrap_or(std::cmp::Ordering::Equal)))
+                .copied();
+        }
+        let Some((c, r)) = self.ring_b else {
+            return self.idle_move(o, pos);
+        };
+        // Where the enemies are: the centre of those seen in the last 6 s.
+        let foes: Vec<[f32; 3]> = self.known.values().filter(|k| o.t - k.seen_t < 6.0).map(|k| k.pos).collect();
+        let th = (pos[1] - c[1]).atan2(pos[0] - c[0]);
+        if !foes.is_empty() {
+            let n = foes.len() as f32;
+            let e = foes.iter().fold([0.0f32; 2], |s, f| [s[0] + f[0] / n, s[1] + f[1] / n]);
+            let want = (c[1] - e[1]).atan2(c[0] - e[0]);
+            let diff = wrap(want - th);
+            if diff.abs() > 0.7 {
+                self.ring_dir = diff.signum();
+            }
+        }
+        // A point a little further round, pushed out until it is walkable; turn back if the way is shut.
+        for _ in 0..2 {
+            let a = th + self.ring_dir * 0.45;
+            for extra in [0.0f32, 4.0, 8.0, 14.0, 20.0] {
+                let g = [c[0] + (r + extra) * a.cos(), c[1] + (r + extra) * a.sin()];
+                if self.walkable(g[0], g[1]) {
+                    let mv = self.go(pos, g);
+                    if mv != [0.0, 0.0] {
+                        return mv;
+                    }
+                }
+            }
+            self.ring_dir = -self.ring_dir;
+        }
+        self.idle_move(o, pos)
     }
 
     /// Aim the gun at a crate and fire once lined up, if the line to it is clear. Returns whether it was.
@@ -3045,6 +3176,81 @@ mod tests {
         let mut b = with(Params { rush_guard: 1.0, ..Params::default() });
         b.decide(&o, [0.0; 3]);
         assert_ne!(b.label, "rush");
+    }
+
+    #[test]
+    fn late_game_keeps_moving() {
+        let mut o = obs(MECH, "");
+        o.t = 200.0;
+        let mut b = with(Params { ring: 1.0, ..Params::default() });
+        let a = b.decide(&o, [0.0; 3]);
+        assert_eq!(b.label, "ring");
+        assert!(a.mv[0].abs() + a.mv[1].abs() > 0.3, "mv {:?}", a.mv);
+        assert!(a.fire[0] || a.fire[1], "not shooting while looping");
+        // Three enemies close by switch it on early.
+        let three = r#"{"id": 3, "kind": "mech", "pos": [40, 0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]},
+                       {"id": 4, "kind": "mech", "pos": [0, 60, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]},
+                       {"id": 5, "kind": "mech", "pos": [-80, 0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let mut b = with(Params { ring: 1.0, ..Params::default() });
+        b.decide(&obs(three, ""), [0.0; 3]);
+        assert_eq!(b.label, "ring");
+        let mut b = with(Params { ring: 1.0, ..Params::default() });
+        b.decide(&obs(MECH, ""), [0.0; 3]);
+        assert_ne!(b.label, "ring");
+    }
+
+    /// On the real map (if the kit is next to the repo or `MAP_DIR` is set): the loop goes round a building
+    /// and keeps moving.
+    #[test]
+    fn late_game_loops_round_a_building() {
+        let dir = std::env::var("MAP_DIR").unwrap_or_else(|_| "../mechfight-kit/arena".into());
+        let Ok(w) = World::load(std::path::Path::new(&dir)) else { return };
+        let nav = Nav::build(&w, 2.5, 9.0, 1.2, 50.0);
+        let w = Arc::new(w);
+        let mut b = Brain::with_params(&Hello::default(), Some(w.clone()), Some(nav), Params { ring: 1.0, ..Params::default() });
+        let mut o = obs(r#"{"id": 3, "kind": "mech", "pos": [140, 0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#, "");
+        o.mechs[0].pos[2] = w.ground(140.0, 0.0);
+        o.t = 200.0;
+        let start = b.nav.as_ref().unwrap().center(b.nav.as_ref().unwrap().nearest_walkable(0.0, 0.0).unwrap());
+        o.me.pos = [start[0], start[1], w.ground(start[0], start[1])];
+        let first = o.me.pos;
+        let mut still = 0;
+        let mut slowest = 0.0f32;
+        for _ in 0..300 {
+            let t0 = std::time::Instant::now();
+            let a = b.decide(&o, o.me.pos);
+            slowest = slowest.max(t0.elapsed().as_secs_f32());
+            assert_eq!(b.label, "ring");
+            let l = a.mv[0].hypot(a.mv[1]);
+            if l < 0.3 {
+                still += 1;
+            }
+            let (nx, ny) = (o.me.pos[0] + a.mv[0] * 11.7 * 0.1, o.me.pos[1] + a.mv[1] * 11.7 * 0.1);
+            if b.walkable(nx, ny) {
+                o.me.pos = [nx, ny, w.ground(nx, ny)];
+            }
+            o.t += 0.1;
+            o.tick += 2;
+        }
+        assert!(b.ring_b.is_some(), "no building to loop around");
+        assert!(still < 10, "stood still {still} times");
+        assert!(d2(&first, &o.me.pos) > 1.0 || still == 0);
+        assert!(slowest < 0.02, "slowest decision {slowest} s");
+    }
+
+    #[test]
+    fn counter_puncher_leaves_distant_mechs_alone() {
+        let away = r#"{"id": 3, "kind": "mech", "pos": [100, 0, 0], "aim": [0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let at_us = r#"{"id": 3, "kind": "mech", "pos": [100, 0, 0], "aim": [3.1, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let mut b = with(Params { counter: 1.0, ..Params::default() });
+        b.decide(&obs(away, ""), [0.0; 3]);
+        assert_eq!(b.focus, None);
+        let mut b = with(Params { counter: 1.0, ..Params::default() });
+        b.decide(&obs(at_us, ""), [0.0; 3]);
+        assert_eq!(b.focus, Some(3));
+        let mut b = with(Params { counter: 0.0, ..Params::default() });
+        b.decide(&obs(away, ""), [0.0; 3]);
+        assert_eq!(b.focus, Some(3));
     }
 
     #[test]
