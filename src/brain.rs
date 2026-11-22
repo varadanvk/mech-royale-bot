@@ -369,6 +369,18 @@ pub struct Params {
     /// Sidestep tuning: how far ahead a bullet is tracked and how far we step.
     pub dodge_look: f32,
     pub dodge_reach: f32,
+    /// Arrival check (0 = off): outside the two-left endgame, break off (or don't start) a fight when another
+    /// known enemy could reach a firing position on us less than `arrive_margin` seconds after we would kill the
+    /// target. Kill time: target HP over our sustained damage times `arrive_hit`; arrival: distance beyond the
+    /// enemy's reach at `arrive_speed`. The decision holds for `arrive_latch` s; out of the line of fire and
+    /// unhurt, the way to cover is walked at `arrive_quiet` m/s.
+    pub arrive: f32,
+    pub arrive_margin: f32,
+    pub arrive_speed: f32,
+    pub arrive_hit: f32,
+    pub arrive_latch: f32,
+    pub arrive_mem: f32,
+    pub arrive_quiet: f32,
 }
 
 impl Default for Params {
@@ -537,6 +549,13 @@ impl Default for Params {
             cube_r_low: 40.0,
             dodge_look: 1.2,
             dodge_reach: 3.5,
+            arrive: 1.0,
+            arrive_margin: 1.5,
+            arrive_speed: 10.0,
+            arrive_hit: 0.7,
+            arrive_latch: 1.0,
+            arrive_mem: 6.0,
+            arrive_quiet: 4.6,
         }
     }
 }
@@ -709,6 +728,13 @@ impl Params {
         p.cube_r_low = g("cube_r_low", p.cube_r_low);
         p.dodge_look = g("dodge_look", p.dodge_look);
         p.dodge_reach = g("dodge_reach", p.dodge_reach);
+        p.arrive = g("arrive", p.arrive);
+        p.arrive_margin = g("arrive_margin", p.arrive_margin);
+        p.arrive_speed = g("arrive_speed", p.arrive_speed);
+        p.arrive_hit = g("arrive_hit", p.arrive_hit);
+        p.arrive_latch = g("arrive_latch", p.arrive_latch);
+        p.arrive_mem = g("arrive_mem", p.arrive_mem);
+        p.arrive_quiet = g("arrive_quiet", p.arrive_quiet);
         p
     }
 
@@ -743,6 +769,53 @@ const UPGRADES: &[&str] = &[
     "gun_velocity", "mortar_reload", "mortar_splash", "sensors", "mortar_velocity", "laser_pierce",
 ];
 
+/// How far a mech holding these weapons can hurt us from, roughly (nothing seen: a gun).
+fn reach_of(weapons: &[String]) -> f32 {
+    weapons
+        .iter()
+        .map(|w| match w.as_str() {
+            "laser" | "mortar" => 120.0,
+            "lightning" => 28.0,
+            _ => 85.0,
+        })
+        .fold(None, |a: Option<f32>, r| Some(a.map_or(r, |a| a.max(r))))
+        .unwrap_or(85.0)
+}
+
+/// Seconds for our weapons to bring down `t`, at `hit` of their sustained damage, counting a reload in progress.
+fn kill_time(me: &crate::proto::SelfObs, t: &Actor, hit: f32) -> f32 {
+    let d = d2(&t.pos, &me.pos);
+    let hp = if t.max_hp > 0.0 { t.hp.max(0.0) } else { 1400.0 };
+    let scale = 1.0 + 0.04 * me.cubes.min(10.0);
+    let mut dps = 0.0f32;
+    let mut wait = 0.0f32;
+    for w in me.weapons.iter().flatten() {
+        match w.kind.as_str() {
+            "gun" if d <= w.stat("range", 230.0) => {
+                let (mag, cd, rl) = (w.stat("mag", 12.0), w.stat("cooldown", 0.24), w.stat("reload", 2.4));
+                let g = w.stat("damage", 45.0) * mag / (mag * cd + rl).max(0.1);
+                let left = if w.reload > 0.0 { w.reload } else if w.ammo <= 0.0 { rl } else { 0.0 };
+                wait += left * g;
+                dps += g;
+            }
+            "laser" if d <= w.stat("range", 280.0) => {
+                dps += w.stat("damage", 315.0) / (w.stat("charge", 0.75) + w.stat("cooldown", 1.65)).max(0.1);
+            }
+            "lightning" if d <= w.stat("range", 45.0) => {
+                dps += w.stat("damage", 60.0) / w.stat("cooldown", 0.25).max(0.05);
+            }
+            "mortar" if d <= 230.0 => {
+                dps += 0.6 * w.stat("damage", 200.0) / w.stat("cooldown", 2.5).max(0.1);
+            }
+            _ => {}
+        }
+    }
+    if dps <= 0.0 {
+        return f32::MAX;
+    }
+    hp / (dps * scale * hit) + wait / dps
+}
+
 fn weapon_rank(kind: &str, p: &Params) -> i32 {
     let laser_first = p.laser_first > 0.0;
     let mortar_second = p.mortar_over_arc > 0.0;
@@ -774,6 +847,8 @@ struct Known {
     aim_yaw: f32,
     /// Health fraction when last seen.
     hp_frac: f32,
+    /// How far its weapons reach (m), as last seen.
+    reach: f32,
 }
 
 /// An action as sent, as far as motion and aim are concerned.
@@ -959,6 +1034,9 @@ pub struct Brain {
     /// Retreat burst in progress until this time, toward this cell (None: none found, fight in place).
     cr_until: f32,
     cr_goal: Option<[f32; 2]>,
+    /// Arrival check: breaking off until this time; the last margin (s) worked out.
+    arrive_until: f32,
+    pub arrive_margin: Option<f32>,
     /// Fight-position strafe: direction sign and when it next reverses.
     fp_side: f32,
     fp_until: f32,
@@ -1080,6 +1158,8 @@ impl Brain {
             dodge_until: -1.0,
             cr_until: -1.0,
             cr_goal: None,
+            arrive_until: -1.0,
+            arrive_margin: None,
             fp_side: 1.0,
             fp_until: -1.0,
             focus_t: -1.0,
@@ -1823,6 +1903,7 @@ impl Brain {
                     charge_since: if m.charging { Some(prev_charge.unwrap_or(o.t)) } else { None },
                     aim_yaw: m.aim[0],
                     hp_frac: if m.max_hp > 0.0 { m.hp / m.max_hp } else { 1.0 },
+                    reach: reach_of(&m.weapons),
                 },
             );
         }
@@ -2381,9 +2462,38 @@ impl Brain {
             // About to win: a target close by that is nearly dead or much weaker than us.
             let winning = p.ext_lose > 0.0 && target.map_or(false, |t| d2(&t.pos, &pos) < 120.0 && (t_hp < 200.0 || t_hp < 0.5 * me.hp));
             let veto = late || finishing || winning || close_kill || (target.is_some() && tf < 0.25 && (p.ext_lose <= 0.0 || hp_frac > 0.2) && near <= 2) || threats.is_empty();
+            // Arrival check: another enemy would be on us before this one is down.
+            self.arrive_margin = None;
+            if p.arrive > 0.0 && !late && o.alive > 2 {
+                if let Some(t) = target {
+                    let ttk = kill_time(&me, t, p.arrive_hit);
+                    let mut eta = f32::MAX;
+                    for (id, k) in self.known.iter() {
+                        if *id == t.id || o.t - k.seen_t >= p.arrive_mem {
+                            continue;
+                        }
+                        let e = ((d2(&k.pos, &pos) - k.reach).max(0.0) / p.arrive_speed.max(0.1) - (o.t - k.seen_t)).max(0.0);
+                        eta = eta.min(e);
+                    }
+                    if self.attackers.iter().any(|(id, at)| *id != t.id && o.t - at < 2.0) {
+                        eta = 0.0;
+                    }
+                    if eta < f32::MAX {
+                        let margin = eta - ttk;
+                        self.arrive_margin = Some(margin);
+                        if margin < p.arrive_margin && !veto {
+                            self.arrive_until = o.t + p.arrive_latch;
+                        }
+                    }
+                }
+            }
+            if veto || p.arrive <= 0.0 {
+                self.arrive_until = -1.0;
+            }
+            let arrive_on = o.t < self.arrive_until;
             if veto {
                 self.cr_until = -1.0;
-            } else if o.t < self.cr_until || trigger {
+            } else if o.t < self.cr_until || trigger || arrive_on {
                 let at_exposed = self.cr_goal.map_or(false, |g| {
                     d2(&g, &pos) < 2.5 && self.hidden_from(g, pos[2], &threats[..threats.len().min(4)]) < threats.len().min(4)
                 });
@@ -2410,6 +2520,25 @@ impl Brain {
             let dg = d2(&pos, &g);
             mv = if dg < 2.0 { [0.0, 0.0] } else { self.go(&pos, g) };
             boost = me.energy > p.retreat_boost_energy && dg > 5.0;
+            if o.t < self.arrive_until {
+                // Slipping away before a fight others would join: don't open it, and once out of their sight
+                // and unhurt, walk quietly.
+                let fresh = target.map_or(false, |t| !self.attackers.get(&t.id).map_or(false, |at| o.t - at < 4.0) && (t.max_hp <= 0.0 || t.hp >= 0.99 * t.max_hp));
+                if fresh {
+                    for (i, w) in me.weapons.iter().enumerate().take(2) {
+                        // A laser already charging is held (letting go would fire it).
+                        if !w.as_ref().map_or(false, |w| w.kind == "laser" && w.charge > 0.0) {
+                            a.fire[i] = false;
+                        }
+                    }
+                }
+                let th = &threats[..threats.len().min(4)];
+                if o.t - self.last_hurt_t > 1.0 && !th.is_empty() && self.hidden_from([pos[0], pos[1]], pos[2], th) == th.len() {
+                    let slow = (p.arrive_quiet / walk_speed.max(0.1)).min(1.0);
+                    mv = [mv[0] * slow, mv[1] * slow];
+                    boost = false;
+                }
+            }
             if dg > 6.0 {
                 for (i, w) in me.weapons.iter().enumerate().take(2) {
                     if w.as_ref().map_or(false, |w| w.kind == "laser" && w.charge <= 0.0) {
@@ -3767,5 +3896,52 @@ mod tests {
                 assert!(pos(s) < pos(d), "{s} after {d}");
             }
         }
+    }
+
+    fn arrive_obs(target_hp: f32, second: Option<f32>) -> Obs {
+        let t = format!(r#"{{"id": 3, "kind": "mech", "pos": [40, 0, 0], "hp": {target_hp}, "max_hp": 1400, "weapons": ["gun"]}}"#);
+        let others = match second {
+            Some(x) => format!(r#"{t}, {{"id": 4, "kind": "mech", "pos": [{x}, 30, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}}"#),
+            None => t,
+        };
+        let mut o = obs(&others, "");
+        o.alive = 15;
+        o
+    }
+
+    fn arrive_brain() -> Brain {
+        with(Params { crowd_retreat: 1.0, arrive: 1.0, ..base() })
+    }
+
+    #[test]
+    fn lone_enemy_is_fought() {
+        let mut b = arrive_brain();
+        let a = b.decide(&arrive_obs(1400.0, None), [0.0; 3]);
+        assert!(b.arrive_until < 0.0, "broke off a one-on-one");
+        assert!(b.label != "cbreak");
+        assert!(a.fire[0] || a.fire[1], "not shooting");
+    }
+
+    #[test]
+    fn fight_a_second_enemy_would_join_is_not_started() {
+        // Kill time ~8.6 s; the second gun is ~2 s from reach.
+        let o = arrive_obs(1400.0, Some(-100.0));
+        let mut b = arrive_brain();
+        b.decide(&o, [0.0; 3]);
+        assert!(b.arrive_margin.map_or(false, |m| m < 0.0), "margin {:?}", b.arrive_margin);
+        assert!(b.arrive_until > o.t, "kept fighting");
+        // Off: unchanged.
+        let mut b = with(Params { crowd_retreat: 1.0, arrive: 0.0, ..base() });
+        b.decide(&o, [0.0; 3]);
+        assert!(b.arrive_until < 0.0);
+    }
+
+    #[test]
+    fn nearly_dead_target_is_finished() {
+        let o = arrive_obs(150.0, Some(-100.0));
+        let mut b = arrive_brain();
+        let a = b.decide(&o, [0.0; 3]);
+        assert!(b.arrive_until < 0.0, "broke off a kill");
+        assert!(a.fire[0] || a.fire[1], "not shooting");
     }
 }
