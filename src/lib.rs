@@ -1,6 +1,8 @@
 //! tinman: a mechfight/1 bot. `world` is the map model, `nav` the ground pathfinder,
-//! `proto` the wire types, `sight` the sight table and sheltered spots, `brain` the decision logic.
+//! `proto` the wire types, `sight` the sight table and sheltered spots, `contacts`
+//! where we believe the enemies are, `brain` the decision logic.
 pub mod brain;
+pub mod contacts;
 pub mod nav;
 pub mod proto;
 pub mod sight;

@@ -3,6 +3,7 @@
 //! the match, choosing whom to engage, and grabbing cubes mid-fight.
 use super::{d2, norm2, wrap, yaw_to, Brain};
 use crate::proto::{Actor, Obs};
+use crate::sight::Foe;
 use std::f32::consts::TAU;
 
 /// Weapon and step sounds worth turning toward.
@@ -196,8 +197,9 @@ impl Brain {
 
     /// Move toward the best of: staying put, or one of 16 points 6 m away. Score: closeness to the preferred
     /// distance, little movement, a line to the target while a weapon is ready, few other enemies within
-    /// 170 m with a line to it, and distance kept from lightning and mortar holders. When staying put wins, strafe
-    /// slowly across the target, reversing every 3 to 5 s (with `ext_fpos`: every `fp_flip_lo`..`fp_flip_hi` s).
+    /// 170 m with a line to it (with `contacts`: also the expected number of believed enemies out of sight with
+    /// one), and distance kept from lightning and mortar holders. When staying put wins, strafe slowly across the
+    /// target, reversing every 3 to 5 s (with `ext_fpos`: every `fp_flip_lo`..`fp_flip_hi` s).
     pub(super) fn fight_pos_move(&mut self, o: &Obs, t: &Actor, pref: f32, ready: bool) -> [f32; 2] {
         let pos = o.me.pos;
         let p = &self.params;
@@ -209,9 +211,19 @@ impl Brain {
             .filter(|m| m.kind == "mech" && m.id != t.id && !(m.max_hp > 0.0 && m.hp <= 0.0) && d2(&m.pos, &pos) < 176.0)
             .collect();
         // Other enemies whose line to a point counts against it: those in sight, and with `ext_fpos` also those
-        // seen in the last 4 s.
+        // seen in the last 4 s; with `contacts`, instead of the latter, every believed enemy out of sight, by the
+        // chance it has a line there.
         let mut watchers: Vec<[f32; 3]> = others.iter().map(|m| m.pos).collect();
-        if p.ext_fpos > 0.0 {
+        let believed: Vec<Foe> = if p.contacts > 0.0 {
+            self.beliefs
+                .iter()
+                .filter(|b| !b.listed && b.id != Some(t.id) && b.conf > 0.05 && d2(&b.pos, &pos) < 176.0 + b.r)
+                .map(|b| Foe { pos: b.pos, hp: b.hp, r: b.r, conf: b.conf, sure: false })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if p.ext_fpos > 0.0 && p.contacts <= 0.0 {
             for (id, k) in self.known.iter() {
                 if *id != t.id && o.t - k.seen_t < 4.0 && o.t - k.seen_t > 0.05 && d2(&k.pos, &pos) < 176.0 && !others.iter().any(|m| m.id == *id) {
                     watchers.push(k.pos);
@@ -246,6 +258,23 @@ impl Brain {
                 if sees {
                     s -= 30.0;
                 }
+            }
+            for f in &believed {
+                if d2(&f.pos, &q) >= 170.0 + f.r {
+                    continue;
+                }
+                let w = match b.sight.as_ref() {
+                    Some(st) if st.cell_at(q[0], q[1]).is_some() => st.watch(q, f),
+                    _ => {
+                        let fz = b.ground(f.pos[0], f.pos[1], pos[2]);
+                        if b.clear([f.pos[0], f.pos[1], fz + 8.0], [q[0], q[1], qz + 5.0]) {
+                            f.conf
+                        } else {
+                            0.0
+                        }
+                    }
+                };
+                s -= 30.0 * w;
             }
             for m in others.iter().copied().chain(std::iter::once(t)) {
                 let k = keep_of(m);
@@ -296,7 +325,8 @@ impl Brain {
     }
 
     /// Late-game home: the best of about 40 points within 0.7 of the next circle's radius, scored mainly by how
-    /// little ground can see it (mean clear line over 64 directions), then by distance and known enemies near it.
+    /// little ground can see it (mean clear line over 64 directions), then by distance and known enemies near it
+    /// (with `contacts`: believed enemies, by how sure we are of each, counting from the near edge of where it may be).
     /// Re-chosen every `home_s` seconds or when it falls outside the next circle; with `ext_late` also after a
     /// fresh hit or loud sound, preferring points away from its direction.
     pub(super) fn home_spot(&mut self, o: &Obs) -> [f32; 2] {
@@ -316,7 +346,12 @@ impl Brain {
         if let Some((h, _)) = keep {
             return h;
         }
-        let foes: Vec<[f32; 3]> = self.known.values().filter(|k| o.t - k.seen_t < 8.0).map(|k| k.pos).collect();
+        // Enemies near a point count against it: position, how much nearer it may be, weight.
+        let foes: Vec<([f32; 2], f32, f32)> = if self.params.contacts > 0.0 {
+            self.beliefs.iter().filter(|b| b.conf >= 0.2).map(|b| (b.pos, b.r * 0.5, b.conf)).collect()
+        } else {
+            self.known.values().filter(|k| o.t - k.seen_t < 8.0).map(|k| ([k.pos[0], k.pos[1]], 0.0, 1.0)).collect()
+        };
         let r = (z.next_radius * 0.7).max(5.0);
         let old = self.home.map(|h| h.0);
         let mut cands: Vec<[f32; 2]> = Vec::with_capacity(42);
@@ -342,7 +377,7 @@ impl Brain {
                 None => 100.0,
             };
             let cr = if ext { self.params.late_crowd_r } else { 120.0 };
-            let crowd: f32 = foes.iter().map(|f| (1.0 - d2(f, &q) / cr).max(0.0)).sum();
+            let crowd: f32 = foes.iter().map(|f| f.2 * (1.0 - (d2(&f.0, &q) - f.1).max(0.0) / cr).max(0.0)).sum();
             let mut s = expo + 0.12 * d2(&q, &pos) + 25.0 * crowd - if Some(q) == old { 5.0 } else { 0.0 };
             if let Some(b) = alert {
                 let dq = d2(&q, &pos);

@@ -169,7 +169,7 @@ fn decisions_are_fast() {
             .map(|_| {
                 let a = r.f() * std::f32::consts::TAU;
                 let d = 30.0 + r.f() * 150.0;
-                Foe { pos: [me[0] + a.cos() * d, me[1] + a.sin() * d], hp: r.f() }
+                Foe::at([me[0] + a.cos() * d, me[1] + a.sin() * d], r.f())
             })
             .collect();
         let z = Zone { center: me, radius: 300.0, next_center: me, next_radius: 200.0, soon: true };
@@ -253,5 +253,126 @@ fn pressed_bot_fights_from_shelter_within_budget() {
         eprintln!("level {level}: table built in {build:.0} ms; decision mean {:.3} ms worst {:.3} ms; sheltered {sheltered}/{n}", sum / n as f32, worst);
         assert!(worst < 10.0, "worst decision {worst} ms");
         assert!(sheltered * 10 >= n * 8, "{sheltered}/{n}");
+    }
+}
+
+#[test]
+fn expected_watchers_weigh_confidence_and_spread() {
+    let Some((w, nav)) = load() else { return };
+    let t = SightTable::build(&w, &nav);
+    let mut r = Rng(0x5eed);
+    let mut checked = 0;
+    for _ in 0..300 {
+        let me = walk_point(&w, &nav, &mut r);
+        let a = r.f() * std::f32::consts::TAU;
+        let f = [me[0] + a.cos() * 60.0, me[1] + a.sin() * 60.0];
+        let seen = t.visible(me, f);
+        // A located enemy counts 0 or its confidence.
+        let sure = Foe::at(f, 1.0);
+        assert_eq!(t.watch(me, &sure), if seen { 1.0 } else { 0.0 });
+        let half = Foe { conf: 0.5, ..sure };
+        assert_eq!(t.watch(me, &half), if seen { 0.5 } else { 0.0 });
+        // A spread-out one: a share of its confidence, in sevenths.
+        let rough = Foe { r: 40.0, conf: 0.7, sure: false, ..sure };
+        let x = t.watch(me, &rough);
+        assert!((0.0..=0.7 + 1e-6).contains(&x));
+        let k = x / 0.7 * 7.0;
+        assert!((k - k.round()).abs() < 1e-3, "{x}");
+        // Out of range all round: nothing.
+        let far = Foe { pos: [me[0] + RANGE + 60.0, me[1]], ..rough };
+        assert_eq!(t.watch(me, &far), 0.0);
+        let all = [sure, half, rough, far];
+        assert!((t.expected(me, &all) - (t.watch(me, &sure) + t.watch(me, &half) + x)).abs() < 1e-5);
+        checked += seen as u32;
+    }
+    assert!(checked > 20);
+    // Isolating among rough contacts: the one watcher is a located enemy, the rest add up to little.
+    let mut found = 0;
+    for _ in 0..100 {
+        let me = walk_point(&w, &nav, &mut r);
+        let foes: Vec<Foe> = (0..12)
+            .map(|i| {
+                let a = r.f() * std::f32::consts::TAU;
+                let d = 30.0 + r.f() * 150.0;
+                let p = [me[0] + a.cos() * d, me[1] + a.sin() * d];
+                if i < 4 { Foe::at(p, r.f()) } else { Foe { pos: p, hp: 1.0, r: 10.0 + r.f() * 60.0, conf: 0.3 + r.f() * 0.6, sure: false } }
+            })
+            .collect();
+        let z = Zone { center: me, radius: 300.0, next_center: me, next_radius: 200.0, soon: true };
+        if let Some(p) = t.pick_isolating(&nav, me, &foes, &z, 11.7, None) {
+            found += 1;
+            let k = foes.iter().position(|f| Some(f.pos) == p.foe).unwrap();
+            assert!(foes[k].sure && t.watch(p.pos, &foes[k]) >= 0.5);
+            assert!(t.expected(p.pos, &foes) - t.watch(p.pos, &foes[k]) <= 0.6 + 1e-4);
+        }
+    }
+    assert!(found > 10, "{found}");
+}
+
+#[test]
+fn enemy_picture_decisions_within_budget() {
+    use std::sync::Arc;
+    use tinman::brain::{Brain, Params};
+    use tinman::proto::{Hello, Obs};
+    let Some((w, nav)) = load() else { return };
+    let w = Arc::new(w);
+    let mut r = Rng(0x77aa55);
+    for (spot, ring) in [(2.0f32, 0.0f32), (0.0, 1.0)] {
+        let params = Params { contacts: 1.0, spot, ring, ..Params::default() };
+        let mut b = Brain::with_params(&Hello::default(), Some(w.clone()), Some(nav.clone()), params);
+        let (mut worst, mut sum, mut n, mut most) = (0.0f32, 0.0f32, 0, 0);
+        for round in 0..10 {
+            let me = walk_point(&w, &nav, &mut r);
+            let foes: Vec<([f32; 2], [f32; 2])> = (0..15)
+                .map(|_| {
+                    let a = r.f() * std::f32::consts::TAU;
+                    let d = 40.0 + r.f() * 140.0;
+                    let v = r.f() * std::f32::consts::TAU;
+                    ([me[0] + a.cos() * d, me[1] + a.sin() * d], [v.cos() * 8.0, v.sin() * 8.0])
+                })
+                .collect();
+            for k in 0..60 {
+                let t = 100.0 + round as f32 * 20.0 + k as f32 * 0.1;
+                // All fifteen listed at first, then out of sight, with ten unexplained sounds every tick.
+                let mechs: Vec<String> = if k < 5 {
+                    foes.iter()
+                        .enumerate()
+                        .map(|(i, (f, v))| {
+                            format!(
+                                r#"{{"id": {i}, "kind": "mech", "pos": [{}, {}, {}], "vel": [{}, {}, 0], "aim": [0, 0], "hp": 900, "max_hp": 1400, "weapons": ["gun"]}}"#,
+                                f[0], f[1], w.ground(f[0], f[1]), v[0], v[1]
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let sounds: Vec<String> = (0..10)
+                    .map(|j| {
+                        let band = ["near", "mid", "far"][j % 3];
+                        format!(r#"{{"kind": "{}", "bearing": {}, "dist": "{band}", "age": 0.05}}"#, ["gun", "step", "laser"][j % 3], r.f() * 6.28 - 3.14)
+                    })
+                    .collect();
+                let s = format!(
+                    r#"{{"tick": {}, "t": {t}, "self": {{"pos": [{}, {}, {}], "aim": [{}, 0], "hp": 1400, "max_hp": 1400, "energy": 100, "grounded": true, "in_zone": true,
+                       "weapons": [{{"kind": "gun", "ammo": 12}}, null]}}, "mechs": [{}], "sounds": [{}],
+                       "events": [{{"type": "damaged", "amount": 20, "weapon": "gun", "bearing": {}, "by": {}}}],
+                       "zone": {{"center": [{}, {}], "radius": 400, "next_center": [{}, {}], "next_radius": 300, "shrink_start": 400}}}}"#,
+                    (t * 20.0) as u64, me[0], me[1], w.ground(me[0], me[1]), r.f() * 6.0 - 3.0, mechs.join(","), sounds.join(","),
+                    r.f() * 6.0 - 3.0, k % 15, me[0], me[1], me[0], me[1]
+                );
+                let o: Obs = serde_json::from_str(&s).unwrap();
+                let t1 = Instant::now();
+                let _ = b.act(&o);
+                let ms = t1.elapsed().as_secs_f32() * 1000.0;
+                worst = worst.max(ms);
+                sum += ms;
+                n += 1;
+                most = most.max(b.dbg_contacts.len());
+            }
+        }
+        eprintln!("spot {spot} ring {ring}: decision mean {:.3} ms worst {:.3} ms; up to {most} believed enemies", sum / n as f32, worst);
+        assert!(most >= 20, "{most}");
+        assert!(worst < 5.0, "worst decision {worst} ms");
     }
 }

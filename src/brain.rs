@@ -1,4 +1,5 @@
 //! Decision logic: one `act` per observation.
+use crate::contacts::{Belief, Contacts};
 use crate::nav::Nav;
 use crate::proto::{Action, Actor, Hello, Obs, Weapon};
 use crate::sight::{Foe, Pick, SightTable, Zone};
@@ -369,6 +370,13 @@ pub struct Params {
     /// Sidestep tuning: how far ahead a bullet is tracked and how far we step.
     pub dodge_look: f32,
     pub dodge_reach: f32,
+    /// Keep a picture of where every enemy is believed to be: tracks of the ones seen (estimates that spread
+    /// once out of view, moved by what we hear, by their hits, and out of places we see empty) and anonymous
+    /// contacts from sounds. Fight-position scoring then counts the expected watchers of a point from it, the
+    /// break-off rule counts confident believed enemies nearby, the late home spot keeps away from believed
+    /// enemies, being pressed counts confident entries within 150 m, and the loop and sheltered-ground choices
+    /// weigh every entry by how sure we are of it (0 = off).
+    pub contacts: f32,
 }
 
 impl Default for Params {
@@ -537,6 +545,7 @@ impl Default for Params {
             cube_r_low: 40.0,
             dodge_look: 1.2,
             dodge_reach: 3.5,
+            contacts: 1.0,
         }
     }
 }
@@ -709,6 +718,7 @@ impl Params {
         p.cube_r_low = g("cube_r_low", p.cube_r_low);
         p.dodge_look = g("dodge_look", p.dodge_look);
         p.dodge_reach = g("dodge_reach", p.dodge_reach);
+        p.contacts = g("contacts", p.contacts);
         p
     }
 
@@ -948,6 +958,11 @@ pub struct Brain {
     spot_ban: BTreeMap<usize, f32>,
     /// Since when two or more enemies have had a line to us.
     spot_seen_since: Option<f32>,
+    contacts: Contacts,
+    /// This tick's believed enemies (with `contacts`).
+    beliefs: Vec<Belief>,
+    /// For a viewer only, never read by decisions: believed enemies as x, y, radius, confidence.
+    pub dbg_contacts: Vec<[f32; 4]>,
     /// Position where only one enemy has a line to us, and when it was last chosen.
     iso_pick: Option<Pick>,
     iso_t: f32,
@@ -1073,6 +1088,9 @@ impl Brain {
             spot_pick: None,
             spot_ban: BTreeMap::new(),
             spot_seen_since: None,
+            contacts: Contacts::default(),
+            beliefs: Vec::new(),
+            dbg_contacts: Vec::new(),
             iso_pick: None,
             iso_t: -1.0,
             hp_hist: VecDeque::new(),
@@ -1441,6 +1459,78 @@ impl Brain {
             }
             _ => Shot { aim: me.aim, tol: [0.0, 0.0], ok: false },
         }
+    }
+
+    /// Feed this observation to the enemy picture and take this tick's beliefs from it.
+    fn update_contacts(&mut self, o: &Obs, pos: &[f32; 3]) {
+        let me = &o.me;
+        let here = [pos[0], pos[1]];
+        self.contacts.begin();
+        for m in o.mechs.iter().filter(|m| m.kind == "mech") {
+            if m.max_hp > 0.0 && m.hp <= 0.0 {
+                self.contacts.remove(m.id);
+                continue;
+            }
+            let aimed = wrap(m.aim[0] - yaw_to(&m.pos, pos)).abs() < 0.2;
+            let hunter = aimed || self.attackers.get(&m.id).map_or(false, |t| o.t - t < 4.0) || self.hunters.contains_key(&m.id);
+            let hpf = if m.max_hp > 0.0 { m.hp / m.max_hp } else { 1.0 };
+            self.contacts.see(o.t, m.id, m.pos, m.vel, &m.weapons, hpf, hunter);
+        }
+        for e in &o.events {
+            match (e.kind.as_str(), e.target, e.by, e.bearing) {
+                ("kill", Some(id), _, _) => self.contacts.remove(id),
+                ("damaged", _, Some(by), Some(b)) if by < 100 => self.contacts.hit_by(o.t, here, Some(by), b, e.weapon.as_deref().unwrap_or("")),
+                _ => {}
+            }
+        }
+        for s in &o.sounds {
+            self.contacts.hear(o.t, here, &s.kind, s.bearing, &s.dist, s.age);
+        }
+        // A mech standing at a point would be listed now: in sight range and the view wedge (or close by), with
+        // a line from our eye to its centre or top.
+        let eye = [pos[0], pos[1], pos[2] + me.stat("eye_height", 8.0)];
+        let aim = me.aim[0];
+        let w = self.world.clone();
+        let in_view = |q: [f32; 2]| -> bool {
+            let Some(w) = w.as_ref() else { return false };
+            let d = d2(&q, pos);
+            if d > 200.0 || (d > 45.0 && wrap(yaw_to(pos, &q) - aim).abs() > PI / 3.0) {
+                return false;
+            }
+            let g = w.ground(q[0], q[1]);
+            w.sees(eye, [q[0], q[1], g + 4.5]) || w.sees(eye, [q[0], q[1], g + 9.0])
+        };
+        self.contacts.settle(o.t, here, &in_view);
+        self.beliefs = self.contacts.beliefs(o.t);
+        self.dbg_contacts = self.beliefs.iter().map(|b| [b.pos[0], b.pos[1], b.r, b.conf]).collect();
+    }
+
+    /// Believed enemies we cannot see now but are fairly sure of (confidence 0.5 or more) within `r` of `pos`
+    /// (with `contacts`; none without).
+    fn unseen_near(&self, pos: &[f32; 3], r: f32) -> usize {
+        if self.params.contacts <= 0.0 {
+            return 0;
+        }
+        self.beliefs.iter().filter(|b| !b.listed && b.conf >= 0.5 && d2(&b.pos, pos) < r).count()
+    }
+
+    /// Enemies pressing us: seen in the last 4 s within 150 m (with `contacts`: believed in with confidence 0.5
+    /// or more within 150 m), or hurting us in the last 3 s.
+    fn pressing(&self, o: &Obs, pos: &[f32; 3]) -> usize {
+        if self.params.contacts > 0.0 {
+            let close = |b: &&Belief| b.conf >= 0.5 && d2(&b.pos, pos) < 150.0;
+            let mut ids: Vec<u32> = self.beliefs.iter().filter(close).filter_map(|b| b.id).collect();
+            let anon = self.beliefs.iter().filter(close).filter(|b| b.id.is_none()).count();
+            ids.extend(self.attackers.iter().filter(|(_, t)| o.t - **t < 3.0).map(|(id, _)| *id));
+            ids.sort_unstable();
+            ids.dedup();
+            return ids.len() + anon;
+        }
+        let mut ids: Vec<u32> = self.known.iter().filter(|(_, k)| o.t - k.seen_t < 4.0 && d2(&k.pos, pos) < 150.0).map(|(id, _)| *id).collect();
+        ids.extend(self.attackers.iter().filter(|(_, t)| o.t - **t < 3.0).map(|(id, _)| *id));
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
     }
 
     /// Positions of enemies we should hide from (recently known), nearest first, at most four.
@@ -1888,6 +1978,11 @@ impl Brain {
 
         self.track_contacts(o);
 
+        // --- where the enemies are believed to be
+        if p.contacts > 0.0 {
+            self.update_contacts(o, &pos);
+        }
+
         // --- upgrades
         if let Some(offer) = &o.offer {
             let list = if p.upg_dmg >= 2.0 { UPGRADES_TANK } else if p.upg_dmg > 0.0 { UPGRADES_DMG } else { UPGRADES };
@@ -1909,22 +2004,16 @@ impl Brain {
         let filter_early = p.engage_filter > 0.0 && !late;
         // Loop mode: late, or pressed by three or more enemies (close by, or hurting us).
         if p.ring > 0.0 {
-            let mut pressing: Vec<u32> = self.known.iter().filter(|(_, k)| o.t - k.seen_t < 4.0 && d2(&k.pos, &pos) < 150.0).map(|(id, _)| *id).collect();
-            pressing.extend(self.attackers.iter().filter(|(_, t)| o.t - **t < 3.0).map(|(id, _)| *id));
-            pressing.sort_unstable();
-            pressing.dedup();
-            if late || pressing.len() >= 3 {
+            let pressing = self.pressing(o, &pos);
+            if late || pressing >= 3 {
                 self.ring_until = o.t + 5.0;
             }
         }
         let ring_on = p.ring > 0.0 && o.t < self.ring_until;
         // Sheltered-ground mode: same trigger as the loop, with its own crowd size.
         if p.spot > 0.0 {
-            let mut pressing: Vec<u32> = self.known.iter().filter(|(_, k)| o.t - k.seen_t < 4.0 && d2(&k.pos, &pos) < 150.0).map(|(id, _)| *id).collect();
-            pressing.extend(self.attackers.iter().filter(|(_, t)| o.t - **t < 3.0).map(|(id, _)| *id));
-            pressing.sort_unstable();
-            pressing.dedup();
-            if late || pressing.len() as f32 >= p.spot_crowd {
+            let pressing = self.pressing(o, &pos);
+            if late || pressing as f32 >= p.spot_crowd {
                 self.spot_until = o.t + 5.0;
             }
             self.hp_hist.push_back((o.t, me.hp));
@@ -2373,7 +2462,8 @@ impl Brain {
         // Outnumbered or losing: break off in bursts to the nearest hidden cell (`crowd_retreat`).
         let mut cr_goal: Option<[f32; 2]> = None;
         if p.crowd_retreat > 0.0 {
-            let near = enemies.iter().filter(|m| d2(&m.pos, &pos) < p.cr_radius).count();
+            // With `contacts`, enemies we cannot see now but are fairly sure of count too.
+            let near = enemies.iter().filter(|m| d2(&m.pos, &pos) < p.cr_radius).count() + self.unseen_near(&pos, p.cr_radius);
             let tf = target.map_or(1.0, |t| if t.max_hp > 0.0 { t.hp / t.max_hp } else { 1.0 });
             let t_hp = target.map_or(0.0, |t| if t.max_hp > 0.0 { t.hp } else { 1400.0 });
             let losing = if p.ext_lose > 0.0 { tf > hp_frac + p.lose_margin } else { t_hp > me.hp };
@@ -3186,12 +3276,17 @@ impl Brain {
         let Some((c, r)) = self.ring_b else {
             return self.idle_move(o, pos);
         };
-        // Where the enemies are: the centre of those seen in the last 6 s.
-        let foes: Vec<[f32; 3]> = self.known.values().filter(|k| o.t - k.seen_t < 6.0).map(|k| k.pos).collect();
+        // Where the enemies are: the centre of those seen in the last 6 s (with `contacts`: of every believed
+        // enemy with confidence 0.3 or more, weighted by it).
+        let foes: Vec<([f32; 2], f32)> = if self.params.contacts > 0.0 {
+            self.beliefs.iter().filter(|b| b.conf >= 0.3).map(|b| (b.pos, b.conf)).collect()
+        } else {
+            self.known.values().filter(|k| o.t - k.seen_t < 6.0).map(|k| ([k.pos[0], k.pos[1]], 1.0)).collect()
+        };
         let th = (pos[1] - c[1]).atan2(pos[0] - c[0]);
-        if !foes.is_empty() {
-            let n = foes.len() as f32;
-            let e = foes.iter().fold([0.0f32; 2], |s, f| [s[0] + f[0] / n, s[1] + f[1] / n]);
+        let n: f32 = foes.iter().map(|f| f.1).sum();
+        if n > 0.0 {
+            let e = foes.iter().fold([0.0f32; 2], |s, f| [s[0] + f.0[0] * f.1 / n, s[1] + f.0[1] * f.1 / n]);
             let want = (c[1] - e[1]).atan2(c[0] - e[0]);
             let diff = wrap(want - th);
             if diff.abs() > 0.7 {
@@ -3225,16 +3320,24 @@ impl Brain {
         let p = self.params.clone();
         let here = [pos[0], pos[1]];
         let walk = me.stat("walk_speed", 11.7);
-        // Enemies seen in the last 6 s, carried along their last velocity for up to 2 s.
-        let foes: Vec<Foe> = self
-            .known
-            .values()
-            .filter(|k| o.t - k.seen_t < 6.0 && d2(&k.pos, pos) < 260.0)
-            .map(|k| {
-                let dt = (o.t - k.seen_t).min(2.0);
-                Foe { pos: [k.pos[0] + k.vel[0] * dt, k.pos[1] + k.vel[1] * dt], hp: k.hp_frac }
-            })
-            .collect();
+        // Enemies seen in the last 6 s, carried along their last velocity for up to 2 s; with `contacts`, every
+        // believed enemy, located (listed, or seen within 2 s) or not.
+        let foes: Vec<Foe> = if p.contacts > 0.0 {
+            self.beliefs
+                .iter()
+                .filter(|b| b.conf > 0.05 && d2(&b.pos, pos) < 260.0 + b.r)
+                .map(|b| Foe { pos: b.pos, hp: b.hp, r: b.r, conf: b.conf, sure: b.listed || (b.id.is_some() && b.age < 2.0) })
+                .collect()
+        } else {
+            self.known
+                .values()
+                .filter(|k| o.t - k.seen_t < 6.0 && d2(&k.pos, pos) < 260.0)
+                .map(|k| {
+                    let dt = (o.t - k.seen_t).min(2.0);
+                    Foe::at([k.pos[0] + k.vel[0] * dt, k.pos[1] + k.vel[1] * dt], k.hp_frac)
+                })
+                .collect()
+        };
         // Enemies with a line to us right now.
         let chest = [pos[0], pos[1], pos[2] + 5.0];
         let seeing = self.known.values().filter(|k| o.t - k.seen_t < 1.0 && d2(&k.pos, pos) < 200.0 && self.clear([k.pos[0], k.pos[1], k.pos[2] + 8.0], chest)).count();
@@ -3282,7 +3385,7 @@ impl Brain {
                     // The partner spot first, if it is inside the safe area and fewer enemies can see it.
                     if let Some(j) = st.spots[i].fallback.filter(|j| !self.spot_ban.contains_key(j)) {
                         let f = &st.spots[j];
-                        if zone.holds(f.pos, 8.0) && st.seen_by(f.pos, &foes) < seeing.max(1) {
+                        if zone.holds(f.pos, 8.0) && st.expected(f.pos, &foes) < seeing.max(1) as f32 {
                             next = Some(Pick { pos: f.pos, yaw: f.lane_yaw, spot: Some(j), foe: None, score: 0.0 });
                         }
                     }
@@ -3448,6 +3551,7 @@ mod tests {
             ext_fpos: 0.0,
             ext_late: 0.0,
             ext_finish: 0.0,
+            contacts: 0.0,
             ..Params::default()
         }
     }
