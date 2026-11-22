@@ -733,8 +733,8 @@ impl Default for Params {
             ffa_plain: 1.0,
             stay_fight: 2.0,
             stay_cover: 0.0,
-            lane: 0.6,
-            lane_mix: 0.4,
+            lane: 0.35,
+            lane_mix: 0.2,
         }
     }
 }
