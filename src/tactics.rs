@@ -95,6 +95,12 @@ impl Brain {
                 s -= 15.0;
             }
         }
+        if self.params.focus_laser > 0.0 && m.weapons.iter().any(|w| w == "laser") {
+            s -= self.params.focus_laser;
+            if m.charging && aimed_at(m, &o.me.pos) {
+                s -= self.params.focus_laser;
+            }
+        }
         s + self.reinforcements(m)
     }
 
@@ -366,7 +372,8 @@ impl Brain {
                 s -= out * 5.0;
             }
             if pin {
-                s += b.pin_score(o, [pos[0], pos[1]], q, t.pos, ex_here);
+                let ps = b.pin_score(o, [pos[0], pos[1]], q, t.pos, ex_here);
+                s += if p.pin_cap > 0.0 { ps.clamp(-p.pin_cap, p.pin_cap) } else { ps };
             }
             s
         };
@@ -433,7 +440,8 @@ impl Brain {
                 return [0.0, 0.0];
             }
         }
-        [side[0] * 0.5, side[1] * 0.5]
+        let sp = self.params.fp_strafe;
+        [side[0] * sp, side[1] * sp]
     }
 
     /// Late-game home: the best of about 40 points within 0.7 of the next circle's radius, scored mainly by how

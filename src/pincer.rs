@@ -42,8 +42,8 @@ pub struct PredTrace {
 }
 
 /// Prediction variants traced: standing still, then (walk share, stop distance) pairs.
-const VARIANTS: usize = 8;
-const VARIANT_SET: [(f32, f32); VARIANTS - 1] = [(0.0, 30.0), (0.25, 30.0), (0.5, 30.0), (0.75, 30.0), (1.0, 30.0), (0.5, 15.0), (0.5, 45.0)];
+const VARIANTS: usize = 14;
+const VARIANT_SET: [(f32, f32); 7] = [(0.0, 30.0), (0.25, 30.0), (0.5, 30.0), (0.75, 30.0), (1.0, 30.0), (0.5, 15.0), (0.5, 45.0)];
 
 impl PredTrace {
     pub fn report(&self, slot: u32, seed: u64) {
@@ -68,6 +68,18 @@ impl Brain {
             || self.attackers.get(&m.id).map_or(false, |t| o.t - t < 4.0)
     }
 
+    /// The velocity an enemy in view is predicted with: its own, with the part across our line scaled by `pred_tan`.
+    pub(super) fn pred_vel(&self, m: &Actor, here: [f32; 2]) -> [f32; 2] {
+        let k = self.params.pred_tan;
+        let vel = [m.vel[0], m.vel[1]];
+        if k == 1.0 {
+            return vel;
+        }
+        let u = super::norm2(m.pos[0] - here[0], m.pos[1] - here[1]);
+        let rad = vel[0] * u[0] + vel[1] * u[1];
+        [u[0] * rad + (vel[0] - u[0] * rad) * k, u[1] * rad + (vel[1] - u[1] * rad) * k]
+    }
+
     /// Fill in the enemies round us, where they are expected to be, and whether we are pincered.
     pub(super) fn update_pincer(&mut self, o: &Obs, pos: &[f32; 3], target: Option<&Actor>) {
         self.trace_pred(o, pos);
@@ -85,7 +97,7 @@ impl Brain {
             let now = [m.pos[0], m.pos[1]];
             let pred = if pred_on {
                 let w = if self.coming(o, m, pos) { hunt_w } else { 0.0 };
-                predict::predict(now, [m.vel[0], m.vel[1]], here, w, 0.0, stop, dt, &walk)
+                predict::predict(now, self.pred_vel(m, here), here, w, 0.0, stop, dt, &walk)
             } else {
                 now
             };
@@ -228,6 +240,19 @@ impl Brain {
                     for (v, (w, stop)) in VARIANT_SET.iter().enumerate() {
                         preds[h][v + 1] = predict::predict(now, vel, here, *w, 0.0, *stop, *hz, &walk);
                     }
+                }
+                // Velocity split into the part toward or away from us and the part across our line.
+                let u = super::norm2(now[0] - here[0], now[1] - here[1]);
+                let rad = vel[0] * u[0] + vel[1] * u[1];
+                let tan = [vel[0] - u[0] * rad, vel[1] - u[1] * rad];
+                let mk = |k: f32| [u[0] * rad + tan[0] * k, u[1] * rad + tan[1] * k];
+                for (h, hz) in [1.0f32, 2.0].iter().enumerate() {
+                    preds[h][8] = predict::predict(now, mk(0.0), here, 0.25, 0.0, 30.0, *hz, &walk);
+                    preds[h][9] = predict::predict(now, mk(0.5), here, 0.25, 0.0, 30.0, *hz, &walk);
+                    preds[h][10] = predict::predict(now, mk(0.5), here, 0.5, 0.0, 45.0, *hz, &walk);
+                    preds[h][11] = predict::predict(now, mk(0.7), here, 0.25, 0.0, 30.0, *hz, &walk);
+                    preds[h][12] = predict::predict(now, mk(0.7), here, 0.4, 0.0, 45.0, *hz, &walk);
+                    preds[h][13] = predict::predict(now, mk(0.3), here, 0.4, 0.0, 45.0, *hz, &walk);
                 }
                 tr.pending.push((o.t, m.id, hunt, preds));
             }

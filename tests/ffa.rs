@@ -152,7 +152,19 @@ fn practice_scene_is_played_as_before() {
     let (_, b) = practice_scene(world.clone(), nav.clone(), Params::default());
     assert!(!b.ffa_latched(), "detector latched in a practice scene: {}", b.dbg_mode);
     // The break-off goal choice (`cb_*`) is newer than this scene's hash: off here.
-    let p = Params { cb_away: 0.0, cb_path: 0.0, cb_known: 0.0, cb_corner: 0.0, cb_turn: 0.0, ..no_practice_map() };
+    // The later additions off as well: the hash below is of the play before any of them.
+    let p = Params {
+        cb_away: 0.0,
+        cb_path: 0.0,
+        cb_known: 0.0,
+        cb_corner: 0.0,
+        cb_turn: 0.0,
+        seek_idle: 0.0,
+        lead_adapt: 0.0,
+        dodge_after: 9.0,
+        reload_laser: 1.0,
+        ..no_practice_map()
+    };
     let (h, _) = practice_scene(world, nav, p);
     eprintln!("practice scene hash {h:#018x}");
     assert_eq!(h, PRACTICE_HASH, "actions differ from the build without the free-for-all side");

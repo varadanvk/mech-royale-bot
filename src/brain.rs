@@ -446,6 +446,28 @@ pub struct Params {
     pub cb_known: f32,
     pub cb_corner: f32,
     pub cb_turn: f32,
+    /// Speed of the sideways strafe across the target when the fight position is held (fraction of walking speed).
+    pub fp_strafe: f32,
+    /// Target choice: metres of preference for an enemy holding a laser, counted twice while it charges at us (0 = off).
+    pub focus_laser: f32,
+    /// Limit on what the keep-enemies-in-front terms may add to or take from a fight position (0 = no limit).
+    pub pin_cap: f32,
+    /// With nothing else to do and healthy, walk toward the nearest enemy in view, remembered or believed within this distance (0 = off).
+    pub seek: f32,
+    /// Seek only above this HP fraction.
+    pub seek_hp: f32,
+    /// An enemy we are walking toward is taken on once it is within this distance.
+    pub seek_fire: f32,
+    /// Seek only from this match time, or earlier once the second weapon slot is filled.
+    pub seek_t: f32,
+    /// With a target within this distance, fight it before walking on to a weapon pickup more than 20 m away (0 = off).
+    pub arm_yield: f32,
+    /// Gun lead learned per enemy (0 = off): every look at an enemy is checked later as a shot led by none, a third, two thirds or all of its speed, and the lead that would have hit most often lately is used once it is clearly ahead of the usual one.
+    pub lead_adapt: f32,
+    /// Outside a free-for-all: after a kill, or after 3 s idle at 70% health or more, with no enemy in view, walk toward the nearest enemy we know of until one is in view (0 = off).
+    pub seek_idle: f32,
+    /// Share of an enemy's speed across our line of sight that its predicted motion keeps (its speed toward or away from us is kept whole): a side-to-side dodge reverses within the second, so less than 1 guesses closer two seconds out.
+    pub pred_tan: f32,
 }
 
 impl Default for Params {
@@ -463,7 +485,7 @@ impl Default for Params {
             strafe_min: 0.3,
             strafe_max: 0.6,
             strafe_alt: 1.0,
-            dodge_after: 9.0,
+            dodge_after: 0.6,
             evade_weight: 0.8,
             focus_hp: 120.0,
             kite: 1.0,
@@ -533,7 +555,7 @@ impl Default for Params {
             laser_finish: 1.0,
             laser_lead: 0.0,
             reload_early: 0.0,
-            reload_laser: 1.0,
+            reload_laser: 0.0,
             retreat_mode: 0.0,
             break_crowd: 0.0,
             break_laser: 1000.0,
@@ -651,6 +673,17 @@ impl Default for Params {
             cb_known: 1.0,
             cb_corner: 1.0,
             cb_turn: 1.0,
+            fp_strafe: 0.5,
+            focus_laser: 0.0,
+            pin_cap: 0.0,
+            seek: 0.0,
+            seek_hp: 0.8,
+            seek_fire: 90.0,
+            seek_t: 0.0,
+            arm_yield: 0.0,
+            lead_adapt: 1.0,
+            seek_idle: 1.0,
+            pred_tan: 1.0,
         }
     }
 }
@@ -875,6 +908,17 @@ impl Params {
         p.cb_known = g("cb_known", p.cb_known);
         p.cb_corner = g("cb_corner", p.cb_corner);
         p.cb_turn = g("cb_turn", p.cb_turn);
+        p.fp_strafe = g("fp_strafe", p.fp_strafe);
+        p.focus_laser = g("focus_laser", p.focus_laser);
+        p.pin_cap = g("pin_cap", p.pin_cap);
+        p.seek = g("seek", p.seek);
+        p.seek_hp = g("seek_hp", p.seek_hp);
+        p.seek_fire = g("seek_fire", p.seek_fire);
+        p.seek_t = g("seek_t", p.seek_t);
+        p.arm_yield = g("arm_yield", p.arm_yield);
+        p.lead_adapt = g("lead_adapt", p.lead_adapt);
+        p.seek_idle = g("seek_idle", p.seek_idle);
+        p.pred_tan = g("pred_tan", p.pred_tan);
         p
     }
 
@@ -1015,7 +1059,67 @@ impl Kin {
     }
 }
 
+/// Leads tried for each enemy (fractions of its speed), the usual one last.
+const LEADS: [f32; 4] = [0.0, 0.3, 0.6, 0.9];
+
+/// How shots at one enemy would have done with each lead in `LEADS`.
+#[derive(Default)]
+pub(crate) struct LeadStat {
+    /// Looks waiting to be checked: when the shot would land, where the enemy was, how far it would be led at full lead,
+    /// and the sideways direction of the shot.
+    pending: VecDeque<(f32, [f32; 2], [f32; 2], [f32; 2])>,
+    /// Running share of hits per lead.
+    ema: [f32; 4],
+    n: u32,
+}
+
+impl LeadStat {
+    /// Note a look at the enemy at time `t`: a shot from `from` landing `tt` seconds later.
+    pub(crate) fn look(&mut self, t: f32, from: [f32; 2], pos: [f32; 2], vel: [f32; 2], tt: f32) {
+        let d = norm2(pos[0] - from[0], pos[1] - from[1]);
+        self.pending.push_back((t + tt, pos, [vel[0] * tt, vel[1] * tt], [-d[1], d[0]]));
+        if self.pending.len() > 16 {
+            self.pending.pop_front();
+        }
+    }
+
+    /// Check the looks that have come due against where the enemy is now (`pos`, moving at `vel`, at time `t`).
+    pub(crate) fn settle(&mut self, t: f32, pos: [f32; 2], vel: [f32; 2], radius: f32) {
+        while self.pending.front().map_or(false, |x| x.0 <= t) {
+            let (due, p0, lead, side) = self.pending.pop_front().unwrap();
+            if t - due > 0.25 {
+                continue;
+            }
+            // Where it was when the shot would have landed.
+            let at = [pos[0] - vel[0] * (t - due), pos[1] - vel[1] * (t - due)];
+            for (k, f) in LEADS.iter().enumerate() {
+                let aim = [p0[0] + lead[0] * f, p0[1] + lead[1] * f];
+                let miss = ((at[0] - aim[0]) * side[0] + (at[1] - aim[1]) * side[1]).abs();
+                let hit = if miss < radius { 1.0 } else { 0.0 };
+                self.ema[k] += 0.04 * (hit - self.ema[k]);
+            }
+            self.n += 1;
+        }
+    }
+
+    /// The lead to use instead of the usual one, once another has clearly done better.
+    pub(crate) fn choice(&self) -> Option<f32> {
+        if self.n < 15 {
+            return None;
+        }
+        let usual = LEADS.len() - 1;
+        let best = (0..usual).max_by(|a, b| self.ema[*a].partial_cmp(&self.ema[*b]).unwrap_or(std::cmp::Ordering::Equal))?;
+        (self.ema[best] > self.ema[usual] + 0.08).then(|| LEADS[best])
+    }
+}
+
 pub struct Brain {
+    /// `seek_idle`: going after the nearest known enemy, and since when we have been idle with no enemy in view.
+    seeking: bool,
+    idle_since: Option<f32>,
+    lead_stats: BTreeMap<u32, LeadStat>,
+    /// The enemy we are walking toward with nothing else to do (`seek`).
+    seek_id: Option<u32>,
     pub world: Option<Arc<World>>,
     pub nav: Option<Nav>,
     pub params: Params,
@@ -1205,6 +1309,10 @@ impl Brain {
             _ => None,
         };
         Brain {
+            seeking: false,
+            idle_since: None,
+            lead_stats: BTreeMap::new(),
+            seek_id: None,
             world,
             nav,
             params,
@@ -1606,7 +1714,8 @@ impl Brain {
                         let dt = (o.t - pt).max(0.05);
                         (t.vel[2] - pv[2]) / dt > -10.0
                     }) || (t.vel[2] > 8.3 && t.vel[2] < 9.5));
-                let lead = if airborne { p.lead_air } else { p.lead_ground };
+                let learned = if p.lead_adapt > 0.0 && !airborne { self.lead_stats.get(&t.id).and_then(|st| st.choice()) } else { None };
+                let lead = if airborne { p.lead_air } else { learned.unwrap_or(p.lead_ground) };
                 let rise = |tt: f32| -> f32 {
                     match floor {
                         None => t.vel[2] * tt * 0.5,
@@ -2049,6 +2158,15 @@ impl Brain {
             if prev_charge.is_some() && !m.charging {
                 self.laser_fired.insert(m.id, o.t);
             }
+            if p.lead_adapt > 0.0 {
+                let st = self.lead_stats.entry(m.id).or_default();
+                let (mp, mvl) = ([m.pos[0], m.pos[1]], [m.vel[0], m.vel[1]]);
+                st.settle(o.t, mp, mvl, 2.5 * (1.0 + 0.05 * m.cubes) * 0.85);
+                let d = d2(&m.pos, &pos);
+                if d < 230.0 {
+                    st.look(o.t, [pos[0], pos[1]], mp, mvl, (d - 3.0).max(0.0) / 252.0 + p.lead_latency);
+                }
+            }
             let prev_vel = self.known.get(&m.id).filter(|k| o.t - k.seen_t < 0.35 && o.t > k.seen_t).map(|k| (k.vel, k.seen_t));
             self.known.insert(
                 m.id,
@@ -2104,6 +2222,7 @@ impl Brain {
                 if let Some(k) = e.target.and_then(|id| self.known.get(&id)) {
                     self.kill_spot = Some((k.pos, o.t));
                 }
+                self.seeking = true;
             }
             if e.kind == "damaged" {
                 if let Some(by) = e.by {
@@ -2134,6 +2253,10 @@ impl Brain {
 
         // --- enemies and target
         let enemies: Vec<&Actor> = o.mechs.iter().filter(|m| m.kind == "mech" && !(m.max_hp > 0.0 && m.hp <= 0.0)).collect();
+        if !enemies.is_empty() {
+            self.seeking = false;
+            self.idle_since = None;
+        }
         let near_enemies = enemies.iter().filter(|m| d2(&m.pos, &pos) < p.crowd_radius).count();
         let no_laser = !me.weapons.iter().flatten().any(|w| w.kind == "laser");
         // With `late_hold`, the late game starts once the next circle is small.
@@ -2181,7 +2304,8 @@ impl Brain {
             for m in &enemies {
                 let aimed = wrap(m.aim[0] - yaw_to(&m.pos, &pos)).abs() < 0.2;
                 let hurt = self.attackers.get(&m.id).map_or(false, |t| o.t - t < 4.0);
-                if aimed || hurt || d2(&m.pos, &pos) < p.counter_range {
+                let sought = p.seek > 0.0 && self.seek_id == Some(m.id) && d2(&m.pos, &pos) < p.seek_fire;
+                if aimed || hurt || sought || d2(&m.pos, &pos) < p.counter_range {
                     self.hunters.insert(m.id, o.t);
                 }
             }
@@ -2192,7 +2316,7 @@ impl Brain {
         let cands: Vec<&Actor> = enemies
             .iter()
             .filter(|m| !counter || self.hunters.get(&m.id).map_or(false, |t| o.t - t < 4.0))
-            .filter(|m| !(hold_late || filter_early) || self.engage_ok(o, m, hold_late))
+            .filter(|m| !(hold_late || filter_early) || self.engage_ok(o, m, hold_late) || (p.seek > 0.0 && !late && self.seek_id == Some(m.id) && d2(&m.pos, &pos) < p.seek_fire))
             .filter(|m| !ffa_on || self.ffa_engage(o, m, hp_frac))
             .copied()
             .collect();
@@ -2749,7 +2873,10 @@ impl Brain {
             mv = m;
             boost = b;
             label = l;
-        } else if let Some(g) = arm_goal.filter(|_| !(p.stand_first > 0.0 && stand_from.is_some())) {
+        } else if let Some(g) = arm_goal
+            .filter(|_| !(p.stand_first > 0.0 && stand_from.is_some()))
+            .filter(|g| !(p.arm_yield > 0.0 && d2(g, &pos) > 20.0 && target.map_or(false, |t| d2(&t.pos, &pos) < p.arm_yield)))
+        {
             label = "arm";
             mv = self.go(&pos, [g[0], g[1]]);
             boost = me.energy > 30.0 && d2(&g, &pos) > 12.0;
@@ -3108,6 +3235,69 @@ impl Brain {
                     self.scan(&mut a);
                 }
             }
+            if p.seek_idle > 0.0 && !ffa_on && enemies.is_empty() {
+                if label == "idle" {
+                    let since = *self.idle_since.get_or_insert(o.t);
+                    let go_now = self.seeking || (o.t - since >= 3.0 && hp_frac >= 0.7);
+                    if go_now && !self.healing && !must_rotate {
+                        // Nearest enemy we believe in, else the nearest remembered one.
+                        let near = |a: &[f32; 2], b: &[f32; 2]| d2(a, &pos).partial_cmp(&d2(b, &pos)).unwrap_or(std::cmp::Ordering::Equal);
+                        let goal = self
+                            .beliefs
+                            .iter()
+                            .filter(|b| b.conf > 0.1)
+                            .map(|b| b.pos)
+                            .min_by(near)
+                            .or_else(|| self.known.values().map(|k| [k.pos[0], k.pos[1]]).min_by(near))
+                            .filter(|g| d2(g, &z.center) < z.radius - 10.0);
+                        if let Some(g) = goal {
+                            label = "seek";
+                            mv = self.go(&pos, g);
+                            a.aim = [yaw_to(&pos, &g), 0.0];
+                        }
+                    }
+                } else {
+                    self.idle_since = None;
+                }
+            }
+            let mut sought: Option<u32> = None;
+            let seek_ready = o.t >= p.seek_t || !empty_slot;
+            if p.seek > 0.0 && label == "idle" && seek_ready && !late && hp_frac > p.seek_hp && !self.healing && !must_rotate {
+                let inz = |q: &[f32]| d2(q, &z.center) < z.radius - 10.0 && (o.t < z.shrink_start - 20.0 || d2(q, &z.next_center) < z.next_radius);
+                // Nearest of: enemies in view, those seen lately, and those believed to be about.
+                let mut best: Option<(f32, [f32; 2], Option<u32>)> = None;
+                for m in &enemies {
+                    let d = d2(&m.pos, &pos);
+                    if d < p.seek && inz(&m.pos) && best.map_or(true, |b| d < b.0) {
+                        best = Some((d, [m.pos[0], m.pos[1]], Some(m.id)));
+                    }
+                }
+                if best.is_none() {
+                    for (id, k) in self.known.iter() {
+                        let d = d2(&k.pos, &pos) + 5.0 * (o.t - k.seen_t);
+                        if d < p.seek && inz(&k.pos) && best.map_or(true, |b| d < b.0) {
+                            best = Some((d, [k.pos[0], k.pos[1]], Some(*id)));
+                        }
+                    }
+                    for b in self.beliefs.iter().filter(|b| b.conf >= 0.4 && !b.listed) {
+                        let d = d2(&b.pos, &pos) + b.r * 0.5 + 20.0;
+                        if d < p.seek && inz(&b.pos) && best.map_or(true, |x| d < x.0) {
+                            best = Some((d, b.pos, b.id));
+                        }
+                    }
+                }
+                if let Some((_, g, id)) = best {
+                    if d2(&g, &pos) > 8.0 {
+                        label = "seek";
+                        mv = self.go(&pos, g);
+                        sought = id;
+                        if enemies.is_empty() {
+                            a.aim = [yaw_to(&pos, &g), 0.0];
+                        }
+                    }
+                }
+            }
+            self.seek_id = sought;
             let armed = p.hunt_any > 0.0 || me.weapons.iter().flatten().any(|w| w.kind == "laser");
             if label == "idle" && p.hunt > 0.0 && armed && hp_frac > p.hunt_hp && !self.healing && !must_rotate {
                 let seen = self
@@ -4308,5 +4498,96 @@ mod tests {
         // The map uses of the practice picture are off by default.
         let d = Params::default();
         assert_eq!((d.map_preaim, d.map_expose, d.map_crowd, d.map_reinf), (0.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn a_dithering_enemy_is_led_less_and_a_steady_one_as_usual() {
+        // Steady walk across our line: the usual lead keeps hitting.
+        let mut st = LeadStat::default();
+        for i in 0..60 {
+            let t = i as f32 * 0.1;
+            let (p, v) = ([100.0, 8.0 * t], [0.0, 8.0]);
+            st.settle(t, p, v, 2.1);
+            st.look(t, [0.0, 0.0], p, v, 0.4);
+        }
+        assert_eq!(st.choice(), None);
+        // Reversing every 0.4 s: where it is now beats where its speed points.
+        let mut st = LeadStat::default();
+        let mut y = 0.0f32;
+        for i in 0..80 {
+            let t = i as f32 * 0.1;
+            let vy = if (i / 4) % 2 == 0 { 8.0 } else { -8.0 };
+            st.settle(t, [100.0, y], [0.0, vy], 2.1);
+            st.look(t, [0.0, 0.0], [100.0, y], [0.0, vy], 0.4);
+            y += vy * 0.1;
+        }
+        assert!(st.choice().map_or(false, |l| l < 0.8), "{:?} {:?}", st.choice(), st.ema);
+    }
+
+    #[test]
+    fn with_nothing_to_do_and_healthy_we_walk_to_an_enemy_and_take_it_on() {
+        let far = r#"{"id": 3, "kind": "mech", "pos": [150, 0, 0], "aim": [0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let near = r#"{"id": 3, "kind": "mech", "pos": [80, 0, 0], "aim": [0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let on = Params { seek: 300.0, engage_filter: 1.0, ..base() };
+        let mut b = with(on.clone());
+        let a = b.decide(&obs(far, ""), [0.0; 3]);
+        assert_eq!((b.label, b.focus, b.seek_id), ("seek", None, Some(3)));
+        assert!(a.mv[0] > 0.5, "{:?}", a.mv);
+        // Once it is within `seek_fire` it is a target although it is not coming for us.
+        b.decide(&obs(near, ""), [0.0; 3]);
+        assert_eq!(b.focus, Some(3));
+        // Off, or hurt: left alone.
+        let mut b = with(Params { seek: 0.0, ..on.clone() });
+        b.decide(&obs(far, ""), [0.0; 3]);
+        b.decide(&obs(near, ""), [0.0; 3]);
+        assert_eq!((b.focus, b.seek_id), (None, None));
+        let mut b = with(on);
+        let mut o = obs(far, "");
+        o.me.hp = 700.0;
+        b.decide(&o, [0.0; 3]);
+        assert_eq!(b.seek_id, None);
+    }
+
+    #[test]
+    fn of_two_like_targets_the_laser_holder_comes_first() {
+        let two = r#"{"id": 3, "kind": "mech", "pos": [40, 0, 0], "aim": [3.14, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]},
+                     {"id": 4, "kind": "mech", "pos": [0, 45, 0], "aim": [-1.57, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun", "laser"]}"#;
+        let mut b = with(Params { engage_filter: 1.0, focus_laser: 50.0, ..base() });
+        b.decide(&obs(two, ""), [0.0; 3]);
+        assert_eq!(b.focus, Some(4));
+        let mut b = with(Params { engage_filter: 1.0, ..base() });
+        b.decide(&obs(two, ""), [0.0; 3]);
+        assert_eq!(b.focus, Some(3));
+    }
+
+    #[test]
+    fn idle_goes_after_the_nearest_known_enemy() {
+        let away = r#"{"id": 3, "kind": "mech", "pos": [100, 0, 0], "aim": [0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        for (on, want) in [(1.0, true), (0.0, false)] {
+            let mut b = with(Params { seek_idle: on, ..base() });
+            let mut o = obs(away, "");
+            b.decide(&o, [0.0; 3]);
+            o.mechs.clear();
+            o.t = 5.5;
+            b.decide(&o, [0.0; 3]);
+            o.t = 9.0;
+            let a = b.decide(&o, [0.0; 3]);
+            assert_eq!(b.label == "seek", want, "label {}", b.label);
+            if want {
+                assert!(a.mv[0] > 0.5, "mv {:?}", a.mv);
+            }
+        }
+    }
+
+    #[test]
+    fn predicted_motion_keeps_less_of_a_sideways_dodge() {
+        // An enemy ahead of us moving 6 m/s toward us and 8 m/s across.
+        let m = mech(3, [60.0, 0.0], [-6.0, 8.0], 3.14);
+        let o = obs(&m, "");
+        let b = with(Params { pred_tan: 0.5, ..base() });
+        let v = b.pred_vel(&o.mechs[0], [0.0, 0.0]);
+        assert!((v[0] + 6.0).abs() < 1e-3 && (v[1] - 4.0).abs() < 1e-3, "{:?}", v);
+        let b = with(base());
+        assert_eq!(b.pred_vel(&o.mechs[0], [0.0, 0.0]), [-6.0, 8.0]);
     }
 }

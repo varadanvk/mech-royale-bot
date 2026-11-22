@@ -16,8 +16,14 @@ fn load() -> Option<(Arc<World>, Nav)> {
     Some((Arc::new(world), nav))
 }
 
+/// The defaults with break-off to hidden ground at any distance and the later additions off: the scenes
+/// below are about where a break-off goes.
+fn earlier() -> Params {
+    Params { seek_idle: 0.0, lead_adapt: 0.0, dodge_after: 9.0, reload_laser: 1.0, ..Params::default() }
+}
+
 fn off() -> Params {
-    Params { cb_away: 0.0, cb_path: 0.0, cb_known: 0.0, cb_corner: 0.0, cb_turn: 0.0, ..Params::default() }
+    Params { cb_away: 0.0, cb_path: 0.0, cb_known: 0.0, cb_corner: 0.0, cb_turn: 0.0, ..earlier() }
 }
 
 fn d2(a: [f32; 2], b: [f32; 2]) -> f32 {
@@ -91,7 +97,7 @@ fn check_away(world: Arc<World>, nav: Nav, sh: [f32; 2]) -> f32 {
         dir[0] * to7[0] + dir[1] * to7[1]
     };
     let (before, _) = crowd_scene_at(world.clone(), nav.clone(), off(), sh);
-    let (goal, acts) = crowd_scene_at(world, nav, Params::default(), sh);
+    let (goal, acts) = crowd_scene_at(world, nav, earlier(), sh);
     eprintln!("moved {sh:?}: goal without the switches {before:?}, now {goal:?} ({} break-off decisions)", acts.len());
     let g = goal.expect("a goal away from the enemies exists here");
     let cen = [(253.1 + 212.8 + 164.7 + 168.6 + 164.3) / 5.0 + sh[0], (35.3 - 46.2 + 28.6 - 41.2 - 45.4) / 5.0 + sh[1]];
@@ -115,7 +121,7 @@ fn no_way_out_means_no_break_off() {
     let Some((world, nav)) = load() else { return };
     // Enemies close on every side: nowhere away from all of them.
     let hello: Hello = serde_json::from_str(r#"{"type":"hello","slot":0,"seed":911,"map":{"dir":""},"config":{}}"#).unwrap();
-    let mut b = Brain::with_params(&hello, Some(world), Some(nav.clone()), Params::default());
+    let mut b = Brain::with_params(&hello, Some(world), Some(nav.clone()), earlier());
     let mut me = [280.17f32, 68.85, 4.84];
     let foes: Vec<(u32, [f32; 3], f32)> = (0..6)
         .map(|i| {
@@ -193,7 +199,7 @@ const CROWD_HASH: u64 = 0x1e21c7d7a3d73ddf;
 fn switches_off_play_as_before() {
     let Some((world, nav)) = load() else { return };
     let h = scene_hash(world.clone(), nav.clone(), off());
-    eprintln!("crowd scene hash (switches off) {h:#018x}, on {:#018x}", scene_hash(world, nav, Params::default()));
+    eprintln!("crowd scene hash (switches off) {h:#018x}, on {:#018x}", scene_hash(world, nav, earlier()));
     assert_eq!(h, CROWD_HASH, "actions differ from the build without the break-off goal choice");
 }
 
@@ -216,7 +222,7 @@ fn scan() {
             let to7 = [(e7[0] - me[0]) / d2(e7, me), (e7[1] - me[1]) / d2(e7, me)];
             let dir = [(g0[0] - me[0]) / d2(g0, me).max(1e-3), (g0[1] - me[1]) / d2(g0, me).max(1e-3)];
             if d2(g0, me) > 3.0 && dir[0] * to7[0] + dir[1] * to7[1] > 0.5 {
-                let (g1, _) = crowd_scene_at(world.clone(), nav.clone(), Params::default(), sh);
+                let (g1, _) = crowd_scene_at(world.clone(), nav.clone(), earlier(), sh);
                 eprintln!("off {sh:?}: before {g0:?} now {g1:?}");
             }
         }
