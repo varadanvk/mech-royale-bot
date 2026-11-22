@@ -400,7 +400,7 @@ impl Default for Params {
             hunt_any: 0.0,
             solo_hp: 0.0,
             close_boost: 30.0,
-            ring: 0.0,
+            ring: 1.0,
             counter: 0.0,
             counter_range: 60.0,
         }
