@@ -492,7 +492,7 @@ impl Default for Params {
             close_boost: 30.0,
             drone_fight: 0.0,
             hold_fight: 1.0,
-            threat_face: 1.0,
+            threat_face: 0.0,
             ltg_space: 1.0,
             laser_hold: 0.0,
             drone_threat: 0.0,
@@ -3511,7 +3511,7 @@ mod tests {
         let mut o = obs("", hit);
         o.mechs.clear();
         o.cubes = vec![crate::proto::Item { id: 5000, pos: [20.0, -30.0, 0.0], ..Default::default() }];
-        let mut b = brain();
+        let mut b = with(Params { threat_face: 1.0, ..base() });
         let a = b.decide(&o, [0.0; 3]);
         assert!(b.label != "loot", "looting while under fire");
         assert!((a.aim[0] - 1.5708).abs() < 0.05, "aim {:?}", a.aim);
