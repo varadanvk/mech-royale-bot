@@ -419,7 +419,7 @@ impl Default for Params {
             hold_fight: 1.0,
             threat_face: 1.0,
             ltg_space: 1.0,
-            laser_hold: 0.0,
+            laser_hold: 1.0,
             drone_threat: 0.0,
             focus_aimer: 0.0,
             arm_crates: 0.0,
