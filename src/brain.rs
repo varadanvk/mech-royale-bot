@@ -877,6 +877,10 @@ impl Kin {
 }
 
 pub struct Brain {
+    /// Learned decision layer and the tuned thresholds it shifts each decision.
+    net: Option<Arc<crate::net::Net>>,
+    base_params: Params,
+    net_prev_hp: f32,
     pub world: Option<Arc<World>>,
     pub nav: Option<Nav>,
     pub params: Params,
@@ -1055,6 +1059,9 @@ impl Brain {
             _ => None,
         };
         Brain {
+            net: crate::net::Net::builtin().map(Arc::new),
+            base_params: params.clone(),
+            net_prev_hp: -1.0,
             world,
             nav,
             params,
@@ -1749,10 +1756,27 @@ impl Brain {
         best.0
     }
 
+    /// Replace the learned decision layer (None = tuned thresholds only).
+    pub fn set_net(&mut self, net: Option<crate::net::Net>) {
+        self.net = net.map(Arc::new);
+        self.params = self.base_params.clone();
+    }
+
     pub fn act(&mut self, o: &Obs) -> Action {
         let t0 = self.trace_ffa.then(std::time::Instant::now);
         if self.params.ffa_detect > 0.0 {
             self.ffa_observe(o);
+        }
+        if let Some(net) = self.net.clone() {
+            let hp = if o.me.max_hp > 0.0 { o.me.hp / o.me.max_hp } else { 1.0 };
+            let drop = if self.net_prev_hp >= 0.0 { (self.net_prev_hp - hp).max(0.0) } else { 0.0 };
+            self.net_prev_hp = hp;
+            let x = crate::net::features(o, drop, self.ffa_latched());
+            let mut y = [0.0f32; crate::net::N_OUT];
+            net.forward(&x, &mut y);
+            let mut p = self.base_params.clone();
+            crate::net::apply(&mut p, &y);
+            self.params = p;
         }
         let raw = o.me.pos;
         let mut kin = self.kin;

@@ -5,6 +5,7 @@ pub mod brain;
 pub mod contacts;
 pub mod detect;
 pub mod nav;
+pub mod net;
 pub mod proto;
 pub mod sight;
 pub mod world;
