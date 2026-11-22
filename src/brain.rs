@@ -490,6 +490,12 @@ pub struct Params {
     pub stay_fight: f32,
     /// See stay_fight.
     pub stay_cover: f32,
+    /// Outside a free-for-all, with no enemy in view, hide to heal below heal_lo (0 = keep going instead).
+    pub heal_hide: f32,
+    /// seek_idle: start after this many seconds idle with no enemy in view.
+    pub idle_wait: f32,
+    /// seek_idle: start only at this HP fraction or more.
+    pub idle_hp: f32,
 }
 
 impl Default for Params {
@@ -717,6 +723,9 @@ impl Default for Params {
             ffa_plain: 1.0,
             stay_fight: 1.0,
             stay_cover: 15.0,
+            heal_hide: 0.0,
+            idle_wait: 3.0,
+            idle_hp: 0.0,
         }
     }
 }
@@ -963,6 +972,9 @@ impl Params {
         p.ffa_plain = g("ffa_plain", p.ffa_plain);
         p.stay_fight = g("stay_fight", p.stay_fight);
         p.stay_cover = g("stay_cover", p.stay_cover);
+        p.heal_hide = g("heal_hide", p.heal_hide);
+        p.idle_wait = g("idle_wait", p.idle_wait);
+        p.idle_hp = g("idle_hp", p.idle_hp);
         p
     }
 
@@ -2634,7 +2646,7 @@ impl Brain {
             self.fleeing = false;
         }
         let crowded = near_enemies >= p.crowd_count && !finishing && p.crowd_retreat <= 0.0;
-        if p.heal_lo > 0.0 && enemies.is_empty() && hp_frac < p.heal_lo && o.t - self.last_mech_hurt_t > 1.0 {
+        if p.heal_lo > 0.0 && (ffa_on || p.heal_hide > 0.0) && enemies.is_empty() && hp_frac < p.heal_lo && o.t - self.last_mech_hurt_t > 1.0 {
             self.healing = true;
         }
         if hp_frac >= p.heal_hi || p.heal_lo <= 0.0 {
@@ -3321,7 +3333,7 @@ impl Brain {
             if p.seek_idle > 0.0 && !ffa_on && enemies.is_empty() {
                 if label == "idle" {
                     let since = *self.idle_since.get_or_insert(o.t);
-                    let go_now = self.seeking || (o.t - since >= 3.0 && hp_frac >= 0.7);
+                    let go_now = self.seeking || (o.t - since >= p.idle_wait && hp_frac >= p.idle_hp);
                     if go_now && !self.healing && !must_rotate {
                         // Nearest enemy we believe in, else the nearest remembered one.
                         let near = |a: &[f32; 2], b: &[f32; 2]| d2(a, &pos).partial_cmp(&d2(b, &pos)).unwrap_or(std::cmp::Ordering::Equal);
