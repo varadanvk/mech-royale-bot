@@ -497,7 +497,7 @@ impl Default for Params {
             home_speed: 4.6,
             engage_filter: 0.0,
             laser_fix: 0.0,
-            fight_cubes: 0.0,
+            fight_cubes: 1.0,
             fight_cube_r: 70.0,
         }
     }
