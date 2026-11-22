@@ -499,6 +499,10 @@ pub struct Params {
     pub stay_fight: f32,
     /// See stay_fight.
     pub stay_cover: f32,
+    /// Before this time (s) into a match, seek_idle and stay_fight stay off: the match may still turn out to be a free-for-all (0 = no wait).
+    pub sure_t: f32,
+    /// Free-for-all clues (detector points) that turn seek_idle and stay_fight off before the match is settled (0 = never).
+    pub sure_clue: f32,
 }
 
 impl Default for Params {
@@ -728,6 +732,8 @@ impl Default for Params {
             ffa_plain: 1.0,
             stay_fight: 2.0,
             stay_cover: 0.0,
+            sure_t: 0.0,
+            sure_clue: 1.0,
         }
     }
 }
@@ -976,6 +982,8 @@ impl Params {
         p.ffa_plain = g("ffa_plain", p.ffa_plain);
         p.stay_fight = g("stay_fight", p.stay_fight);
         p.stay_cover = g("stay_cover", p.stay_cover);
+        p.sure_t = g("sure_t", p.sure_t);
+        p.sure_clue = g("sure_clue", p.sure_clue);
         p
     }
 
@@ -2416,6 +2424,10 @@ impl Brain {
         // In a free-for-all placing counts for more than kills: the earlier, more careful settings (`ffa_plain`).
         let (cr_max_d, cr_laser, cr_strafe, reload_laser, dodge_after) =
             if ffa_on && p.ffa_plain > 0.0 { (0.0, 0.0, 0.0, 1.0, 9.0) } else { (p.cr_max_d, p.cr_laser, p.cr_strafe, p.reload_laser, p.dodge_after) };
+        // Going after enemies and staying in fights only once the match looks like practice: not in its first
+        // seconds, and not after clues of other mechs fighting each other (`sure_t`, `sure_clue`).
+        let unsure = o.t < p.sure_t || (p.sure_clue > 0.0 && self.detector.total() >= p.sure_clue - 1e-3);
+        let practice_play = !ffa_on && !unsure;
         let cands: Vec<&Actor> = enemies
             .iter()
             .filter(|m| !counter || self.hunters.get(&m.id).map_or(false, |t| o.t - t < 4.0))
@@ -2697,7 +2709,7 @@ impl Brain {
             self.healing = false;
         }
         // Stay in a live fight rather than break off (`stay_fight`).
-        let stay = p.stay_fight > 0.0 && !ffa_on && target.is_some() && (engaged || recently_hurt_by_mech);
+        let stay = p.stay_fight > 0.0 && practice_play && target.is_some() && (engaged || recently_hurt_by_mech);
         if stay {
             self.fleeing = false;
             self.healing = false;
@@ -2923,7 +2935,7 @@ impl Brain {
                 cb_all = all;
             }
         }
-        let stay_all = p.stay_fight >= 2.0 && !ffa_on;
+        let stay_all = p.stay_fight >= 2.0 && practice_play;
         if (stay || stay_all) && (cr_goal.is_some() || cb_cornered) && (stay_all || cr_goal.map_or(true, |g| d2(&g, &pos) > p.stay_cover)) {
             cr_goal = None;
             cb_cornered = false;
@@ -3375,7 +3387,7 @@ impl Brain {
                     self.scan(&mut a);
                 }
             }
-            if p.seek_idle > 0.0 && !ffa_on && enemies.is_empty() {
+            if p.seek_idle > 0.0 && practice_play && enemies.is_empty() {
                 if label == "idle" {
                     let since = *self.idle_since.get_or_insert(o.t);
                     let go_now = self.seeking || (o.t - since >= 3.0 && hp_frac >= 0.7);
