@@ -60,7 +60,7 @@ impl Brain {
         let d = d2(&m.pos, &pos);
         let hurt_s = |s: f32| self.attackers.get(&m.id).map_or(false, |t| o.t - t < s);
         if late {
-            o.alive <= 3
+            o.alive <= if self.params.ext_late > 0.0 { 2 } else { 3 }
                 || d < 60.0
                 || hurt_s(4.0)
                 || (m.charging && aimed_at(m, &pos) && d < 120.0)
@@ -68,23 +68,32 @@ impl Brain {
         } else {
             let to_me = norm2(pos[0] - m.pos[0], pos[1] - m.pos[1]);
             let closing = m.vel[0] * to_me[0] + m.vel[1] * to_me[1];
-            d < 60.0 || hurt_s(6.0) || (closing > 3.0 && d < 180.0) || (hp_frac(m) < 0.4 && d < 160.0) || (aimed_at(m, &pos) && d < 190.0)
+            (self.params.ext_target > 0.0 && o.alive <= 3) || d < 60.0 || hurt_s(6.0) || (closing > 3.0 && d < 180.0) || (hp_frac(m) < 0.4 && d < 160.0) || (aimed_at(m, &pos) && d < 190.0)
         }
     }
 
     /// Target score for `engage_filter` (lower is better): distance plus 0.18 per HP point, much lower for a
-    /// nearly dead mech and for the one we have been hitting, a little lower for a recent attacker.
+    /// nearly dead mech and for the current target (held 2 s at a time, or while we keep hitting it), a little
+    /// lower for a recent attacker and for a mech closing on us.
     pub(super) fn engage_score(&self, o: &Obs, m: &Actor) -> f32 {
         let d = d2(&m.pos, &o.me.pos);
         let mut s = d + 0.18 * hp_abs(m);
         if hp_frac(m) < 0.3 {
             s -= 200.0;
         }
-        if self.focus == Some(m.id) && self.hit_t.get(&m.id).map_or(false, |t| o.t - t < 2.0) {
+        let ext = self.params.ext_target > 0.0;
+        let held = ext && o.t - self.focus_t < 2.0;
+        if self.focus == Some(m.id) && (held || self.hit_t.get(&m.id).map_or(false, |t| o.t - t < 2.0)) {
             s -= 200.0;
         }
-        if self.attackers.get(&m.id).map_or(false, |t| o.t - t < 6.0) {
+        if self.attackers.get(&m.id).map_or(false, |t| o.t - t < if ext { 4.0 } else { 6.0 }) {
             s -= 40.0;
+        }
+        if ext {
+            let to_me = norm2(o.me.pos[0] - m.pos[0], o.me.pos[1] - m.pos[1]);
+            if m.vel[0] * to_me[0] + m.vel[1] * to_me[1] > 1.0 {
+                s -= 15.0;
+            }
         }
         s
     }
@@ -115,7 +124,18 @@ impl Brain {
         let mut frontier = vec![start];
         let mut checks = 0;
         let max_steps = self.params.cr_steps.max(1.0) as usize;
-        for _ in 0..max_steps {
+        // With `ext_lose`: cost = 2 per step + a zone penalty - 0.25 per metre from the nearest enemy (up to
+        // 80 m), searched until no further cell could beat the best found, over at most 350 cells.
+        let weighed = self.params.ext_lose > 0.0;
+        let mut best_cost: Option<([f32; 2], f32)> = None;
+        for step in 0..max_steps {
+            if weighed {
+                if let Some(b) = best_cost {
+                    if 2.0 * (step + 1) as f32 - 20.0 >= b.1 {
+                        return Some(b.0);
+                    }
+                }
+            }
             let mut next = Vec::new();
             for &c in &frontier {
                 for n in nav.neighbors(c) {
@@ -145,10 +165,20 @@ impl Brain {
                     }
                 }
                 checks += 1;
-                if checks > 600 {
-                    return best.map(|b| b.0);
+                if checks > if weighed { 350 } else { 600 } {
+                    return if weighed { best_cost.map(|b| b.0) } else { best.map(|b| b.0) };
                 }
                 let qz = self.ground(q[0], q[1], pos[2]);
+                if weighed {
+                    if self.hidden_at(q, qz, &eyes) {
+                        let out_next = (d2(&q, &z.next_center) - z.next_radius).max(0.0);
+                        let cost = 2.0 * (step + 1) as f32 + 0.5 * out_next.min(40.0) - 0.25 * near.min(80.0);
+                        if best_cost.map_or(true, |b| cost < b.1) {
+                            best_cost = Some((q, cost));
+                        }
+                    }
+                    continue;
+                }
                 if self.hidden_at(q, qz, &eyes) {
                     // Among cells at the same step count, prefer the one furthest from the enemies.
                     if best.map_or(true, |b| near > b.1) {
@@ -161,13 +191,13 @@ impl Brain {
             }
             frontier = next;
         }
-        None
+        best_cost.map(|b| b.0)
     }
 
     /// Move toward the best of: staying put, or one of 16 points 6 m away. Score: closeness to the preferred
     /// distance, little movement, a line to the target while a weapon is ready, few other enemies within
     /// 170 m with a line to it, and distance kept from lightning and mortar holders. When staying put wins, strafe
-    /// slowly across the target, reversing every 3 to 5 s.
+    /// slowly across the target, reversing every 3 to 5 s (with `ext_fpos`: every `fp_flip_lo`..`fp_flip_hi` s).
     pub(super) fn fight_pos_move(&mut self, o: &Obs, t: &Actor, pref: f32, ready: bool) -> [f32; 2] {
         let pos = o.me.pos;
         let p = &self.params;
@@ -178,6 +208,16 @@ impl Brain {
             .iter()
             .filter(|m| m.kind == "mech" && m.id != t.id && !(m.max_hp > 0.0 && m.hp <= 0.0) && d2(&m.pos, &pos) < 176.0)
             .collect();
+        // Other enemies whose line to a point counts against it: those in sight, and with `ext_fpos` also those
+        // seen in the last 4 s.
+        let mut watchers: Vec<[f32; 3]> = others.iter().map(|m| m.pos).collect();
+        if p.ext_fpos > 0.0 {
+            for (id, k) in self.known.iter() {
+                if *id != t.id && o.t - k.seen_t < 4.0 && o.t - k.seen_t > 0.05 && d2(&k.pos, &pos) < 176.0 && !others.iter().any(|m| m.id == *id) {
+                    watchers.push(k.pos);
+                }
+            }
+        }
         let keep_of = |m: &Actor| -> f32 {
             let mut k = 0.0f32;
             if m.weapons.iter().any(|w| w == "lightning") {
@@ -195,13 +235,13 @@ impl Brain {
             if ready && b.clear([q[0], q[1], qz + muzzle_h], tc) {
                 s += 45.0;
             }
-            for m in &others {
-                if d2(&m.pos, &q) >= 170.0 {
+            for m in &watchers {
+                if d2(m, &q) >= 170.0 {
                     continue;
                 }
                 let sees = match b.sight.as_ref() {
-                    Some(st) if st.cell_at(q[0], q[1]).is_some() => st.visible(q, [m.pos[0], m.pos[1]]),
-                    _ => b.clear([m.pos[0], m.pos[1], m.pos[2] + 8.0], [q[0], q[1], qz + 5.0]),
+                    Some(st) if st.cell_at(q[0], q[1]).is_some() => st.visible(q, [m[0], m[1]]),
+                    _ => b.clear([m[0], m[1], m[2] + 8.0], [q[0], q[1], qz + 5.0]),
                 };
                 if sees {
                     s -= 30.0;
@@ -237,15 +277,16 @@ impl Brain {
             return norm2(best.0[0] - pos[0], best.0[1] - pos[1]);
         }
         // Staying put wins: slow strafe across the line to the target.
+        let (lo, span) = if self.params.ext_fpos > 0.0 { (self.params.fp_flip_lo, (self.params.fp_flip_hi - self.params.fp_flip_lo).max(0.0)) } else { (3.0, 2.0) };
         if o.t >= self.fp_until {
             self.fp_side = -self.fp_side;
-            self.fp_until = o.t + 3.0 + 2.0 * self.rnd();
+            self.fp_until = o.t + lo + span * self.rnd();
         }
         let to = norm2(t.pos[0] - pos[0], t.pos[1] - pos[1]);
         let mut side = [-to[1] * self.fp_side, to[0] * self.fp_side];
         if !self.walkable(pos[0] + side[0] * 5.0, pos[1] + side[1] * 5.0) {
             self.fp_side = -self.fp_side;
-            self.fp_until = o.t + 3.0 + 2.0 * self.rnd();
+            self.fp_until = o.t + lo + span * self.rnd();
             side = [-side[0], -side[1]];
             if !self.walkable(pos[0] + side[0] * 5.0, pos[1] + side[1] * 5.0) {
                 return [0.0, 0.0];
@@ -256,11 +297,22 @@ impl Brain {
 
     /// Late-game home: the best of about 40 points within 0.7 of the next circle's radius, scored mainly by how
     /// little ground can see it (mean clear line over 64 directions), then by distance and known enemies near it.
-    /// Re-chosen every `home_s` seconds or when it falls outside the next circle.
+    /// Re-chosen every `home_s` seconds or when it falls outside the next circle; with `ext_late` also after a
+    /// fresh hit or loud sound, preferring points away from its direction.
     pub(super) fn home_spot(&mut self, o: &Obs) -> [f32; 2] {
         let pos = o.me.pos;
         let z = &o.zone;
-        let keep = self.home.filter(|(h, t0)| o.t - t0 < self.params.home_s && self.in_next(o, h, 10.0));
+        let ext = self.params.ext_late > 0.0;
+        // A fresh hit or loud sound since the spot was chosen: choose again, away from it.
+        let alert = if ext { self.alert_bearing(o) } else { None };
+        let alert_new = ext
+            && alert.is_some()
+            && self.home.map_or(false, |(_, t0)| {
+                let ht = self.hit_bearing.map_or(-1.0, |h| h.1);
+                let st = self.sound_bearing.map_or(-1.0, |h| h.1);
+                ht.max(st) > t0
+            });
+        let keep = self.home.filter(|(h, t0)| o.t - t0 < self.params.home_s && self.in_next(o, h, 10.0) && !alert_new);
         if let Some((h, _)) = keep {
             return h;
         }
@@ -289,8 +341,16 @@ impl Brain {
                 },
                 None => 100.0,
             };
-            let crowd: f32 = foes.iter().map(|f| (1.0 - d2(f, &q) / 120.0).max(0.0)).sum();
-            let s = expo + 0.12 * d2(&q, &pos) + 25.0 * crowd - if Some(q) == old { 5.0 } else { 0.0 };
+            let cr = if ext { self.params.late_crowd_r } else { 120.0 };
+            let crowd: f32 = foes.iter().map(|f| (1.0 - d2(f, &q) / cr).max(0.0)).sum();
+            let mut s = expo + 0.12 * d2(&q, &pos) + 25.0 * crowd - if Some(q) == old { 5.0 } else { 0.0 };
+            if let Some(b) = alert {
+                let dq = d2(&q, &pos);
+                if dq > 3.0 {
+                    let toward = ((q[0] - pos[0]) * b.cos() + (q[1] - pos[1]) * b.sin()) / dq;
+                    s += 30.0 * toward.max(0.0);
+                }
+            }
             if best.map_or(true, |b| s < b.1) {
                 best = Some((q, s));
             }
@@ -333,7 +393,7 @@ impl Brain {
                 continue;
             }
             let tc = -(r[0] * v[0] + r[1] * v[1]) / vv;
-            if !(0.0..=0.8).contains(&tc) {
+            if !(0.0..=self.params.dodge_look).contains(&tc) {
                 continue;
             }
             let miss = ((r[0] + v[0] * tc).powi(2) + (r[1] + v[1] * tc).powi(2)).sqrt();
@@ -357,7 +417,7 @@ impl Brain {
         }
         let Some(u) = incoming else { return false };
         let z = &o.zone;
-        let dist = 3.6;
+        let dist = self.params.dodge_reach;
         let vel = [me.vel[0], me.vel[1]];
         let tgt = target.map(|t| [t.pos[0], t.pos[1], t.pos[2] + 4.5]);
         let muzzle_h = me.stat("muzzle_height", 7.0);
@@ -396,7 +456,8 @@ impl Brain {
     /// cube or to the halfway point.
     pub(super) fn fight_cube(&self, o: &Obs, t: &Actor) -> Option<[f32; 3]> {
         let pos = o.me.pos;
-        let r = self.params.fight_cube_r;
+        let low = self.params.ext_finish > 0.0 && o.me.max_hp > 0.0 && o.me.hp < 0.5 * o.me.max_hp;
+        let r = if low { self.params.cube_r_low.min(self.params.fight_cube_r) } else { self.params.fight_cube_r };
         let others: Vec<[f32; 3]> =
             self.known.iter().filter(|(id, k)| **id != t.id && o.t - k.seen_t < 4.0).map(|(_, k)| [k.pos[0], k.pos[1], k.pos[2] + 8.0]).collect();
         let mut cubes: Vec<[f32; 3]> = self

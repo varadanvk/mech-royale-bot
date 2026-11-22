@@ -160,7 +160,7 @@ pub struct Params {
     pub arm_rank: f32,
     /// Holding a weaker second weapon: go for a better one within this distance (0 = off).
     pub arm_better: f32,
-    /// Upgrade order: 0 = survival first, 1 = damage first.
+    /// Upgrade order: 0 = survival first, 1 = damage first, 2 = hit points and armour, then laser, then the rest.
     pub upg_dmg: f32,
     /// Holding lightning: outside a rush, the zone or getting unstuck, boost only above this energy (0 = no limit).
     pub arc_save: f32,
@@ -344,6 +344,31 @@ pub struct Params {
     /// Pick up cubes within `fight_cube_r` during a fight when no other enemy watches the way (0 = off).
     pub fight_cubes: f32,
     pub fight_cube_r: f32,
+    /// Retreat rule refinements (0 = off): the low-health clause compares health fractions (target at least
+    /// `lose_margin` healthier), "finishing" means a target within 120 m under 200 HP or under half our HP, and
+    /// the cover search weighs walking steps against distance from the enemies over up to 350 cells.
+    pub ext_lose: f32,
+    pub lose_margin: f32,
+    /// Engagement refinements (0 = off): engage everyone once at most three mechs remain; target score keeps the
+    /// current target for 2 s, favours an attacker of the last 4 s and a mech closing on us.
+    pub ext_target: f32,
+    /// Fight-position refinements (0 = off): count every enemy seen in the last few seconds, strafe reversals
+    /// every `fp_flip_lo`..`fp_flip_hi` seconds, keep `pref_ltg` with lightning.
+    pub ext_fpos: f32,
+    pub fp_flip_lo: f32,
+    pub fp_flip_hi: f32,
+    pub pref_ltg: f32,
+    /// Late-game refinements (0 = off): engage anyone only with one opponent left, crowding counted within
+    /// `late_crowd_r`, and the home spot re-chosen away from the direction of a fresh hit or sound.
+    pub ext_late: f32,
+    pub late_crowd_r: f32,
+    /// Finishing refinements (0 = off): close in on a weak target only while healthy and not crowded; grab cubes
+    /// only within `cube_r_low` when below half health.
+    pub ext_finish: f32,
+    pub cube_r_low: f32,
+    /// Sidestep tuning: how far ahead a bullet is tracked and how far we step.
+    pub dodge_look: f32,
+    pub dodge_reach: f32,
 }
 
 impl Default for Params {
@@ -410,7 +435,7 @@ impl Default for Params {
             arm_hp: 0.35,
             arm_rank: 25.0,
             arm_better: 60.0,
-            upg_dmg: 1.0,
+            upg_dmg: 2.0,
             arc_save: 0.0,
             laser_range: 0.0,
             drop_gun: 0.0,
@@ -488,7 +513,7 @@ impl Default for Params {
             cr_steps: 50.0,
             fight_pos: 1.0,
             pref_gun: 85.0,
-            pref_laser: 115.0,
+            pref_laser: 120.0,
             keep_ltg: 64.0,
             keep_mortar: 80.0,
             late_hold: 1.0,
@@ -499,6 +524,19 @@ impl Default for Params {
             laser_fix: 1.0,
             fight_cubes: 1.0,
             fight_cube_r: 70.0,
+            ext_lose: 1.0,
+            lose_margin: 0.10,
+            ext_target: 1.0,
+            ext_fpos: 1.0,
+            fp_flip_lo: 0.3,
+            fp_flip_hi: 1.0,
+            pref_ltg: 28.0,
+            ext_late: 1.0,
+            late_crowd_r: 80.0,
+            ext_finish: 1.0,
+            cube_r_low: 40.0,
+            dodge_look: 1.2,
+            dodge_reach: 3.5,
         }
     }
 }
@@ -658,6 +696,19 @@ impl Params {
         p.laser_fix = g("laser_fix", p.laser_fix);
         p.fight_cubes = g("fight_cubes", p.fight_cubes);
         p.fight_cube_r = g("fight_cube_r", p.fight_cube_r);
+        p.ext_lose = g("ext_lose", p.ext_lose);
+        p.lose_margin = g("lose_margin", p.lose_margin);
+        p.ext_target = g("ext_target", p.ext_target);
+        p.ext_fpos = g("ext_fpos", p.ext_fpos);
+        p.fp_flip_lo = g("fp_flip_lo", p.fp_flip_lo);
+        p.fp_flip_hi = g("fp_flip_hi", p.fp_flip_hi);
+        p.pref_ltg = g("pref_ltg", p.pref_ltg);
+        p.ext_late = g("ext_late", p.ext_late);
+        p.late_crowd_r = g("late_crowd_r", p.late_crowd_r);
+        p.ext_finish = g("ext_finish", p.ext_finish);
+        p.cube_r_low = g("cube_r_low", p.cube_r_low);
+        p.dodge_look = g("dodge_look", p.dodge_look);
+        p.dodge_reach = g("dodge_reach", p.dodge_reach);
         p
     }
 
@@ -675,6 +726,13 @@ impl Params {
 const UPGRADES_DMG: &[&str] = &[
     "laser_damage", "gun_mag", "laser_charge", "plating", "gun_damage", "armor", "lightning_efficiency", "gun_rate",
     "nanites", "lightning_chain", "servos", "reactor", "capacitor", "gyros", "lightning_range", "jets",
+    "gun_velocity", "mortar_reload", "mortar_splash", "sensors", "mortar_velocity", "laser_pierce",
+];
+
+/// Upgrade preference with hit points and armour first, then the laser, regeneration and the gun.
+const UPGRADES_TANK: &[&str] = &[
+    "plating", "armor", "laser_damage", "laser_charge", "nanites", "gun_damage", "gun_rate", "gun_mag",
+    "lightning_efficiency", "servos", "lightning_chain", "reactor", "capacitor", "gyros", "lightning_range", "jets",
     "gun_velocity", "mortar_reload", "mortar_splash", "sensors", "mortar_velocity", "laser_pierce",
 ];
 
@@ -904,6 +962,8 @@ pub struct Brain {
     /// Fight-position strafe: direction sign and when it next reverses.
     fp_side: f32,
     fp_until: f32,
+    /// When the current target was last locked in.
+    focus_t: f32,
     /// Late-game home spot and when it was chosen.
     home: Option<([f32; 2], f32)>,
     /// Mechs we hit recently: id -> time.
@@ -1022,6 +1082,7 @@ impl Brain {
             cr_goal: None,
             fp_side: 1.0,
             fp_until: -1.0,
+            focus_t: -1.0,
             home: None,
             hit_t: BTreeMap::new(),
             hit_bearing: None,
@@ -1829,7 +1890,7 @@ impl Brain {
 
         // --- upgrades
         if let Some(offer) = &o.offer {
-            let list = if p.upg_dmg > 0.0 { UPGRADES_DMG } else { UPGRADES };
+            let list = if p.upg_dmg >= 2.0 { UPGRADES_TANK } else if p.upg_dmg > 0.0 { UPGRADES_DMG } else { UPGRADES };
             let rank = |id: &str| list.iter().position(|u| *u == id).unwrap_or(list.len());
             a.pick = offer.choices.iter().enumerate().min_by_key(|(_, c)| rank(&c.id)).map(|(i, _)| i as u32);
         }
@@ -1919,7 +1980,11 @@ impl Brain {
             (Some((b, _)), _) => Some(b),
             _ => None,
         };
-        self.focus = target.map(|t| t.id);
+        let new_focus = target.map(|t| t.id);
+        if new_focus != self.focus || o.t - self.focus_t >= 2.0 {
+            self.focus_t = o.t;
+        }
+        self.focus = new_focus;
         if let Some(t) = target {
             self.threat = Some((t.pos, o.t));
         }
@@ -2302,15 +2367,20 @@ impl Brain {
         };
         let live_fight = p.hold_fight > 0.0 && target.is_some() && (engaged || recently_hurt_by_mech);
         // Finishing a weak target up close (`engage_filter`).
-        let close_kill = p.engage_filter > 0.0 && target.map_or(false, |t| t.max_hp > 0.0 && t.hp / t.max_hp < 0.38);
+        let close_kill = p.engage_filter > 0.0
+            && target.map_or(false, |t| t.max_hp > 0.0 && t.hp / t.max_hp < 0.38)
+            && (p.ext_finish <= 0.0 || (hp_frac > 0.42 && near_enemies <= 2));
         // Outnumbered or losing: break off in bursts to the nearest hidden cell (`crowd_retreat`).
         let mut cr_goal: Option<[f32; 2]> = None;
         if p.crowd_retreat > 0.0 {
             let near = enemies.iter().filter(|m| d2(&m.pos, &pos) < p.cr_radius).count();
             let tf = target.map_or(1.0, |t| if t.max_hp > 0.0 { t.hp / t.max_hp } else { 1.0 });
             let t_hp = target.map_or(0.0, |t| if t.max_hp > 0.0 { t.hp } else { 1400.0 });
-            let trigger = (near >= 2 && hp_frac < 0.55) || (near >= 3 && hp_frac < 0.8) || (hp_frac < 0.35 && target.is_some() && t_hp > me.hp);
-            let veto = late || finishing || close_kill || (target.is_some() && tf < 0.25 && near <= 2) || threats.is_empty();
+            let losing = if p.ext_lose > 0.0 { tf > hp_frac + p.lose_margin } else { t_hp > me.hp };
+            let trigger = (near >= 2 && hp_frac < 0.55) || (near >= 3 && hp_frac < 0.8) || (hp_frac < 0.35 && target.is_some() && losing);
+            // About to win: a target close by that is nearly dead or much weaker than us.
+            let winning = p.ext_lose > 0.0 && target.map_or(false, |t| d2(&t.pos, &pos) < 120.0 && (t_hp < 200.0 || t_hp < 0.5 * me.hp));
+            let veto = late || finishing || winning || close_kill || (target.is_some() && tf < 0.25 && (p.ext_lose <= 0.0 || hp_frac > 0.2) && near <= 2) || threats.is_empty();
             if veto {
                 self.cr_until = -1.0;
             } else if o.t < self.cr_until || trigger {
@@ -2635,7 +2705,7 @@ impl Brain {
                 let mtr = if t.weapons.iter().any(|w| w == "mortar") { p.keep_mortar } else { 0.0 };
                 base.max(ltg).max(mtr)
             } else if has_arc && hp_frac > p.arc_min_hp && near_enemies as f32 <= p.arc_crowd {
-                p.arc_range
+                if p.fight_pos > 0.0 && p.ext_fpos > 0.0 { p.pref_ltg } else { p.arc_range }
             } else if they_arc {
                 p.gun_range.max(60.0).max(p.laser_range * has_laser as i32 as f32)
             } else if has_laser && p.laser_range > 0.0 {
@@ -3373,6 +3443,11 @@ mod tests {
             engage_filter: 0.0,
             laser_fix: 0.0,
             fight_cubes: 0.0,
+            ext_lose: 0.0,
+            ext_target: 0.0,
+            ext_fpos: 0.0,
+            ext_late: 0.0,
+            ext_finish: 0.0,
             ..Params::default()
         }
     }
