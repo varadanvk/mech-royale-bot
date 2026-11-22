@@ -120,6 +120,15 @@ pub struct Params {
     pub lead_air: f32,
     /// Seconds added to the bullet flight time when leading.
     pub lead_latency: f32,
+    /// Seconds from a look until the shot leaves (0 = off, `lead_latency` instead). The target is led by its whole
+    /// speed over this time plus its lead share over the flight, and the shot starts from where our muzzle will
+    /// be by then; the per-enemy lead learning uses the same timing (practice matches only).
+    pub lead_delay: f32,
+    /// Gun lead on a target speeding up or turning around (its velocity changed by at least this many m/s per
+    /// second since the last look, on the ground): its speed along that change is predicted to build at the
+    /// walking acceleration up to walking (or boost) speed and hold there, instead of staying as it is now
+    /// (0 = off; practice matches only, with `lead_delay`).
+    pub lead_accel: f32,
     /// Predict an airborne target's height with gravity or jet thrust, stopping at the surface below it
     /// (0 = lead by half its vertical speed).
     pub lead_ballistic: f32,
@@ -537,6 +546,8 @@ impl Default for Params {
             lead_ground: 0.9,
             lead_air: 1.0,
             lead_latency: 0.025,
+            lead_delay: 0.075,
+            lead_accel: 20.0,
             lead_ballistic: 1.0,
             aim_slack: 1.0,
             dual: 1.0,
@@ -783,6 +794,8 @@ impl Params {
         p.lead_ground = g("lead_ground", p.lead_ground);
         p.lead_air = g("lead_air", p.lead_air);
         p.lead_latency = g("lead_latency", p.lead_latency);
+        p.lead_delay = g("lead_delay", p.lead_delay);
+        p.lead_accel = g("lead_accel", p.lead_accel);
         p.lead_ballistic = g("lead_ballistic", p.lead_ballistic);
         p.aim_slack = g("aim_slack", p.aim_slack);
         p.dual = g("dual", p.dual);
@@ -1118,10 +1131,12 @@ pub(crate) struct LeadStat {
 }
 
 impl LeadStat {
-    /// Note a look at the enemy at time `t`: a shot from `from` landing `tt` seconds later.
-    pub(crate) fn look(&mut self, t: f32, from: [f32; 2], pos: [f32; 2], vel: [f32; 2], tt: f32) {
+    /// Note a look at the enemy at time `t`: a shot from `from` leaving `delay` seconds later (the enemy is led
+    /// by all of its speed over that time) and landing `tt` seconds after that.
+    pub(crate) fn look(&mut self, t: f32, from: [f32; 2], pos: [f32; 2], vel: [f32; 2], delay: f32, tt: f32) {
         let d = norm2(pos[0] - from[0], pos[1] - from[1]);
-        self.pending.push_back((t + tt, pos, [vel[0] * tt, vel[1] * tt], [-d[1], d[0]]));
+        let p0 = [pos[0] + vel[0] * delay, pos[1] + vel[1] * delay];
+        self.pending.push_back((t + delay + tt, p0, [vel[0] * tt, vel[1] * tt], [-d[1], d[0]]));
         if self.pending.len() > 16 {
             self.pending.pop_front();
         }
@@ -1479,6 +1494,15 @@ impl Brain {
         (self.rng >> 40) as f32 / (1u64 << 24) as f32
     }
 
+    /// Gun lead timing: seconds until the shot leaves (led at full speed) and seconds added to the flight time.
+    fn lead_timing(&self) -> (f32, f32) {
+        if self.params.lead_delay > 0.0 && !self.ffa_on() {
+            (self.params.lead_delay, 0.0)
+        } else {
+            (0.0, self.params.lead_latency)
+        }
+    }
+
     fn clear(&self, a: [f32; 3], b: [f32; 3]) -> bool {
         self.world.as_ref().map_or(true, |w| w.clear(a, b))
     }
@@ -1777,10 +1801,41 @@ impl Brain {
                         }
                     }
                 };
+                // The shot leaves `delay` from now, from where our muzzle will be by then.
+                let (delay, lat) = self.lead_timing();
+                let muzzle = [muzzle[0] + me.vel[0] * delay, muzzle[1] + me.vel[1] * delay, muzzle[2]];
+                // Ground distance it covers in `h` seconds: straight on, or (`lead_accel`) with the speed along its
+                // latest change in velocity building at 58.5 m/s^2 up to its top speed.
+                let accel = if delay > 0.0 && p.lead_accel > 0.0 && !airborne && t.kind == "mech" {
+                    self.known.get(&t.id).and_then(|k| k.prev_vel).and_then(|(pv, pt0)| {
+                        let dt = o.t - pt0;
+                        let a = [(t.vel[0] - pv[0]) / dt.max(0.05), (t.vel[1] - pv[1]) / dt.max(0.05)];
+                        (dt > 0.0 && a[0].hypot(a[1]) >= p.lead_accel).then(|| norm2(a[0], a[1]))
+                    })
+                } else {
+                    None
+                };
+                let flat_v = t.vel[0].hypot(t.vel[1]);
+                let cap = if flat_v > 12.5 { 19.5 } else { 11.7 };
+                let shift = |h: f32| -> [f32; 2] {
+                    match accel {
+                        None => [t.vel[0] * h, t.vel[1] * h],
+                        Some(u) => {
+                            let va = t.vel[0] * u[0] + t.vel[1] * u[1];
+                            let vp = [t.vel[0] - va * u[0], t.vel[1] - va * u[1]];
+                            let tr = ((cap - va).max(0.0) / 58.5).min(h);
+                            let along = va * tr + 0.5 * 58.5 * tr * tr + va.max(cap) * (h - tr);
+                            [vp[0] * h + u[0] * along, vp[1] * h + u[1] * along]
+                        }
+                    }
+                };
                 let mut pt = tc;
                 for _ in 0..3 {
-                    let tt = ((d3(&muzzle, &pt) - lead_out).max(0.0)) / speed + p.lead_latency;
-                    pt = [tc[0] + t.vel[0] * tt * lead, tc[1] + t.vel[1] * tt * lead, tc[2] + rise(tt)];
+                    let tt = ((d3(&muzzle, &pt) - lead_out).max(0.0)) / speed + lat;
+                    // The whole of the move until the shot leaves, the lead share of the move during the flight.
+                    let (s0, s1) = (shift(delay), shift(delay + tt));
+                    let ahead = [s0[0] + (s1[0] - s0[0]) * lead, s0[1] + (s1[1] - s0[1]) * lead];
+                    pt = [tc[0] + ahead[0], tc[1] + ahead[1], tc[2] + rise(delay + tt)];
                 }
                 let ok = w.ammo > 0.0 && w.reload <= 0.0 && d3(&muzzle, &pt) < w.stat("range", 230.0) && self.clear(muzzle, pt);
                 Shot { aim: flat(&pt, &muzzle), tol: body, ok }
@@ -2203,12 +2258,13 @@ impl Brain {
                 self.laser_fired.insert(m.id, o.t);
             }
             if p.lead_adapt > 0.0 {
+                let (delay, lat) = self.lead_timing();
                 let st = self.lead_stats.entry(m.id).or_default();
                 let (mp, mvl) = ([m.pos[0], m.pos[1]], [m.vel[0], m.vel[1]]);
                 st.settle(o.t, mp, mvl, 2.5 * (1.0 + 0.05 * m.cubes) * 0.85);
                 let d = d2(&m.pos, &pos);
                 if d < 230.0 {
-                    st.look(o.t, [pos[0], pos[1]], mp, mvl, (d - 3.0).max(0.0) / 252.0 + p.lead_latency);
+                    st.look(o.t, [pos[0], pos[1]], mp, mvl, delay, (d - 3.0).max(0.0) / 252.0 + lat);
                 }
             }
             let prev_vel = self.known.get(&m.id).filter(|k| o.t - k.seen_t < 0.35 && o.t > k.seen_t).map(|k| (k.vel, k.seen_t));
@@ -4592,7 +4648,7 @@ mod tests {
             let t = i as f32 * 0.1;
             let (p, v) = ([100.0, 8.0 * t], [0.0, 8.0]);
             st.settle(t, p, v, 2.1);
-            st.look(t, [0.0, 0.0], p, v, 0.4);
+            st.look(t, [0.0, 0.0], p, v, 0.0, 0.4);
         }
         assert_eq!(st.choice(), None);
         // Reversing every 0.4 s: where it is now beats where its speed points.
@@ -4602,7 +4658,7 @@ mod tests {
             let t = i as f32 * 0.1;
             let vy = if (i / 4) % 2 == 0 { 8.0 } else { -8.0 };
             st.settle(t, [100.0, y], [0.0, vy], 2.1);
-            st.look(t, [0.0, 0.0], [100.0, y], [0.0, vy], 0.4);
+            st.look(t, [0.0, 0.0], [100.0, y], [0.0, vy], 0.0, 0.4);
             y += vy * 0.1;
         }
         assert!(st.choice().map_or(false, |l| l < 0.8), "{:?} {:?}", st.choice(), st.ema);

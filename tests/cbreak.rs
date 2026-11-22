@@ -19,7 +19,7 @@ fn load() -> Option<(Arc<World>, Nav)> {
 /// The defaults with break-off to hidden ground at any distance and the later additions off: the scenes
 /// below are about where a break-off goes.
 fn earlier() -> Params {
-    Params { stay_fight: 0.0, cr_max_d: 0.0, cr_laser: 0.0, cr_strafe: 0.0, seek_idle: 0.0, lead_adapt: 0.0, dodge_after: 9.0, reload_laser: 1.0, ..Params::default() }
+    Params { stay_fight: 0.0, cr_max_d: 0.0, cr_laser: 0.0, cr_strafe: 0.0, seek_idle: 0.0, lead_adapt: 0.0, dodge_after: 9.0, reload_laser: 1.0, lead_delay: 0.0, ..Params::default() }
 }
 
 fn off() -> Params {
