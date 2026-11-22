@@ -377,6 +377,31 @@ pub struct Params {
     /// enemies, being pressed counts confident entries within 150 m, and the loop and sheltered-ground choices
     /// weigh every entry by how sure we are of it (0 = off).
     pub contacts: f32,
+    /// Profile every believed enemy (needs `contacts`): coming for us, estimated hit points, weapon, alone,
+    /// behind us, cornered (0 = off).
+    pub infer: f32,
+    /// Escape when swarmed (needs `infer`; 0 = off): at least `esc_hunters` believed enemies coming for us within
+    /// `esc_r` (each counted by how sure we are of it), one fewer below `esc_low_hp`, or hits from two enemies on
+    /// different bearings within 3 s. Go to the reachable place the fewest of them can see, away from them and
+    /// behind cover, boosting only while seen and walking at `esc_quiet` once hidden; no loot, no new laser
+    /// charge. Stop at `esc_heal` health once the trigger is gone, when fewer than two remain, or after `esc_cap`
+    /// seconds without a hit (then not again for `esc_cool` s). One enemy alone coming round the corner is fought.
+    pub esc: f32,
+    pub esc_r: f32,
+    pub esc_hunters: f32,
+    pub esc_low_hp: f32,
+    pub esc_heal: f32,
+    pub esc_cap: f32,
+    pub esc_cool: f32,
+    pub esc_quiet: f32,
+    /// Duel a lone enemy (needs `infer`; 0 = off): one with no other believed enemy near it, within `duel_r`,
+    /// with no more hit points than us or cornered, while we are above `duel_hp` and nobody else is believed
+    /// within `duel_r` of us. Commit to it: go to it, fight it, no loot; glance at anything believed behind us
+    /// every `duel_glance` seconds when no shot is lined up.
+    pub duel: f32,
+    pub duel_r: f32,
+    pub duel_hp: f32,
+    pub duel_glance: f32,
 }
 
 impl Default for Params {
@@ -546,6 +571,19 @@ impl Default for Params {
             dodge_look: 1.2,
             dodge_reach: 3.5,
             contacts: 1.0,
+            infer: 1.0,
+            esc: 1.0,
+            esc_r: 150.0,
+            esc_hunters: 3.0,
+            esc_low_hp: 0.55,
+            esc_heal: 0.8,
+            esc_cap: 12.0,
+            esc_cool: 4.0,
+            esc_quiet: 4.6,
+            duel: 1.0,
+            duel_r: 120.0,
+            duel_hp: 0.6,
+            duel_glance: 2.5,
         }
     }
 }
@@ -719,6 +757,19 @@ impl Params {
         p.dodge_look = g("dodge_look", p.dodge_look);
         p.dodge_reach = g("dodge_reach", p.dodge_reach);
         p.contacts = g("contacts", p.contacts);
+        p.infer = g("infer", p.infer);
+        p.esc = g("esc", p.esc);
+        p.esc_r = g("esc_r", p.esc_r);
+        p.esc_hunters = g("esc_hunters", p.esc_hunters);
+        p.esc_low_hp = g("esc_low_hp", p.esc_low_hp);
+        p.esc_heal = g("esc_heal", p.esc_heal);
+        p.esc_cap = g("esc_cap", p.esc_cap);
+        p.esc_cool = g("esc_cool", p.esc_cool);
+        p.esc_quiet = g("esc_quiet", p.esc_quiet);
+        p.duel = g("duel", p.duel);
+        p.duel_r = g("duel_r", p.duel_r);
+        p.duel_hp = g("duel_hp", p.duel_hp);
+        p.duel_glance = g("duel_glance", p.duel_glance);
         p
     }
 
@@ -986,6 +1037,28 @@ pub struct Brain {
     /// Bearing and time of the last hit taken from a mech, and of the last weapon or step sound heard.
     hit_bearing: Option<(f32, f32)>,
     sound_bearing: Option<(f32, f32)>,
+    /// Our position every half second over the last five seconds.
+    me_hist: VecDeque<(f32, [f32; 2])>,
+    /// Hits taken from mechs over the last three seconds: time, attacker, bearing.
+    hit_hist: VecDeque<(f32, u32, f32)>,
+    /// Escape in progress (since when), not to start again before `esc_cool_until`, and the place chosen.
+    esc_on: bool,
+    esc_start: f32,
+    esc_cool_until: f32,
+    esc_pick: Option<Pick>,
+    esc_pick_t: f32,
+    /// Enemy being dueled, since when, and when it was last listed.
+    duel: Option<u32>,
+    duel_start: f32,
+    duel_seen_t: f32,
+    /// Look behind: until when, which way, and when next.
+    glance_until: f32,
+    glance_yaw: f32,
+    glance_next: f32,
+    /// How many escapes and duels were started (for a viewer); printed as they start with `TMODES` set.
+    pub esc_n: u32,
+    pub duel_n: u32,
+    trace_modes: bool,
 }
 
 impl Brain {
@@ -1105,6 +1178,22 @@ impl Brain {
             hit_t: BTreeMap::new(),
             hit_bearing: None,
             sound_bearing: None,
+            me_hist: VecDeque::new(),
+            hit_hist: VecDeque::new(),
+            esc_on: false,
+            esc_start: -100.0,
+            esc_cool_until: -1.0,
+            esc_pick: None,
+            esc_pick_t: -100.0,
+            duel: None,
+            duel_start: -100.0,
+            duel_seen_t: -100.0,
+            glance_until: -1.0,
+            glance_yaw: 0.0,
+            glance_next: -1.0,
+            esc_n: 0,
+            duel_n: 0,
+            trace_modes: std::env::var("TMODES").is_ok(),
         }
     }
 
@@ -1466,6 +1555,11 @@ impl Brain {
         let me = &o.me;
         let here = [pos[0], pos[1]];
         self.contacts.begin();
+        for e in o.events.iter().filter(|e| e.kind == "hit") {
+            if let Some(id) = e.target.filter(|t| *t < 100) {
+                self.contacts.note_dealt(id, e.amount);
+            }
+        }
         for m in o.mechs.iter().filter(|m| m.kind == "mech") {
             if m.max_hp > 0.0 && m.hp <= 0.0 {
                 self.contacts.remove(m.id);
@@ -1475,6 +1569,9 @@ impl Brain {
             let hunter = aimed || self.attackers.get(&m.id).map_or(false, |t| o.t - t < 4.0) || self.hunters.contains_key(&m.id);
             let hpf = if m.max_hp > 0.0 { m.hp / m.max_hp } else { 1.0 };
             self.contacts.see(o.t, m.id, m.pos, m.vel, &m.weapons, hpf, hunter);
+            if m.max_hp > 0.0 {
+                self.contacts.note_hp(m.id, m.hp);
+            }
         }
         for e in &o.events {
             match (e.kind.as_str(), e.target, e.by, e.bearing) {
@@ -1965,6 +2062,9 @@ impl Brain {
                         self.last_mech_hurt_t = o.t;
                         self.attackers.insert(by, o.t);
                         if let Some(b) = e.bearing {
+                            self.hit_hist.push_back((o.t, by, b));
+                        }
+                        if let Some(b) = e.bearing {
                             if !o.mechs.iter().any(|m| m.id == by) {
                                 self.threat = Some(([pos[0] + b.cos() * 70.0, pos[1] + b.sin() * 70.0, pos[2]], o.t));
                             }
@@ -1976,11 +2076,18 @@ impl Brain {
             }
         }
 
+        while self.hit_hist.front().map_or(false, |h| o.t - h.0 > 3.0) {
+            self.hit_hist.pop_front();
+        }
         self.track_contacts(o);
 
         // --- where the enemies are believed to be
         if p.contacts > 0.0 {
             self.update_contacts(o, &pos);
+        }
+        let infer = p.contacts > 0.0 && p.infer > 0.0;
+        if infer {
+            self.profile(o, &pos);
         }
 
         // --- upgrades
@@ -2039,6 +2146,9 @@ impl Brain {
             }
         }
         self.hunters.retain(|_, t| o.t - *t < 10.0);
+        // A lone enemy worth taking on by ourselves: committed to until it is gone or others come.
+        let duel = if infer && p.duel > 0.0 { self.update_duel(o, &pos, hp_frac, late) } else { None };
+        let duel_t: Option<&Actor> = duel.and_then(|id| enemies.iter().find(|m| m.id == id).copied());
         let cands: Vec<&Actor> = enemies
             .iter()
             .filter(|m| !counter || self.hunters.get(&m.id).map_or(false, |t| o.t - t < 4.0))
@@ -2069,6 +2179,7 @@ impl Brain {
             (Some((b, _)), _) => Some(b),
             _ => None,
         };
+        let target = duel_t.or(target);
         let new_focus = target.map(|t| t.id);
         if new_focus != self.focus || o.t - self.focus_t >= 2.0 {
             self.focus_t = o.t;
@@ -2393,7 +2504,7 @@ impl Brain {
         }
         // An empty slot: the nearest good weapon on the ground comes first.
         let worst_rank = worst_slot.map_or(0, |(_, r)| r);
-        let arm_goal = if p.arm > 0.0 && farm_on && !hold_late && (empty_slot || p.arm_better > 0.0 || p.laser_seek > 0.0) && hp_frac > p.arm_hp {
+        let arm_goal = if p.arm > 0.0 && farm_on && !hold_late && duel.is_none() && (empty_slot || p.arm_better > 0.0 || p.laser_seek > 0.0) && hp_frac > p.arm_hp {
             let reach = if empty_slot { p.arm_reach } else { p.arm_better };
             let cands: Vec<(u32, [f32; 3], f32)> = self
                 .picks_mem
@@ -2422,7 +2533,7 @@ impl Brain {
         };
         // Cubes dropped by a kill: the nearest one known around the spot, or the spot itself until we have looked.
         let collect_goal = match self.kill_spot {
-            Some((ks, kt)) if p.collect > 0.0 && !hold_late && o.t - kt < p.collect_s && hp_frac > p.collect_hp && (enemies.len() as f32) < p.collect_seen => {
+            Some((ks, kt)) if p.collect > 0.0 && !hold_late && duel.is_none() && o.t - kt < p.collect_s && hp_frac > p.collect_hp && (enemies.len() as f32) < p.collect_seen => {
                 let c = self
                     .cubes_mem
                     .values()
@@ -2486,6 +2597,22 @@ impl Brain {
                 cr_goal = self.cr_goal;
             }
         }
+        // Swarmed: escape to the least watched place nearby; one enemy alone in sight close by is fought.
+        let mut esc_goal: Option<[f32; 2]> = None;
+        if infer && p.esc > 0.0 {
+            let tf = target.map_or(1.0, |t| if t.max_hp > 0.0 { t.hp / t.max_hp } else { 1.0 });
+            let t_hp = target.map_or(0.0, |t| if t.max_hp > 0.0 { t.hp } else { 1400.0 });
+            let winning = target.map_or(false, |t| d2(&t.pos, &pos) < 120.0 && (t_hp < 200.0 || t_hp < 0.5 * me.hp));
+            let veto = late || finishing || winning || close_kill || (target.is_some() && tf < 0.25 && hp_frac > 0.2);
+            esc_goal = self.update_escape(o, &pos, hp_frac, veto);
+            if esc_goal.is_some() && hp_frac > 0.25 {
+                let chest = [pos[0], pos[1], pos[2] + 5.0];
+                let seers: Vec<&&Actor> = enemies.iter().filter(|m| self.world.as_ref().map_or(true, |w| w.sees([m.pos[0], m.pos[1], m.pos[2] + 8.0], chest))).collect();
+                if seers.len() == 1 && enemies.len() == 1 && d2(&seers[0].pos, &pos) < 70.0 {
+                    esc_goal = None;
+                }
+            }
+        }
         let mut boost = false;
         let mut mv: [f32; 2];
         let mut label = "idle";
@@ -2494,6 +2621,30 @@ impl Brain {
             label = "zone";
             mv = self.go(&pos, zone_goal);
             boost = !me.in_zone && me.energy > 5.0;
+        } else if let Some(g) = esc_goal {
+            // Escape: boost only while seen, walk quietly once out of sight, hold still there to heal.
+            label = "esc";
+            let dg = d2(&pos, &g);
+            mv = if dg < 2.0 { [0.0, 0.0] } else { self.go(&pos, g) };
+            let chest = [pos[0], pos[1], pos[2] + 5.0];
+            let seen = enemies.iter().any(|m| self.world.as_ref().map_or(true, |w| w.sees([m.pos[0], m.pos[1], m.pos[2] + 8.0], chest)));
+            boost = seen && me.energy > 10.0 && dg > 5.0;
+            if !seen && self.watched_here(&pos) < 0.5 {
+                let slow = (p.esc_quiet / walk_speed.max(0.1)).min(1.0);
+                mv = [mv[0] * slow, mv[1] * slow];
+            }
+            for (i, w) in me.weapons.iter().enumerate().take(2) {
+                if w.as_ref().map_or(false, |w| w.kind == "laser" && w.charge <= 0.0) {
+                    a.fire[i] = false;
+                }
+            }
+            if shoot_at.is_none() {
+                if let Some(b) = self.alert_bearing(o) {
+                    a.aim = [b, 0.0];
+                } else if let Some(th) = threats.first() {
+                    a.aim = [yaw_to(&pos, th), 0.0];
+                }
+            }
         } else if let Some(g) = cr_goal {
             // Break off to hidden ground; stand still once there.
             label = "cbreak";
@@ -2534,6 +2685,13 @@ impl Brain {
             mv = m;
             boost = b;
             label = l;
+        } else if let Some(g) = duel.filter(|_| duel_t.is_none()).and_then(|id| self.beliefs.iter().find(|b| b.id == Some(id)).map(|b| b.pos)) {
+            // Dueling an enemy out of sight: go to where it is believed to be, facing it.
+            label = "duel";
+            mv = self.go(&pos, g);
+            if shoot_at.is_none() {
+                a.aim = [yaw_to(&pos, &g), 0.0];
+            }
         } else if let Some(g) = arm_goal.filter(|_| !(p.stand_first > 0.0 && stand_from.is_some())) {
             label = "arm";
             mv = self.go(&pos, [g[0], g[1]]);
@@ -2845,7 +3003,7 @@ impl Brain {
                 label = "reload";
                 mv = h;
                 boost = me.energy > 25.0;
-            } else if let Some(c) = (if p.fight_cubes > 0.0 { self.fight_cube(o, t) } else { near_cube }).filter(|_| !finishing || dist < 20.0) {
+            } else if let Some(c) = (if p.fight_cubes > 0.0 { self.fight_cube(o, t) } else { near_cube }).filter(|_| (!finishing || dist < 20.0) && duel.is_none()) {
                 label = "fcube";
                 let g = self.go(&pos, [c[0], c[1]]);
                 mv = norm2(g[0] + mv[0] * 0.35, g[1] + mv[1] * 0.35);
@@ -2924,6 +3082,23 @@ impl Brain {
             }
         }
 
+        // Dueling: now and then glance at anything believed behind us, never during a laser charge or with a
+        // shot lined up.
+        if duel.is_some() {
+            let charging = me.weapons.iter().flatten().any(|w| w.kind == "laser" && w.charge > 0.0);
+            let gun_down = me.weapons.iter().flatten().any(|w| w.kind == "gun" && (w.reload > 0.0 || w.ammo <= 0.0));
+            if !charging && o.t >= self.glance_next && (!engaged || gun_down) {
+                let back = self.beliefs.iter().filter(|b| b.behind && b.id != duel).min_by(|x, y| d2(&x.pos, &pos).partial_cmp(&d2(&y.pos, &pos)).unwrap_or(std::cmp::Ordering::Equal)).map(|b| b.pos);
+                if let Some(q) = back {
+                    self.glance_yaw = yaw_to(&pos, &q);
+                    self.glance_until = o.t + 0.4;
+                    self.glance_next = o.t + p.duel_glance;
+                }
+            }
+            if o.t < self.glance_until && !charging {
+                a.aim = [self.glance_yaw, 0.0];
+            }
+        }
         // A held laser charge keeps its aim whatever the mode did with the torso.
         if let Some(la) = laser_aim {
             a.aim = la;
@@ -2938,7 +3113,7 @@ impl Brain {
             }
         }
         // Outside a fight, still weave across the line of the nearest shooter.
-        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "ring" || label == "spot" || label == "iso" || label == "fight" || label == "rush" || label == "climb" || (label == "hold" && p.hold_fight <= 0.0) || label == "drone" || label == "reload" || label == "stand" || label == "peek" || label == "hide" || label == "repeek" || label == "home" || label == "cbreak") {
+        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "ring" || label == "spot" || label == "iso" || label == "fight" || label == "rush" || label == "climb" || (label == "hold" && p.hold_fight <= 0.0) || label == "drone" || label == "reload" || label == "stand" || label == "peek" || label == "hide" || label == "repeek" || label == "home" || label == "cbreak" || label == "esc" || label == "duel") {
             if o.t >= self.strafe_until {
                 self.next_strafe(o.t);
             }
@@ -3531,6 +3706,8 @@ impl Brain {
 
 #[path = "tactics.rs"]
 mod tactics;
+#[path = "escape.rs"]
+mod escape;
 
 #[cfg(test)]
 mod tests {

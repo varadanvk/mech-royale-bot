@@ -3,7 +3,7 @@
 //! and by hits from it, and pushed out of places we can see empty. Sounds and hits we cannot put a name to
 //! become short-lived anonymous contacts. `beliefs` gives the rest of the brain one list of both.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::f32::consts::TAU;
 
 /// How fast the area an unseen enemy may be in spreads (between walking and boosting), m/s.
@@ -24,6 +24,11 @@ const BEARING_SD: f32 = 0.122;
 const FADE_S: f32 = 12.0;
 /// Most anonymous contacts kept.
 const MAX_CONTACTS: usize = 12;
+/// A track's estimated position is sampled this often, and kept this long, to tell whether it is closing in.
+const HIST_DT: f32 = 0.5;
+const HIST_S: f32 = 5.0;
+/// Hit points assumed for an enemy never listed.
+const UNKNOWN_HP: f32 = 1400.0;
 
 fn dist(a: [f32; 2], b: [f32; 2]) -> f32 {
     (a[0] - b[0]).hypot(a[1] - b[1])
@@ -50,6 +55,23 @@ pub fn carry(kind: &str) -> Option<f32> {
         "reload" => 60.0,
         _ => return None,
     })
+}
+
+/// Weapon codes in `Belief::weapon`: what an enemy last fired, else the best it was seen holding.
+pub const W_NONE: u8 = 0;
+pub const W_GUN: u8 = 1;
+pub const W_MORTAR: u8 = 2;
+pub const W_LIGHTNING: u8 = 3;
+pub const W_LASER: u8 = 4;
+
+fn weapon_code(kind: &str) -> u8 {
+    match kind {
+        "gun" => W_GUN,
+        "mortar" => W_MORTAR,
+        "lightning" => W_LIGHTNING,
+        "laser" => W_LASER,
+        _ => W_NONE,
+    }
 }
 
 /// The weapon a sound gives away.
@@ -95,6 +117,13 @@ pub struct Track {
     pub lost: bool,
     pub listed: bool,
     check_t: f32,
+    /// Hit points when last listed, and damage we have dealt it since.
+    pub hp_abs: f32,
+    pub dealt: f32,
+    /// Weapon it last fired (heard or hit by).
+    pub fired: u8,
+    /// Estimated position every `HIST_DT` seconds over the last `HIST_S`, oldest first.
+    pub hist: VecDeque<(f32, [f32; 2])>,
 }
 
 impl Track {
@@ -123,7 +152,7 @@ impl Contact {
 }
 
 /// One believed enemy, for the rest of the brain.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Belief {
     /// The enemy's id, for a track.
     pub id: Option<u32>,
@@ -138,6 +167,17 @@ pub struct Belief {
     pub hunter: bool,
     /// Listed right now: its position is exact.
     pub listed: bool,
+    /// Hit points: when last listed, less what we have dealt it since.
+    pub est_hp: f32,
+    /// Weapon it last fired, else the best it was seen holding (`W_*`).
+    pub weapon: u8,
+    /// Filled in by the brain (`profile`): coming for us (came for us lately, closing in over the last few
+    /// seconds, or moving toward us); no other believed enemy within 80 m of it; within 60 m and outside our
+    /// view; standing where few directions lead away.
+    pub hunting: bool,
+    pub alone: bool,
+    pub behind: bool,
+    pub cornered: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -172,6 +212,10 @@ impl Contacts {
             lost: false,
             listed: true,
             check_t: t,
+            hp_abs: UNKNOWN_HP,
+            dealt: 0.0,
+            fired: W_NONE,
+            hist: VecDeque::new(),
         });
         k.pos = pos;
         k.vel = vel;
@@ -241,6 +285,9 @@ impl Contacts {
             k.info_t = k.info_t.max(heard_t);
             k.coasting = false;
             k.lost = false;
+            if let Some(w) = weapon {
+                k.fired = weapon_code(w);
+            }
             return;
         }
         let d = (lo + hi) * 0.5;
@@ -264,6 +311,11 @@ impl Contacts {
             self.note(t, t, q, guess * 0.6, true);
             return;
         };
+        if let Some(k) = self.tracks.get_mut(&id) {
+            if weapon_code(weapon) != W_NONE {
+                k.fired = weapon_code(weapon);
+            }
+        }
         match self.tracks.get_mut(&id) {
             Some(k) if k.listed => k.hunter_t = t,
             Some(k) => {
@@ -296,6 +348,10 @@ impl Contacts {
                         lost: false,
                         listed: false,
                         check_t: t,
+                        hp_abs: UNKNOWN_HP,
+                        dealt: 0.0,
+                        fired: weapon_code(weapon),
+                        hist: VecDeque::new(),
                     },
                 );
             }
@@ -355,8 +411,31 @@ impl Contacts {
                 }
             }
         }
+        for k in self.tracks.values_mut() {
+            if k.hist.back().map_or(true, |h| t - h.0 >= HIST_DT - 1e-3) {
+                k.hist.push_back((t, k.est));
+            }
+            while k.hist.front().map_or(false, |h| t - h.0 > HIST_S) {
+                k.hist.pop_front();
+            }
+        }
         self.tracks.retain(|_, k| k.listed || t - k.info_t < FORGET_S);
         self.contacts.retain(|c| t - c.t < CONTACT_S);
+    }
+
+    /// Hit points of a listed enemy (when the game gives them): what we deal it from now on counts from here.
+    pub fn note_hp(&mut self, id: u32, hp: f32) {
+        if let Some(k) = self.tracks.get_mut(&id) {
+            k.hp_abs = hp;
+            k.dealt = 0.0;
+        }
+    }
+
+    /// We hit enemy `id` for `amount`.
+    pub fn note_dealt(&mut self, id: u32, amount: f32) {
+        if let Some(k) = self.tracks.get_mut(&id) {
+            k.dealt += amount.max(0.0);
+        }
     }
 
     /// Every enemy we believe in: tracks, then anonymous contacts.
@@ -375,6 +454,9 @@ impl Contacts {
                     hp: k.hp,
                     hunter: t - k.hunter_t < 10.0,
                     listed: k.listed,
+                    est_hp: (k.hp_abs - k.dealt).max(1.0),
+                    weapon: if k.fired != W_NONE { k.fired } else { k.weapons.iter().map(|w| weapon_code(w)).max().unwrap_or(W_NONE) },
+                    ..Belief::default()
                 }
             })
             .collect();
@@ -387,6 +469,8 @@ impl Contacts {
             hp: 1.0,
             hunter: c.hunter,
             listed: false,
+            est_hp: UNKNOWN_HP,
+            ..Belief::default()
         }));
         v
     }

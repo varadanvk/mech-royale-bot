@@ -443,6 +443,105 @@ impl SightTable {
         best
     }
 
+    /// Whether a mech at `p` has few ways out: at most a quarter of the directions open, or a single lane
+    /// covering under half of them.
+    pub fn cornered_at(&self, p: [f32; 2]) -> bool {
+        match self.cell_at(p[0], p[1]) {
+            Some(c) => (self.open[c] as usize) * 4 <= SECTORS || (self.lanes[c] <= 1 && (self.open[c] as usize) * 2 < SECTORS),
+            None => false,
+        }
+    }
+
+    /// A place to break off to when several enemies close in: within `ESC_R` of `me`, reachable on foot, inside
+    /// the safe area, not toward the enemies (their weighted centre) and not near any of them. Scored by the
+    /// expected number of `foes` with a line to it (by far the most), how exposed and how many approach lanes it
+    /// has, solid cover between it and the enemies' centre, the walking time, and how many enemies are expected
+    /// to see us on the way (sampled along the walking path). `Some` at `me` when we are out of sight already;
+    /// `None` when nothing is clearly better than where we stand. `keep` is the place chosen before: it stays
+    /// unless another is clearly better.
+    pub fn escape_pick(&self, nav: &Nav, me: [f32; 2], foes: &[Foe], zone: &Zone, walk: f32, keep: Option<[f32; 2]>) -> Option<Pick> {
+        const ESC_R: f32 = 100.0;
+        let wsum: f32 = foes.iter().map(|f| f.conf).sum();
+        if wsum <= 0.0 {
+            return None;
+        }
+        let cen = [foes.iter().map(|f| f.pos[0] * f.conf).sum::<f32>() / wsum, foes.iter().map(|f| f.pos[1] * f.conf).sum::<f32>() / wsum];
+        let here = self.expected(me, foes);
+        let face = (cen[1] - me[1]).atan2(cen[0] - me[0]);
+        if here < 0.3 {
+            return Some(Pick { pos: me, yaw: face, spot: None, foe: None, score: 0.0 });
+        }
+        let dc_me = dist(me, cen);
+        let away = [me[0] - cen[0], me[1] - cen[1]];
+        // Static part of the score, or None when the cell is ruled out.
+        let base = |p: [f32; 2], c: usize| -> Option<f32> {
+            if !self.reach[c] || !zone.holds(p, 8.0) {
+                return None;
+            }
+            let dm = dist(p, me);
+            // Never toward the enemies: further from their centre, and not on their side of us.
+            if dist(p, cen) < dc_me + 0.3 * dm.min(20.0) || (dm > 1.0 && (p[0] - me[0]) * away[0] + (p[1] - me[1]) * away[1] < -0.2 * dm * dc_me) {
+                return None;
+            }
+            if foes.iter().any(|f| f.conf >= 0.3 && dist(f.pos, p) < 35.0 + f.r * 0.5) {
+                return None;
+            }
+            let seen = self.expected(p, foes);
+            let dcp = dist(p, cen);
+            let covered = self.range_at(c, (cen[1] - p[1]).atan2(cen[0] - p[0])) + 3.0 < dcp.min(RANGE);
+            Some(seen * 12.0 + self.exposure[c] * 6.0 + 0.5 * (self.lanes[c].max(1) - 1) as f32 - if covered { 3.0 } else { 0.0 })
+        };
+        let mut cands: Vec<(f32, usize)> = self.cells_near(me, ESC_R).filter_map(|c| base(self.pt[c].unwrap(), c).map(|s| (s, c))).collect();
+        cands.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+        cands.truncate(14);
+        let mut nav = nav.clone();
+        nav.set_goal(me[0], me[1]);
+        let walk = walk.max(1.0);
+        // Full score: static part, walking time, and enemies expected to see us along the way there.
+        let full = |nav: &Nav, p: [f32; 2], s0: f32| -> Option<f32> {
+            let travel = nav.path_len(p[0], p[1])?;
+            if travel > ESC_R * 1.7 {
+                return None;
+            }
+            let (mut q, mut on_way, mut n) = (p, 0.0f32, 0);
+            for _ in 0..12 {
+                let Some(nq) = nav.steer(q[0], q[1]) else { break };
+                if dist(nq, me) < 6.0 || dist(nq, q) < 0.5 {
+                    break;
+                }
+                q = nq;
+                on_way += (self.expected(q, foes) - 0.5).max(0.0);
+                n += 1;
+            }
+            let path = if n > 0 { on_way / n as f32 } else { 0.0 };
+            Some(s0 + travel / walk * 0.8 + path * 6.0)
+        };
+        let mut best: Option<Pick> = None;
+        for &(s0, c) in &cands {
+            let p = self.pt[c].unwrap();
+            if let Some(sc) = full(&nav, p, s0) {
+                if best.map_or(true, |b| sc < b.score) {
+                    best = Some(Pick { pos: p, yaw: face, spot: None, foe: None, score: sc });
+                }
+            }
+        }
+        let b = best?;
+        // Nothing clearly less watched than where we stand: fight where we are.
+        if self.expected(b.pos, foes) > here - 0.4 {
+            return None;
+        }
+        if let Some(q) = keep {
+            if let Some(c) = self.cell_at(q[0], q[1]) {
+                if let Some(sc) = base(q, c).and_then(|s0| full(&nav, q, s0)) {
+                    if sc <= b.score + 2.0 {
+                        return Some(Pick { pos: q, score: sc, ..b });
+                    }
+                }
+            }
+        }
+        Some(b)
+    }
+
     /// Cells with a standing point whose centre lies within `r` of `p`.
     fn cells_near(&self, p: [f32; 2], r: f32) -> impl Iterator<Item = usize> + '_ {
         let i0 = (((p[0] - r - self.x0) / GRID).floor().max(0.0)) as usize;
