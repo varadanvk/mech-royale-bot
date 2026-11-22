@@ -369,12 +369,6 @@ pub struct Params {
     /// Sidestep tuning: how far ahead a bullet is tracked and how far we step.
     pub dodge_look: f32,
     pub dodge_reach: f32,
-    /// With nothing to fight or pick up, go looking for enemies: toward the latest one seen in the last
-    /// `seek_mem` seconds, else the latest sound, else the middle of the next circle (0 = off). Only above
-    /// `seek_hp` health, never while retreating, healing or in the late hold.
-    pub seek: f32,
-    pub seek_mem: f32,
-    pub seek_hp: f32,
 }
 
 impl Default for Params {
@@ -543,9 +537,6 @@ impl Default for Params {
             cube_r_low: 40.0,
             dodge_look: 1.2,
             dodge_reach: 3.5,
-            seek: 1.0,
-            seek_mem: 20.0,
-            seek_hp: 0.5,
         }
     }
 }
@@ -718,9 +709,6 @@ impl Params {
         p.cube_r_low = g("cube_r_low", p.cube_r_low);
         p.dodge_look = g("dodge_look", p.dodge_look);
         p.dodge_reach = g("dodge_reach", p.dodge_reach);
-        p.seek = g("seek", p.seek);
-        p.seek_mem = g("seek_mem", p.seek_mem);
-        p.seek_hp = g("seek_hp", p.seek_hp);
         p
     }
 
@@ -2844,39 +2832,6 @@ impl Brain {
                     }
                 }
             }
-            // Nothing to do: go looking for enemies (last seen, else last heard, else the middle of the next
-            // circle) instead of standing around. Pickups and the zone keep priority; never in the late hold.
-            if label == "idle" && p.seek > 0.0 && !hold_late && !self.fleeing && !self.healing && !must_rotate && hp_frac > p.seek_hp {
-                let seen = self
-                    .known
-                    .values()
-                    .filter(|k| o.t - k.seen_t < p.seek_mem && d2(&k.pos, &z.center) < z.radius - 10.0)
-                    .max_by(|x, y| x.seen_t.partial_cmp(&y.seen_t).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|k| [k.pos[0], k.pos[1]]);
-                let heard = o
-                    .sounds
-                    .iter()
-                    .filter(|sd| sd.age < 4.0 && matches!(sd.kind.as_str(), "gun" | "laser" | "laser_charge" | "lightning" | "mortar" | "step" | "boost"))
-                    .min_by(|x, y| x.age.partial_cmp(&y.age).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|sd| {
-                        let r = match sd.dist.as_str() {
-                            "near" => 40.0,
-                            "mid" => 90.0,
-                            _ => 150.0,
-                        };
-                        [pos[0] + sd.bearing.cos() * r, pos[1] + sd.bearing.sin() * r]
-                    })
-                    .filter(|g| d2(g, &z.center) < z.radius - 10.0);
-                let mid = z.next_center;
-                let goal = seen.or(heard).or(if d2(&mid, &pos) > 20.0 { Some(mid) } else { None });
-                if let Some(g) = goal {
-                    label = "search";
-                    mv = self.go(&pos, g);
-                    if shoot_at.is_none() {
-                        a.aim = [yaw_to(&pos, &[g[0], g[1], pos[2]]), 0.0];
-                    }
-                }
-            }
         }
 
         // A held laser charge keeps its aim whatever the mode did with the torso.
@@ -3493,7 +3448,6 @@ mod tests {
             ext_fpos: 0.0,
             ext_late: 0.0,
             ext_finish: 0.0,
-            seek: 0.0,
             ..Params::default()
         }
     }
