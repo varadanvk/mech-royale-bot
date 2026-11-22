@@ -495,7 +495,7 @@ impl Default for Params {
             late_r: 140.0,
             home_s: 12.0,
             home_speed: 4.6,
-            engage_filter: 0.0,
+            engage_filter: 1.0,
             laser_fix: 0.0,
             fight_cubes: 0.0,
             fight_cube_r: 70.0,
