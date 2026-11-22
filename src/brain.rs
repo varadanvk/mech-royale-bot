@@ -501,6 +501,13 @@ pub struct Params {
     pub stay_fight: f32,
     /// See stay_fight.
     pub stay_cover: f32,
+    /// Starting within `ring_r` m of the zone centre (practice matches only; 0 = off): open with a loop. Head to a
+    /// ring at `ring_f` of the next zone's radius round its centre, then go round it the way with more loot, picking
+    /// up loot within `ring_loot` m of the way, until the first contact or `ring_s` seconds.
+    pub ring_r: f32,
+    pub ring_s: f32,
+    pub ring_f: f32,
+    pub ring_loot: f32,
 }
 
 impl Default for Params {
@@ -731,6 +738,10 @@ impl Default for Params {
             ffa_plain: 1.0,
             stay_fight: 2.0,
             stay_cover: 0.0,
+            ring_r: 220.0,
+            ring_s: 55.0,
+            ring_f: 0.75,
+            ring_loot: 40.0,
         }
     }
 }
@@ -980,6 +991,10 @@ impl Params {
         p.ffa_plain = g("ffa_plain", p.ffa_plain);
         p.stay_fight = g("stay_fight", p.stay_fight);
         p.stay_cover = g("stay_cover", p.stay_cover);
+        p.ring_r = g("ring_r", p.ring_r);
+        p.ring_s = g("ring_s", p.ring_s);
+        p.ring_f = g("ring_f", p.ring_f);
+        p.ring_loot = g("ring_loot", p.ring_loot);
         p
     }
 
@@ -1237,6 +1252,10 @@ pub struct Brain {
     cubes_mem: BTreeMap<u32, [f32; 3]>,
     picks_mem: BTreeMap<u32, (String, [f32; 3])>,
     healing: bool,
+    /// Opening loop round the next zone (`ring_r`): started, over, and the way round (+1 anticlockwise, -1 clockwise, 0 = not chosen).
+    ring_init: bool,
+    ring_done: bool,
+    rl_dir: f32,
     kin: Kin,
     /// Recent actions sent, oldest first.
     sent: VecDeque<Sent>,
@@ -1416,6 +1435,9 @@ impl Brain {
             cubes_mem: BTreeMap::new(),
             picks_mem: BTreeMap::new(),
             healing: false,
+            ring_init: false,
+            ring_done: false,
+            rl_dir: 0.0,
             kin: Kin {
                 walk: f("mech", "walk_speed", 11.7),
                 boost: f("mech", "boost_speed", 19.5),
@@ -3483,6 +3505,79 @@ impl Brain {
             }
         }
 
+        // Opening from near the zone centre: a loop round the next zone, picking up loot on the way (`ring_r`).
+        if p.ring_r > 0.0 && !self.ring_done {
+            if !self.ring_init {
+                self.ring_init = true;
+                if ffa_on || d2(&pos, &z.center) > p.ring_r {
+                    self.ring_done = true;
+                }
+            }
+            if ffa_on || o.t >= p.ring_s || !enemies.is_empty() || o.t - self.last_mech_hurt_t < 3.0 || engaged || shoot_at.is_some() {
+                self.ring_done = true;
+            }
+            if !self.ring_done && matches!(label, "idle" | "seek" | "hunt" | "arm") {
+                let c = z.next_center;
+                let r = (z.next_radius * p.ring_f).min(z.radius - 25.0).max(10.0);
+                let off = [pos[0] - c[0], pos[1] - c[1]];
+                let d = off[0].hypot(off[1]);
+                let th = if d > 1.0 { off[1].atan2(off[0]) } else { 0.0 };
+                let loot: Vec<[f32; 3]> = self
+                    .crates_mem
+                    .values()
+                    .copied()
+                    .chain(self.cubes_mem.values().copied())
+                    .chain(self.picks_mem.values().map(|(_, q)| *q))
+                    .chain(o.crates.iter().chain(o.cubes.iter()).chain(o.pickups.iter()).map(|i| i.pos))
+                    .filter(|q| d2(q, &z.center) < z.radius - 10.0)
+                    .collect();
+                if self.rl_dir == 0.0 {
+                    // The way round with more loot near the ring ahead (within half a turn).
+                    let mut score = 0.0f32;
+                    for q in &loot {
+                        let qd = (q[0] - c[0]).hypot(q[1] - c[1]);
+                        if (qd - r).abs() < p.ring_loot + 40.0 {
+                            let mut da = (q[1] - c[1]).atan2(q[0] - c[0]) - th;
+                            while da > std::f32::consts::PI {
+                                da -= 2.0 * std::f32::consts::PI;
+                            }
+                            while da < -std::f32::consts::PI {
+                                da += 2.0 * std::f32::consts::PI;
+                            }
+                            score += da.signum();
+                        }
+                    }
+                    self.rl_dir = if score < 0.0 { -1.0 } else { 1.0 };
+                }
+                let route = if (d - r).abs() > 15.0 {
+                    let u = if d > 1.0 { [off[0] / d, off[1] / d] } else { [1.0, 0.0] };
+                    [c[0] + u[0] * r, c[1] + u[1] * r]
+                } else {
+                    let a2 = th + self.rl_dir * (40.0 / r).min(1.0);
+                    [c[0] + a2.cos() * r, c[1] + a2.sin() * r]
+                };
+                // Loot near the way: keep a loot run already under way if close, else take the nearest item
+                // within ring_loot m of us or of the route point.
+                let keep = matches!(label, "seek" | "arm")
+                    && loot.iter().any(|q| d2(q, &pos) < p.ring_loot + 15.0 && (q[0] - pos[0]) * mv[0] + (q[1] - pos[1]) * mv[1] > 0.0);
+                if !keep {
+                    let pick = loot
+                        .iter()
+                        .filter(|q| d2(*q, &pos) < p.ring_loot || d2(*q, &route) < p.ring_loot)
+                        .min_by(|x, y| d2(*x, &pos).partial_cmp(&d2(*y, &pos)).unwrap_or(std::cmp::Ordering::Equal))
+                        .copied();
+                    let goal = pick.map_or(route, |q| [q[0], q[1]]);
+                    if d2(&goal, &z.center) < z.radius - 10.0 {
+                        label = if pick.is_some() { "rloot" } else { "rloop" };
+                        mv = self.go(&pos, goal);
+                        boost = false;
+                        if enemies.is_empty() && shoot_at.is_none() {
+                            a.aim = [yaw_to(&pos, &goal), 0.0];
+                        }
+                    }
+                }
+            }
+        }
         // A held laser charge keeps its aim whatever the mode did with the torso.
         if let Some(la) = laser_aim {
             a.aim = la;
@@ -4137,6 +4232,7 @@ mod tests {
     fn base() -> Params {
         Params {
             dodge: 0.0,
+            ring_r: 0.0,
             crowd_retreat: 0.0,
             fight_pos: 0.0,
             late_hold: 0.0,
