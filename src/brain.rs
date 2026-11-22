@@ -384,6 +384,24 @@ pub struct Params {
     pub ffa_third_r: f32,
     pub ffa_late_r: f32,
     pub ffa_quiet: f32,
+    /// With no mech seen for `topup_after` seconds and the magazine below `topup_frac` of full, reload
+    /// (0 = off).
+    pub topup_after: f32,
+    pub topup_frac: f32,
+    /// Gun empty or reloading in a fight: keep fighting while the other weapon can fire; otherwise step out of
+    /// sight within `empty_cover` m and come back once loaded (0 = off).
+    pub empty_cover: f32,
+    pub empty_w2: f32,
+    /// Outside a sidestep, the zone, a climb or getting unstuck, don't boost on the ground below this energy
+    /// (practice matches only; 0 = off).
+    pub energy_reserve: f32,
+    /// With `energy_reserve`: a break-off or retreat may still boost below it (0 = no).
+    pub reserve_flee: f32,
+    /// After losing sight of the target, face (and, when healthy, walk toward) where it was last seen for this
+    /// many seconds instead of idling (0 = off).
+    pub target_mem: f32,
+    /// With `target_mem`: walk toward the remembered spot, not only face it (0 = face only).
+    pub target_go: f32,
 }
 
 impl Default for Params {
@@ -558,6 +576,14 @@ impl Default for Params {
             ffa_third_r: 220.0,
             ffa_late_r: 140.0,
             ffa_quiet: 4.6,
+            topup_after: 1.5,
+            topup_frac: 0.5,
+            empty_cover: 15.0,
+            empty_w2: 1.0,
+            energy_reserve: 30.0,
+            target_mem: 4.0,
+            target_go: 1.0,
+            reserve_flee: 1.0,
         }
     }
 }
@@ -736,6 +762,14 @@ impl Params {
         p.ffa_third_r = g("ffa_third_r", p.ffa_third_r);
         p.ffa_late_r = g("ffa_late_r", p.ffa_late_r);
         p.ffa_quiet = g("ffa_quiet", p.ffa_quiet);
+        p.topup_after = g("topup_after", p.topup_after);
+        p.topup_frac = g("topup_frac", p.topup_frac);
+        p.empty_cover = g("empty_cover", p.empty_cover);
+        p.empty_w2 = g("empty_w2", p.empty_w2);
+        p.energy_reserve = g("energy_reserve", p.energy_reserve);
+        p.target_mem = g("target_mem", p.target_mem);
+        p.target_go = g("target_go", p.target_go);
+        p.reserve_flee = g("reserve_flee", p.reserve_flee);
         p
     }
 
@@ -1026,6 +1060,10 @@ pub struct Brain {
     pub dbg_kills: Vec<(f32, Option<u32>, Option<u32>)>,
     pub dbg_mode: String,
     pub dbg_enemies: Vec<ffa::EnemyInfo>,
+    /// Last time any mech was in view.
+    mech_seen_t: f32,
+    /// The last target: where it was, how it moved and when it was last in view.
+    last_target: Option<([f32; 3], [f32; 3], f32)>,
 }
 
 impl Brain {
@@ -1162,6 +1200,8 @@ impl Brain {
             dbg_kills: Vec::new(),
             dbg_mode: String::new(),
             dbg_enemies: Vec::new(),
+            mech_seen_t: -100.0,
+            last_target: None,
         }
     }
 
@@ -1979,6 +2019,9 @@ impl Brain {
 
         // --- enemies and target
         let enemies: Vec<&Actor> = o.mechs.iter().filter(|m| m.kind == "mech" && !(m.max_hp > 0.0 && m.hp <= 0.0)).collect();
+        if !enemies.is_empty() {
+            self.mech_seen_t = o.t;
+        }
         let near_enemies = enemies.iter().filter(|m| d2(&m.pos, &pos) < p.crowd_radius).count();
         let no_laser = !me.weapons.iter().flatten().any(|w| w.kind == "laser");
         // With `late_hold`, the late game starts once the next circle is small.
@@ -2076,6 +2119,7 @@ impl Brain {
         self.focus = new_focus;
         if let Some(t) = target {
             self.threat = Some((t.pos, o.t));
+            self.last_target = Some((t.pos, t.vel, o.t));
         }
         if self.threat.map_or(false, |(_, t)| o.t - t > 8.0) {
             self.threat = None;
@@ -2236,7 +2280,9 @@ impl Brain {
             // With a laser shot on the way, reload a low magazine now so the gun is back when the beam is spent.
             let laser_busy = me.weapons.iter().flatten().any(|w| w.kind == "laser" && w.charge > 0.0);
             let early = p.reload_early > 0.0 && laser_busy && g.ammo <= p.reload_early;
-            if g.reload <= 0.0 && (g.ammo <= 0.0 || early || (!engaged && g.ammo < mag * 0.6)) {
+            // Nobody in view for a while: top up a half-empty magazine before the next fight.
+            let topup = p.topup_after > 0.0 && o.t - self.mech_seen_t >= p.topup_after && g.ammo < mag * p.topup_frac;
+            if g.reload <= 0.0 && (g.ammo <= 0.0 || early || topup || (!engaged && g.ammo < mag * 0.6)) {
                 a.reload = true;
             }
         }
@@ -2845,8 +2891,18 @@ impl Brain {
                 .map(|k| [k.pos[0], k.pos[1], k.pos[2] + 8.0])
                 .collect();
             let laser_up = has_laser && p.reload_laser <= 0.0 && me.weapons.iter().flatten().any(|w| w.kind == "laser" && w.cooldown < 0.8);
-            let hide = if p.reload_hide > 0.0 && reloading && !(has_arc && dist < 45.0) && !finishing && !laser_up {
-                self.hide_step(&pos, &eyes, p.reload_hide)
+            // Gun empty: fight on with the other weapon while it can fire, else step out of sight close by.
+            let other_ready = p.empty_cover > 0.0
+                && p.empty_w2 > 0.0
+                && me.weapons.iter().take(2).flatten().any(|w| match w.kind.as_str() {
+                    "laser" => w.charge > 0.0 || w.cooldown <= 0.3,
+                    "lightning" => dist < w.stat("range", 45.0) - 2.0 && me.energy >= w.stat("energy", 3.0),
+                    "mortar" => w.cooldown <= 0.3,
+                    _ => false,
+                });
+            let hide_r = if p.empty_cover > 0.0 { p.empty_cover } else { p.reload_hide };
+            let hide = if hide_r > 0.0 && reloading && !other_ready && !(has_arc && dist < 45.0) && !finishing && !laser_up {
+                self.hide_step(&pos, &eyes, hide_r)
             } else {
                 None
             };
@@ -2913,6 +2969,19 @@ impl Brain {
                     self.scan(&mut a);
                 }
             }
+            // Just lost the target: keep facing where it should be and, when healthy, go after it.
+            if label == "idle" && p.target_mem > 0.0 && !must_rotate {
+                if let Some((lp, lv, lt)) = self.last_target.filter(|x| o.t - x.2 < p.target_mem) {
+                    let dt = (o.t - lt).min(1.5);
+                    let q = [lp[0] + lv[0] * dt, lp[1] + lv[1] * dt, lp[2] + 4.5];
+                    label = "recall";
+                    let muzzle = [pos[0], pos[1], pos[2] + me.stat("muzzle_height", 7.0)];
+                    a.aim = [yaw_to(&muzzle, &q), (q[2] - muzzle[2]).atan2(d2(&q, &muzzle).max(0.1))];
+                    if p.target_go > 0.0 && hp_frac > p.hunt_hp && !self.healing && d2(&q, &pos) > 20.0 {
+                        mv = self.go(&pos, [q[0], q[1]]);
+                    }
+                }
+            }
             let armed = p.hunt_any > 0.0 || me.weapons.iter().flatten().any(|w| w.kind == "laser");
             if label == "idle" && p.hunt > 0.0 && armed && hp_frac > p.hunt_hp && !self.healing && !must_rotate {
                 let seen = self
@@ -2977,9 +3046,11 @@ impl Brain {
         }
 
         // Sidestep an incoming shot.
+        let mut dodging = ducked;
         if p.dodge > 0.0 && label != "zone" && label != "climb" && o.t >= self.unstick_until && self.dodge_check(o, target, mv, &threats) {
             mv = self.dodge_dir;
             boost = me.energy > 3.0;
+            dodging = true;
         }
 
         // --- stuck: wanting to move but not moving means a ledge or a wall; hop and jet over it
@@ -3048,6 +3119,12 @@ impl Brain {
                     a.fire[i] = false;
                 }
             }
+        }
+        // Keep enough energy for a sidestep or a getaway.
+        if p.energy_reserve > 0.0 && !ffa_on && boost && me.grounded && me.energy < p.energy_reserve && !dodging && label != "zone" && label != "climb" && o.t >= self.unstick_until
+            && !(p.reserve_flee > 0.0 && matches!(label, "cbreak" | "kite" | "kitec" | "heal" | "crowd" | "leave"))
+        {
+            boost = false;
         }
         a.boost = boost;
         if !a.aim.iter().all(|v| v.is_finite()) {
@@ -3891,5 +3968,86 @@ mod tests {
                 assert!(pos(s) < pos(d), "{s} after {d}");
             }
         }
+    }
+
+
+    fn self_obs(t: f32, energy: f32, gun: &str, laser: &str, mechs: &str, projectiles: &str) -> Obs {
+        let s = format!(
+            r#"{{"tick": {}, "t": {t},
+              "self": {{"pos": [0,0,0], "aim": [0,0], "hp": 1400, "max_hp": 1400, "energy": {energy}, "grounded": true, "in_zone": true,
+                        "weapons": [{gun}, {laser}]}},
+              "mechs": [{mechs}], "projectiles": [{projectiles}],
+              "zone": {{"center": [0,0], "radius": 500, "next_center": [0,0], "next_radius": 400, "shrink_start": 100}}}}"#,
+            (t * 20.0) as u64
+        );
+        serde_json::from_str(&s).unwrap()
+    }
+
+    const GUN5: &str = r#"{"kind": "gun", "ammo": 5}"#;
+    const GUN12: &str = r#"{"kind": "gun", "ammo": 12}"#;
+
+    #[test]
+    fn half_empty_magazine_is_topped_up_with_nobody_in_view() {
+        // Shooting a drone (so the plain rule leaves the magazine alone): topped up once no mech was seen lately.
+        let p = Params { drone_threat: 1.0, ..base() };
+        let a = with(p.clone()).decide(&self_obs(5.0, 100.0, GUN5, "null", DRONE, ""), [0.0; 3]);
+        assert!(a.reload, "no top-up: {a:?}");
+        let a = with(Params { topup_after: 0.0, ..p.clone() }).decide(&self_obs(5.0, 100.0, GUN5, "null", DRONE, ""), [0.0; 3]);
+        assert!(!a.reload, "reloaded with the top-up off");
+        // A mech just seen: no top-up while it is around.
+        let mut b = with(p.clone());
+        b.decide(&self_obs(5.0, 100.0, GUN12, "null", MECH, ""), [0.0; 3]);
+        let a = b.decide(&self_obs(5.5, 100.0, GUN5, "null", DRONE, ""), [0.0; 3]);
+        assert!(!a.reload, "topped up half a second after a mech was in view");
+        let a = b.decide(&self_obs(7.5, 100.0, GUN5, "null", DRONE, ""), [0.0; 3]);
+        assert!(a.reload, "no top-up 2 s after the mech");
+    }
+
+    #[test]
+    fn low_energy_is_kept_for_a_sidestep() {
+        // Fighting with a boost on any energy: below the reserve no boost, above it boost.
+        let p = Params { fight_boost: 5.0, ..base() };
+        let a = with(p.clone()).decide(&self_obs(5.0, 25.0, GUN12, "null", MECH, ""), [0.0; 3]);
+        assert!(!a.boost, "boosted at 25 energy");
+        let a = with(Params { energy_reserve: 0.0, ..p.clone() }).decide(&self_obs(5.0, 25.0, GUN12, "null", MECH, ""), [0.0; 3]);
+        assert!(a.boost, "no boost with the reserve off");
+        let a = with(p.clone()).decide(&self_obs(5.0, 50.0, GUN12, "null", MECH, ""), [0.0; 3]);
+        assert!(a.boost, "no boost at 50 energy");
+        // The sidestep itself still boosts below the reserve.
+        let bullet = r#"{"id": 280, "kind": "gun", "pos": [60, 0, 5], "vel": [-252, 0, 0]}"#;
+        let a = with(Params { dodge: 1.0, dodge_energy: 20.0, ..p }).decide(&self_obs(5.0, 25.0, GUN12, "null", MECH, bullet), [0.0; 3]);
+        assert!(a.boost && a.mv[1].abs() > 0.9, "sidestep without boost: {:?} {}", a.mv, a.boost);
+    }
+
+    #[test]
+    fn lost_target_is_faced_and_followed() {
+        let side = r#"{"id": 3, "kind": "mech", "pos": [0, 60, 0], "vel": [0, 0, 0], "aim": [-1.5708, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let mut b = with(base());
+        b.decide(&self_obs(5.0, 100.0, GUN12, "null", side, ""), [0.0; 3]);
+        let a = b.decide(&self_obs(6.0, 100.0, GUN12, "null", "", ""), [0.0; 3]);
+        assert_eq!(b.label, "recall");
+        assert!((a.aim[0] - std::f32::consts::FRAC_PI_2).abs() < 0.1, "aim {:?}", a.aim);
+        assert!(a.mv[1] > 0.7, "move {:?}", a.mv);
+        b.decide(&self_obs(8.5, 100.0, GUN12, "null", "", ""), [0.0; 3]);
+        assert_eq!(b.label, "recall");
+        b.decide(&self_obs(9.5, 100.0, GUN12, "null", "", ""), [0.0; 3]);
+        assert_ne!(b.label, "recall", "remembered for more than 4 s");
+        // Face only, when hurt.
+        let mut b = with(base());
+        let hurt = |t: f32, m: &str| {
+            let mut o = self_obs(t, 100.0, GUN12, "null", m, "");
+            o.me.hp = 600.0;
+            o
+        };
+        b.decide(&hurt(5.0, side), [0.0; 3]);
+        let a = b.decide(&hurt(6.0, ""), [0.0; 3]);
+        if b.label == "recall" {
+            assert!(a.mv[1] < 0.7, "followed while hurt: {:?}", a.mv);
+        }
+        // Off: nothing remembered.
+        let mut b = with(Params { target_mem: 0.0, ..base() });
+        b.decide(&self_obs(5.0, 100.0, GUN12, "null", side, ""), [0.0; 3]);
+        b.decide(&self_obs(6.0, 100.0, GUN12, "null", "", ""), [0.0; 3]);
+        assert_ne!(b.label, "recall");
     }
 }
