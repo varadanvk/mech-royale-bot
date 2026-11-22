@@ -582,7 +582,7 @@ impl Default for Params {
             laser_seek: 0.0,
             explore: 0.0,
             explore_r: 110.0,
-            roof: 0.0,
+            roof: 1.0,
             roof_cost: 40.0,
             roof_energy: 55.0,
             loot_target: 0.0,
