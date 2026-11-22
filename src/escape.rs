@@ -72,7 +72,7 @@ impl Brain {
             let best = self
                 .beliefs
                 .iter()
-                .filter(|b| b.id.is_some() && b.alone && b.conf >= 0.5 && d2(&b.pos, &here) < p.duel_r && (b.est_hp <= my_hp || b.cornered))
+                .filter(|b| b.id.is_some() && b.alone && b.conf >= 0.5 && d2(&b.pos, &here) < p.duel_r && (b.est_hp <= my_hp * p.duel_ratio || b.cornered))
                 .filter(|b| !self.beliefs.iter().any(|c| c.id != b.id && c.conf >= 0.3 && d2(&c.pos, &here) < p.duel_r))
                 .min_by(|x, y| (d2(&x.pos, &here) + 0.1 * x.est_hp).partial_cmp(&(d2(&y.pos, &here) + 0.1 * y.est_hp)).unwrap_or(std::cmp::Ordering::Equal))
                 .and_then(|b| b.id);

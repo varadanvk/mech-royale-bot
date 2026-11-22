@@ -395,13 +395,15 @@ pub struct Params {
     pub esc_cool: f32,
     pub esc_quiet: f32,
     /// Duel a lone enemy (needs `infer`; 0 = off): one with no other believed enemy near it, within `duel_r`,
-    /// with no more hit points than us or cornered, while we are above `duel_hp` and nobody else is believed
+    /// with at most `duel_ratio` times our hit points or cornered, while we are above `duel_hp` and nobody else is believed
     /// within `duel_r` of us. Commit to it: go to it, fight it, no loot; glance at anything believed behind us
     /// every `duel_glance` seconds when no shot is lined up.
     pub duel: f32,
     pub duel_r: f32,
     pub duel_hp: f32,
     pub duel_glance: f32,
+    /// A duel is started on an enemy with up to this many times our hit points.
+    pub duel_ratio: f32,
 }
 
 impl Default for Params {
@@ -584,6 +586,7 @@ impl Default for Params {
             duel_r: 120.0,
             duel_hp: 0.6,
             duel_glance: 2.5,
+            duel_ratio: 1.25,
         }
     }
 }
@@ -770,6 +773,7 @@ impl Params {
         p.duel_r = g("duel_r", p.duel_r);
         p.duel_hp = g("duel_hp", p.duel_hp);
         p.duel_glance = g("duel_glance", p.duel_glance);
+        p.duel_ratio = g("duel_ratio", p.duel_ratio);
         p
     }
 
