@@ -387,10 +387,10 @@ impl Default for Params {
             break_laser: 1000.0,
             break_los: 0.0,
             break_los_hp: 0.8,
-            collect: 0.0,
+            collect: 1.0,
             collect_s: 15.0,
             collect_hp: 0.3,
-            collect_seen: 2.0,
+            collect_seen: 1.0,
             arm_keep: 0.0,
             wall_t: 170.0,
             wall_r: 290.0,
@@ -422,7 +422,7 @@ impl Default for Params {
             laser_hold: 0.0,
             drone_threat: 0.0,
             focus_aimer: 0.0,
-            arm_crates: 0.0,
+            arm_crates: 1.0,
             rush_guard: 0.0,
         }
     }
