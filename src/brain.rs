@@ -340,6 +340,9 @@ pub struct Params {
     pub home_speed: f32,
     /// Before the late game, take on only enemies that are close, come for us or are weak (0 = off).
     pub engage_filter: f32,
+    /// Outside a free-for-all: after a kill, or after 3 s idle at 70% health or more, with no enemy in view,
+    /// walk toward the nearest enemy we know of until one is in view (0 = off).
+    pub seek: f32,
     /// Laser: count the cook-off on mortar holders when releasing early for a kill, and never charge outside
     /// the zone (0 = off).
     pub laser_fix: f32,
@@ -547,6 +550,7 @@ impl Default for Params {
             home_s: 12.0,
             home_speed: 4.6,
             engage_filter: 1.0,
+            seek: 1.0,
             laser_fix: 1.0,
             fight_cubes: 1.0,
             fight_cube_r: 70.0,
@@ -730,6 +734,7 @@ impl Params {
         p.home_s = g("home_s", p.home_s);
         p.home_speed = g("home_speed", p.home_speed);
         p.engage_filter = g("engage_filter", p.engage_filter);
+        p.seek = g("seek", p.seek);
         p.laser_fix = g("laser_fix", p.laser_fix);
         p.fight_cubes = g("fight_cubes", p.fight_cubes);
         p.fight_cube_r = g("fight_cube_r", p.fight_cube_r);
@@ -986,6 +991,9 @@ pub struct Brain {
     ring_until: f32,
     /// Enemies that showed they are after us (aimed at us, hurt us or came close): id -> last time.
     hunters: BTreeMap<u32, f32>,
+    /// `seek`: going after the nearest known enemy, and since when we have been idle with no enemy in view.
+    seeking: bool,
+    idle_since: Option<f32>,
     /// Lines of sight over the map and the sheltered spots (built when `spot` is on).
     pub sight: Option<Arc<SightTable>>,
     /// Sheltered-ground mode stays on until this time.
@@ -1144,6 +1152,8 @@ impl Brain {
             ring_dir: 1.0,
             ring_until: -1.0,
             hunters: BTreeMap::new(),
+            seeking: false,
+            idle_since: None,
             sight,
             spot_until: -1.0,
             spot_pick: None,
@@ -1970,6 +1980,7 @@ impl Brain {
                 if let Some(k) = e.target.and_then(|id| self.known.get(&id)) {
                     self.kill_spot = Some((k.pos, o.t));
                 }
+                self.seeking = true;
             }
             if e.kind == "damaged" {
                 if let Some(by) = e.by {
@@ -2000,6 +2011,10 @@ impl Brain {
 
         // --- enemies and target
         let enemies: Vec<&Actor> = o.mechs.iter().filter(|m| m.kind == "mech" && !(m.max_hp > 0.0 && m.hp <= 0.0)).collect();
+        if !enemies.is_empty() {
+            self.seeking = false;
+            self.idle_since = None;
+        }
         let near_enemies = enemies.iter().filter(|m| d2(&m.pos, &pos) < p.crowd_radius).count();
         let no_laser = !me.weapons.iter().flatten().any(|w| w.kind == "laser");
         // With `late_hold`, the late game starts once the next circle is small.
@@ -3002,6 +3017,31 @@ impl Brain {
                     }
                 }
             }
+            if p.seek > 0.0 && !ffa_on && enemies.is_empty() {
+                if label == "idle" {
+                    let since = *self.idle_since.get_or_insert(o.t);
+                    let go_now = self.seeking || (o.t - since >= 3.0 && hp_frac >= 0.7);
+                    if go_now && !self.healing && !must_rotate {
+                        // Nearest enemy we believe in, else the nearest remembered one.
+                        let near = |a: &[f32; 2], b: &[f32; 2]| d2(a, &pos).partial_cmp(&d2(b, &pos)).unwrap_or(std::cmp::Ordering::Equal);
+                        let goal = self
+                            .beliefs
+                            .iter()
+                            .filter(|b| b.conf > 0.1)
+                            .map(|b| b.pos)
+                            .min_by(near)
+                            .or_else(|| self.known.values().map(|k| [k.pos[0], k.pos[1]]).min_by(near))
+                            .filter(|g| d2(g, &z.center) < z.radius - 10.0);
+                        if let Some(g) = goal {
+                            label = "seek";
+                            mv = self.go(&pos, g);
+                            a.aim = [yaw_to(&pos, &g), 0.0];
+                        }
+                    }
+                } else {
+                    self.idle_since = None;
+                }
+            }
         }
 
         // A held laser charge keeps its aim whatever the mode did with the torso.
@@ -3917,6 +3957,25 @@ mod tests {
         let mut b = with(Params { counter: 0.0, ..base() });
         b.decide(&obs(away, ""), [0.0; 3]);
         assert_eq!(b.focus, Some(3));
+    }
+
+    #[test]
+    fn idle_goes_after_the_nearest_known_enemy() {
+        let away = r#"{"id": 3, "kind": "mech", "pos": [100, 0, 0], "aim": [0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        for (on, want) in [(1.0, true), (0.0, false)] {
+            let mut b = with(Params { seek: on, ..base() });
+            let mut o = obs(away, "");
+            b.decide(&o, [0.0; 3]);
+            o.mechs.clear();
+            o.t = 5.5;
+            b.decide(&o, [0.0; 3]);
+            o.t = 9.0;
+            let a = b.decide(&o, [0.0; 3]);
+            assert_eq!(b.label == "seek", want, "label {}", b.label);
+            if want {
+                assert!(a.mv[0] > 0.5, "mv {:?}", a.mv);
+            }
+        }
     }
 
     #[test]
