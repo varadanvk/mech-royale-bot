@@ -186,6 +186,8 @@ pub struct Params {
     pub no_mortar: f32,
     /// Without a laser: go for a known laser on the ground within this distance even with both slots full (0 = off).
     pub laser_seek: f32,
+    /// In a fight, or with a recently seen enemy near the laser, `laser_seek` only goes for one closer than this.
+    pub laser_seek_busy: f32,
     /// Without a laser and nothing else to do: walk toward the nearest part of the map not looked at yet (0 = off).
     pub explore: f32,
     /// Map cells within this distance of us count as looked at.
@@ -570,7 +572,8 @@ impl Default for Params {
             hunt: 0.0,
             hunt_hp: 0.8,
             no_mortar: 0.0,
-            laser_seek: 0.0,
+            laser_seek: 250.0,
+            laser_seek_busy: 40.0,
             explore: 0.0,
             explore_r: 110.0,
             roof: 0.0,
@@ -818,6 +821,7 @@ impl Params {
         p.hunt_hp = g("hunt_hp", p.hunt_hp);
         p.no_mortar = g("no_mortar", p.no_mortar);
         p.laser_seek = g("laser_seek", p.laser_seek);
+        p.laser_seek_busy = g("laser_seek_busy", p.laser_seek_busy);
         p.explore = g("explore", p.explore);
         p.explore_r = g("explore_r", p.explore_r);
         p.roof = g("roof", p.roof);
@@ -2742,7 +2746,10 @@ impl Brain {
                 .filter(|(_, (k, q))| {
                     let r = weapon_rank(k, &p);
                     let d = d2(q, &pos);
-                    let laser = k == "laser" && p.laser_seek > 0.0 && d < p.laser_seek;
+                    // Not through a fight: while fighting, or with an enemy seen lately near the laser, only one close by.
+                    let busy = (target.is_some() && (engaged || recently_hurt_by_mech))
+                        || self.known.values().any(|e| o.t - e.seen_t < 4.0 && d2(&e.pos, q) < 60.0);
+                    let laser = k == "laser" && p.laser_seek > 0.0 && !ffa_on && d < p.laser_seek && (!busy || d < p.laser_seek_busy);
                     let up = q[2] - self.ground(q[0], q[1], q[2]);
                     let reachable = up.abs() < 3.0 || (p.roof > 0.0 && up < 22.0);
                     r > 0 && (laser || ((empty_slot || r > worst_rank) && d < reach)) && !held.contains(&k.as_str()) && reachable
@@ -4237,6 +4244,32 @@ mod tests {
         let mut b = with(Params { focus_aimer: 40.0, ..base() });
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.focus, Some(4));
+    }
+
+    #[test]
+    fn goes_out_of_the_way_for_a_laser_and_swaps_it_in() {
+        let mut o = obs("", "");
+        o.mechs.clear();
+        o.me.weapons = vec![Some(Weapon { kind: "gun".into(), ammo: 12.0, ..Default::default() }), Some(Weapon { kind: "lightning".into(), ..Default::default() })];
+        o.pickups = vec![crate::proto::Item { id: 8000, kind: "laser".into(), pos: [0.0, 200.0, 0.0], ..Default::default() }];
+        let mut b = brain();
+        let a = b.decide(&o, [0.0; 3]);
+        assert_eq!(b.label, "arm");
+        assert!(a.mv[1] > 0.9, "move {:?}", a.mv);
+        let mut b = with(Params { laser_seek: 0.0, ..base() });
+        b.decide(&o, [0.0; 3]);
+        assert_ne!(b.label, "arm");
+        // Standing on it: the lightning goes, the gun stays.
+        o.pickups[0].pos = [1.0, 0.0, 0.0];
+        let a = brain().decide(&o, [0.0; 3]);
+        assert_eq!((a.take, a.drop), (Some(8000), Some(1)));
+        // Not past a fight to a far one.
+        let mut o = obs(MECH, "");
+        o.me.weapons = vec![Some(Weapon { kind: "gun".into(), ammo: 12.0, ..Default::default() }), Some(Weapon { kind: "lightning".into(), ..Default::default() })];
+        o.pickups = vec![crate::proto::Item { id: 8000, kind: "laser".into(), pos: [0.0, 200.0, 0.0], ..Default::default() }];
+        let mut b = brain();
+        b.decide(&o, [0.0; 3]);
+        assert_ne!(b.label, "arm");
     }
 
     #[test]
