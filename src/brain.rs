@@ -499,6 +499,11 @@ pub struct Params {
     pub stay_fight: f32,
     /// See stay_fight.
     pub stay_cover: f32,
+    /// With two or more enemies about, walk a clear lane that bunches them in front of us while fighting: act when
+    /// they spread wider than this many radians as seen from us (practice matches only; 0 = off).
+    pub lane: f32,
+    /// How much of the usual fight movement is kept on top of the lane direction.
+    pub lane_mix: f32,
 }
 
 impl Default for Params {
@@ -728,6 +733,8 @@ impl Default for Params {
             ffa_plain: 1.0,
             stay_fight: 2.0,
             stay_cover: 0.0,
+            lane: 0.6,
+            lane_mix: 0.4,
         }
     }
 }
@@ -976,6 +983,8 @@ impl Params {
         p.ffa_plain = g("ffa_plain", p.ffa_plain);
         p.stay_fight = g("stay_fight", p.stay_fight);
         p.stay_cover = g("stay_cover", p.stay_cover);
+        p.lane = g("lane", p.lane);
+        p.lane_mix = g("lane_mix", p.lane_mix);
         p
     }
 
@@ -1248,6 +1257,8 @@ pub struct Brain {
     trace_dmg: bool,
     /// Target of the lightning rush in progress.
     rushing: Option<u32>,
+    /// Direction of the lane we are walking while fighting several enemies.
+    lane_prev: Option<[f32; 2]>,
     /// When our laser charge became full (None while not full).
     laser_full_t: Option<f32>,
     /// Coarse map cells we have been near (for weapon search): flag per cell.
@@ -1430,6 +1441,7 @@ impl Brain {
             label: "",
             trace_dmg: std::env::var("TDMG").is_ok(),
             rushing: None,
+            lane_prev: None,
             laser_full_t: None,
             looked: Vec::new(),
             arm_pick: None,
@@ -1513,6 +1525,71 @@ impl Brain {
 
     fn walkable(&self, x: f32, y: f32) -> bool {
         self.nav.as_ref().map_or(true, |n| n.walkable(x, y))
+    }
+
+    /// Smallest arc (radians) holding the bearings from `from` to every point.
+    fn spread(from: &[f32], pts: &[[f32; 3]]) -> f32 {
+        if pts.len() < 2 {
+            return 0.0;
+        }
+        let mut b: Vec<f32> = pts.iter().map(|q| (q[1] - from[1]).atan2(q[0] - from[0])).collect();
+        b.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+        let mut gap = b[0] + std::f32::consts::TAU - b[b.len() - 1];
+        for i in 1..b.len() {
+            gap = gap.max(b[i] - b[i - 1]);
+        }
+        std::f32::consts::TAU - gap
+    }
+
+    /// With two or more enemies about, a direction along clear walkable ground that brings them all into one arc in
+    /// front of us, keeping to the lane we were already on where it still works.
+    fn lane_dir(&mut self, o: &Obs, pos: &[f32; 3], min_spread: f32) -> Option<[f32; 2]> {
+        let foes: Vec<[f32; 3]> = self.known.values().filter(|k| o.t - k.seen_t < 3.0 && d2(&k.pos, pos) < 150.0).map(|k| k.pos).collect();
+        if foes.len() < 2 {
+            self.lane_prev = None;
+            return None;
+        }
+        let s0 = Self::spread(pos, &foes);
+        let keep = self.lane_prev.is_some();
+        if s0 < if keep { min_spread * 0.6 } else { min_spread } {
+            self.lane_prev = None;
+            return None;
+        }
+        let z = &o.zone;
+        let mut best: Option<([f32; 2], f32)> = None;
+        for i in 0..16 {
+            let a = i as f32 * std::f32::consts::TAU / 16.0;
+            let d = [a.cos(), a.sin()];
+            let mut len = 0.0;
+            let mut s = 3.0;
+            while s <= 30.0 {
+                let q = [pos[0] + d[0] * s, pos[1] + d[1] * s];
+                if !self.walkable(q[0], q[1]) || d2(&q, &z.center) > z.radius - 8.0 {
+                    break;
+                }
+                len = s;
+                s += 3.0;
+            }
+            if len < 9.0 {
+                continue;
+            }
+            let r = len.min(15.0);
+            let q = [pos[0] + d[0] * r, pos[1] + d[1] * r, pos[2]];
+            let sp = Self::spread(&q, &foes);
+            let near = foes.iter().map(|f| d2(f, &q)).fold(f32::MAX, f32::min);
+            let mut cost = sp - 0.01 * len;
+            if near < 25.0 {
+                cost += (25.0 - near) * 0.05;
+            }
+            if let Some(pd) = self.lane_prev {
+                cost += 0.3 * (1.0 - (d[0] * pd[0] + d[1] * pd[1]));
+            }
+            if sp < s0 - 0.05 && best.map_or(true, |(_, c)| cost < c) {
+                best = Some((d, cost));
+            }
+        }
+        self.lane_prev = best.map(|b| b.0);
+        self.lane_prev
     }
 
     /// Straight ground line between two points is walkable.
@@ -3334,6 +3411,13 @@ impl Brain {
                 boost = me.energy > 30.0;
             } else if p.expose_weight > 0.0 && p.fight_pos <= 0.0 {
                 mv = self.less_exposed(o, &pos, t, mv, p.expose_weight);
+            }
+            if p.lane > 0.0 && !ffa_on && label == "fight" && laser_on.is_none() {
+                if let Some(d) = self.lane_dir(o, &pos, p.lane) {
+                    let w = p.lane_mix;
+                    mv = norm2(d[0] + mv[0] * w, d[1] + mv[1] * w);
+                    label = "lane";
+                }
             }
             mv = [mv[0] * p.fight_speed, mv[1] * p.fight_speed];
             boost = boost || (laser_on.is_some() && me.energy > 10.0);
