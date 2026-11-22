@@ -490,6 +490,10 @@ pub struct Params {
     pub stay_fight: f32,
     /// See stay_fight.
     pub stay_cover: f32,
+    /// seek_idle: start after this many seconds idle with no enemy in view.
+    pub idle_wait: f32,
+    /// seek_idle: start only at this HP fraction or more.
+    pub idle_hp: f32,
 }
 
 impl Default for Params {
@@ -717,6 +721,8 @@ impl Default for Params {
             ffa_plain: 1.0,
             stay_fight: 1.0,
             stay_cover: 15.0,
+            idle_wait: 0.0,
+            idle_hp: 0.4,
         }
     }
 }
@@ -963,6 +969,8 @@ impl Params {
         p.ffa_plain = g("ffa_plain", p.ffa_plain);
         p.stay_fight = g("stay_fight", p.stay_fight);
         p.stay_cover = g("stay_cover", p.stay_cover);
+        p.idle_wait = g("idle_wait", p.idle_wait);
+        p.idle_hp = g("idle_hp", p.idle_hp);
         p
     }
 
@@ -3321,7 +3329,7 @@ impl Brain {
             if p.seek_idle > 0.0 && !ffa_on && enemies.is_empty() {
                 if label == "idle" {
                     let since = *self.idle_since.get_or_insert(o.t);
-                    let go_now = self.seeking || (o.t - since >= 3.0 && hp_frac >= 0.7);
+                    let go_now = self.seeking || (o.t - since >= p.idle_wait && hp_frac >= p.idle_hp);
                     if go_now && !self.healing && !must_rotate {
                         // Nearest enemy we believe in, else the nearest remembered one.
                         let near = |a: &[f32; 2], b: &[f32; 2]| d2(a, &pos).partial_cmp(&d2(b, &pos)).unwrap_or(std::cmp::Ordering::Equal);
