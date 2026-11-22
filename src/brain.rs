@@ -3028,10 +3028,10 @@ mod tests {
     fn late_fights_are_fought_moving() {
         let mut o = obs(MECH, "");
         o.t = 200.0;
-        let mut b = brain();
+        let mut b = with(Params { ring: 0.0, ..Params::default() });
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "fight");
-        let mut b = Brain::with_params(&Hello::default(), None, None, Params { hold_fight: 0.0, ..Params::default() });
+        let mut b = with(Params { hold_fight: 0.0, ring: 0.0, ..Params::default() });
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "hold");
     }
@@ -3056,7 +3056,7 @@ mod tests {
         let arc = r#"{"id": 3, "kind": "mech", "pos": [40, 0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun", "lightning"]}"#;
         let mut o = obs(arc, "");
         o.t = 200.0;
-        let params = Params { hold_fight: 0.0, ..Params::default() };
+        let params = Params { hold_fight: 0.0, ring: 0.0, ..Params::default() };
         let mut b = Brain::with_params(&Hello::default(), None, None, params.clone());
         let a = b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "hold");
