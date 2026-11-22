@@ -274,6 +274,9 @@ pub struct Params {
     /// Take on drones by choice (farming, chasing). 0: only shoot back at a drone that hurt us in the last
     /// 3 s while no mech is in view, and never move toward one.
     pub drone_fight: f32,
+    /// Late in the match, a live fight (a target in sight while engaged or recently hurt by a mech) is fought
+    /// with normal movement instead of holding a spot, and holding weaves across the nearest shooter.
+    pub hold_fight: f32,
 }
 
 impl Default for Params {
@@ -396,6 +399,7 @@ impl Default for Params {
             solo_hp: 0.0,
             close_boost: 30.0,
             drone_fight: 0.0,
+            hold_fight: 1.0,
         }
     }
 }
@@ -522,6 +526,7 @@ impl Params {
         p.solo_hp = g("solo_hp", p.solo_hp);
         p.close_boost = g("close_boost", p.close_boost);
         p.drone_fight = g("drone_fight", p.drone_fight);
+        p.hold_fight = g("hold_fight", p.hold_fight);
         p
     }
 
@@ -1958,6 +1963,7 @@ impl Brain {
             None
         };
         let late = (p.wall_t > 0.0 && o.t >= p.wall_t) || (p.wall_t > 0.0 && o.zone.radius <= p.wall_r);
+        let live_fight = p.hold_fight > 0.0 && target.is_some() && (engaged || recently_hurt_by_mech);
         let mut boost = false;
         let mut mv: [f32; 2];
         let mut label = "idle";
@@ -2061,7 +2067,7 @@ impl Brain {
                     a.aim = [yaw_to(&pos, th), 0.0];
                 }
             }
-        } else if late && !self.fleeing {
+        } else if late && !self.fleeing && !live_fight {
             if p.wall_mode >= 2.0 {
                 // Keep away from the enemies we know of, inside the zone.
                 label = "evade";
@@ -2316,7 +2322,7 @@ impl Brain {
             }
         }
         // Outside a fight, still weave across the line of the nearest shooter.
-        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "fight" || label == "rush" || label == "climb" || label == "hold" || label == "drone" || label == "reload" || label == "stand" || label == "peek" || label == "hide" || label == "repeek") {
+        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "fight" || label == "rush" || label == "climb" || (label == "hold" && p.hold_fight <= 0.0) || label == "drone" || label == "reload" || label == "stand" || label == "peek" || label == "hide" || label == "repeek") {
             if o.t >= self.strafe_until {
                 self.next_strafe(o.t);
             }
@@ -2754,6 +2760,18 @@ mod tests {
         assert!(a.aim[0].abs() < 0.2, "not aimed at the drone");
         let a = brain().decide(&obs(MECH, ""), [0.0; 3]);
         assert!(a.fire[1], "laser not charged at a mech");
+    }
+
+    #[test]
+    fn late_fights_are_fought_moving() {
+        let mut o = obs(MECH, "");
+        o.t = 200.0;
+        let mut b = brain();
+        b.decide(&o, [0.0; 3]);
+        assert_eq!(b.label, "fight");
+        let mut b = Brain::with_params(&Hello::default(), None, None, Params { hold_fight: 0.0, ..Params::default() });
+        b.decide(&o, [0.0; 3]);
+        assert_eq!(b.label, "hold");
     }
 
     #[test]
