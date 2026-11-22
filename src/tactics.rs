@@ -233,6 +233,9 @@ impl Brain {
             k
         };
         let z = &o.zone;
+        // With two or more enemies about (`pincer`): keep them all in front, a wall behind, out of the open.
+        let pin = self.pin_on();
+        let ex_here = if pin { self.exposure_at([pos[0], pos[1]]) } else { None };
         let score = |b: &Brain, q: [f32; 2], moved: f32| -> f32 {
             let qz = b.ground(q[0], q[1], pos[2]);
             let mut s = -1.1 * (d2(&q, &t.pos) - pref).abs() - 0.4 * moved;
@@ -263,20 +266,54 @@ impl Brain {
             if out > 0.0 {
                 s -= out * 5.0;
             }
+            if pin {
+                s += b.pin_score(o, [pos[0], pos[1]], q, t.pos, ex_here);
+            }
             s
         };
         let here = [pos[0], pos[1]];
         let mut best = (here, score(self, here, 0.0), true);
-        for k in 0..16 {
-            let a = k as f32 * TAU / 16.0;
-            let q = [pos[0] + a.cos() * 6.0, pos[1] + a.sin() * 6.0];
-            if !self.straight(&pos, &q) {
-                continue;
+        let rings = self.pin_rings();
+        for &r in &rings {
+            for k in 0..16 {
+                let a = k as f32 * TAU / 16.0;
+                let q = [pos[0] + a.cos() * r, pos[1] + a.sin() * r];
+                if !self.straight(&pos, &q) {
+                    continue;
+                }
+                let s = score(self, q, r);
+                if s > best.1 {
+                    best = (q, s, false);
+                }
             }
-            let s = score(self, q, 6.0);
-            if s > best.1 {
-                best = (q, s, false);
+        }
+        // A far position chosen while pincered is kept for a moment unless another is clearly better.
+        if pin {
+            self.pin_goal = self.pin_goal.filter(|g| o.t < g.1 && d2(&g.0, &pos) > 2.5 && self.straight(&pos, &g.0));
+            if let Some((g, _)) = self.pin_goal {
+                let s = score(self, g, d2(&g, &pos)) + 10.0;
+                if s > best.1 {
+                    best = (g, s, false);
+                }
             }
+            if !best.2 && d2(&best.0, &pos) > 9.0 && self.pin_goal.map_or(true, |g| d2(&g.0, &best.0) > 1.0) {
+                self.pin_goal = Some((best.0, o.t + 1.5));
+            }
+        } else {
+            self.pin_goal = None;
+        }
+        if pin && std::env::var_os("TPIN").is_some() {
+            eprintln!(
+                "PIN fight t {:.1} best {:.0},{:.0} score {:.1} (pin {:.1}) stay {:.1} (pin {:.1}) pref {:.0}",
+                o.t,
+                best.0[0],
+                best.0[1],
+                best.1,
+                self.pin_score(o, here, best.0, t.pos, ex_here),
+                score(self, here, 0.0),
+                self.pin_score(o, here, here, t.pos, ex_here),
+                pref
+            );
         }
         if !best.2 {
             return norm2(best.0[0] - pos[0], best.0[1] - pos[1]);

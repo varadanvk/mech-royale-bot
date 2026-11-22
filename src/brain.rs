@@ -410,6 +410,31 @@ pub struct Params {
     pub map_expose: f32,
     pub map_crowd: f32,
     pub map_reinf: f32,
+    /// Enemy motion (0 = off): each enemy within reach is carried `pred_s` seconds ahead along its velocity over
+    /// walkable ground; one coming for us is also walked toward us (stopping `pred_stop` m short) and the two
+    /// guesses blended with weight `pred_hunt` on the walk.
+    pub pred: f32,
+    pub pred_s: f32,
+    pub pred_hunt: f32,
+    pub pred_stop: f32,
+    /// Keeping enemies on one side while fighting (0 = off). Enemies within `pin_r` (in view, sure believed ones,
+    /// and where they are expected to be) count. Two or more spread over more than half the circle round us,
+    /// or one expected to come round more than 90 degrees off the target, is a pincer. With two or more about,
+    /// a fight position loses `pin_rear` for each enemy (now and expected) behind it as we face the target,
+    /// `pin_spread` per quarter circle the enemies spread over beyond the first, `pin_open` per tenth more
+    /// open ground than here and `pin_zone` per metre outside the next circle, and gains up to `pin_cover` for
+    /// a wall close behind it, and loses `pin_close` per metre it brings us closer to an enemy other than the
+    /// target. While pincered, points up to `pin_ring` m away are weighed too, and a far one
+    /// chosen is kept for a moment.
+    pub pincer: f32,
+    pub pin_r: f32,
+    pub pin_rear: f32,
+    pub pin_spread: f32,
+    pub pin_cover: f32,
+    pub pin_open: f32,
+    pub pin_zone: f32,
+    pub pin_ring: f32,
+    pub pin_close: f32,
 }
 
 impl Default for Params {
@@ -593,10 +618,23 @@ impl Default for Params {
             map_keep_spread: 1.0,
             map_hold_r: 1.0,
             map_coast_grow: 1.0,
-            map_preaim: 1.0,
-            map_expose: 15.0,
-            map_crowd: 40.0,
-            map_reinf: 15.0,
+            map_preaim: 0.0,
+            map_expose: 0.0,
+            map_crowd: 0.0,
+            map_reinf: 0.0,
+            pred: 1.0,
+            pred_s: 2.0,
+            pred_hunt: 0.25,
+            pred_stop: 30.0,
+            pincer: 1.0,
+            pin_r: 120.0,
+            pin_rear: 25.0,
+            pin_spread: 20.0,
+            pin_cover: 15.0,
+            pin_open: 15.0,
+            pin_zone: 3.0,
+            pin_ring: 24.0,
+            pin_close: 3.0,
         }
     }
 }
@@ -803,6 +841,19 @@ impl Params {
         p.map_expose = g("map_expose", p.map_expose);
         p.map_crowd = g("map_crowd", p.map_crowd);
         p.map_reinf = g("map_reinf", p.map_reinf);
+        p.pred = g("pred", p.pred);
+        p.pred_s = g("pred_s", p.pred_s);
+        p.pred_hunt = g("pred_hunt", p.pred_hunt);
+        p.pred_stop = g("pred_stop", p.pred_stop);
+        p.pincer = g("pincer", p.pincer);
+        p.pin_r = g("pin_r", p.pin_r);
+        p.pin_rear = g("pin_rear", p.pin_rear);
+        p.pin_spread = g("pin_spread", p.pin_spread);
+        p.pin_cover = g("pin_cover", p.pin_cover);
+        p.pin_open = g("pin_open", p.pin_open);
+        p.pin_zone = g("pin_zone", p.pin_zone);
+        p.pin_ring = g("pin_ring", p.pin_ring);
+        p.pin_close = g("pin_close", p.pin_close);
         p
     }
 
@@ -1095,6 +1146,14 @@ pub struct Brain {
     pub dbg_kills: Vec<(f32, Option<u32>, Option<u32>)>,
     pub dbg_mode: String,
     pub dbg_enemies: Vec<ffa::EnemyInfo>,
+    /// Debug only: whether we are pincered and how widely the enemies round us are spread (degrees).
+    pub dbg_pincer: (bool, f32),
+    /// Enemies round us now and where they are expected to be (`pred`, `pincer`).
+    pin: pincer::PinPicture,
+    /// A far fight position chosen while pincered, kept until the given time.
+    pin_goal: Option<([f32; 2], f32)>,
+    /// Debug only (`TPRED`): motion predictions waiting to be checked, and their errors.
+    pred_trace: Option<pincer::PredTrace>,
 }
 
 impl Brain {
@@ -1233,6 +1292,10 @@ impl Brain {
             dbg_kills: Vec::new(),
             dbg_mode: String::new(),
             dbg_enemies: Vec::new(),
+            dbg_pincer: (false, 0.0),
+            pin: pincer::PinPicture::default(),
+            pin_goal: None,
+            pred_trace: std::env::var("TPRED").is_ok().then(pincer::PredTrace::default),
         }
     }
 
@@ -2152,6 +2215,7 @@ impl Brain {
             self.threat = None;
         }
         let threats = self.threats(o);
+        self.update_pincer(o, &pos, target);
 
         // Drone to deal with: one shooting us, or (when calm) one worth farming.
         let calm = enemies.is_empty() && o.t - self.last_mech_hurt_t > 5.0;
@@ -3613,9 +3677,14 @@ impl Brain {
 mod tactics;
 #[path = "ffa.rs"]
 pub mod ffa;
+#[path = "pincer.rs"]
+mod pincer;
 
 impl Drop for Brain {
     fn drop(&mut self) {
+        if let Some(tr) = &self.pred_trace {
+            tr.report(self.ffa_slot, self.ffa_seed);
+        }
         if self.trace_ffa {
             let t = self.ffa_ticks;
             eprintln!(
@@ -3629,6 +3698,7 @@ impl Drop for Brain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::predict;
 
     /// Defaults with the optional tactics off: the checks below are about the behaviour underneath them.
     fn base() -> Params {
@@ -3645,8 +3715,15 @@ mod tests {
             ext_fpos: 0.0,
             ext_late: 0.0,
             ext_finish: 0.0,
+            pred: 0.0,
+            pincer: 0.0,
             ..Params::default()
         }
+    }
+
+    /// `base` with the enemy picture used in practice play.
+    fn map_on() -> Params {
+        Params { map_preaim: 1.0, map_expose: 15.0, map_crowd: 40.0, map_reinf: 15.0, ..base() }
     }
 
     fn brain() -> Brain {
@@ -3974,27 +4051,27 @@ mod tests {
     fn with_no_enemy_in_view_we_face_the_surest_believed_one_nearby() {
         let o = obs("", "");
         let picture = vec![belief(Some(7), [0.0, 100.0], 0.8, false), belief(None, [100.0, 0.0], 0.3, false), belief(Some(9), [-180.0, 0.0], 0.9, false)];
-        let mut b = with(base());
+        let mut b = with(map_on());
         b.beliefs = picture.clone();
         let a = b.decide(&o, [0.0; 3]);
         assert!((a.aim[0] - std::f32::consts::FRAC_PI_2).abs() < 0.05, "aim {:?}", a.aim);
         // Off: the usual sweep.
-        let mut b = with(Params { map_preaim: 0.0, ..base() });
+        let mut b = with(Params { map_preaim: 0.0, ..map_on() });
         b.beliefs = picture.clone();
         let a = b.decide(&o, [0.0; 3]);
         assert!((a.aim[0] - std::f32::consts::FRAC_PI_2).abs() > 0.5, "aim {:?}", a.aim);
         // Only out-of-sight ones within 150 m, and only with none in view.
-        let mut far = with(base());
+        let mut far = with(map_on());
         far.beliefs = vec![belief(Some(9), [-180.0, 0.0], 0.9, false)];
         assert_eq!(far.preaim(&[0.0; 3]), None);
-        let mut seen = with(base());
+        let mut seen = with(map_on());
         seen.beliefs = vec![belief(Some(7), [0.0, 100.0], 0.8, false), belief(Some(3), [50.0, 0.0], 1.0, true)];
         assert_eq!(seen.preaim(&[0.0; 3]), None);
     }
 
     #[test]
     fn fight_positions_seen_by_believed_enemies_score_lower() {
-        let mut b = with(base());
+        let mut b = with(map_on());
         b.beliefs = vec![
             belief(Some(7), [0.0, 100.0], 0.6, false),
             belief(None, [100.0, 0.0], 0.3, false),
@@ -4012,7 +4089,7 @@ mod tests {
 
     #[test]
     fn ways_past_two_or_more_believed_enemies_cost_more() {
-        let mut b = with(base());
+        let mut b = with(map_on());
         let two = vec![belief(Some(7), [100.0, 30.0], 0.7, false), belief(None, [150.0, -40.0], 0.5, false), belief(Some(8), [100.0, 150.0], 0.9, false)];
         b.beliefs = two.clone();
         assert_eq!(b.crowd_cost(5.0, &[0.0; 3], [200.0, 0.0]), 80.0);
@@ -4045,22 +4122,118 @@ mod tests {
             belief(None, [110.0, 10.0], 0.7, false),
             belief(Some(8), [100.0, -30.0], 0.6, false),
         ];
-        let mut b = with(base());
+        let mut b = with(map_on());
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.focus, Some(3));
-        let mut b = with(base());
+        let mut b = with(map_on());
         b.beliefs = picture.clone();
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.focus, Some(5));
-        let mut b = with(Params { map_reinf: 0.0, ..base() });
+        let mut b = with(Params { map_reinf: 0.0, ..map_on() });
         b.beliefs = picture.clone();
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.focus, Some(3));
         // The same in the engage-filter score.
-        let mut b = with(Params::default());
+        let mut b = with(Params { map_reinf: 15.0, ..Params::default() });
         let plain = b.engage_score(&o, &o.mechs[0]);
         b.beliefs = picture;
         assert_eq!(b.engage_score(&o, &o.mechs[0]) - plain, 30.0);
         assert_eq!(b.reinforcements(&o.mechs[1]), 0.0);
+    }
+
+    fn mech(id: u32, pos: [f32; 2], vel: [f32; 2], aim: f32) -> String {
+        format!(r#"{{"id": {id}, "kind": "mech", "pos": [{}, {}, 0], "vel": [{}, {}, 0], "aim": [{aim}, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}}"#, pos[0], pos[1], vel[0], vel[1])
+    }
+
+    fn pin_brain(on: bool) -> Brain {
+        with(Params { pred: on as i32 as f32, pincer: on as i32 as f32, fight_pos: 1.0, ..base() })
+    }
+
+    #[test]
+    fn enemies_are_expected_along_their_way() {
+        // One walking north past us, not looking at us; one coming at us from the east.
+        let others = format!("{},{}", mech(3, [-50.0, -40.0], [0.0, 10.0], 1.0), mech(4, [80.0, 0.0], [-10.0, 0.0], 3.14159));
+        let o = obs(&others, "");
+        let mut b = pin_brain(true);
+        b.update_pincer(&o, &[0.0; 3], None);
+        let t3 = b.pin.threats.iter().find(|t| t.id == Some(3)).unwrap();
+        assert!((t3.pred[1] - -20.0).abs() < 0.5 && (t3.pred[0] - -50.0).abs() < 0.5, "{:?}", t3);
+        // The one coming for us stops at its fighting distance.
+        let t4 = b.pin.threats.iter().find(|t| t.id == Some(4)).unwrap();
+        assert!((t4.pred[0] - 60.0).abs() < 0.5, "{:?}", t4);
+        // Off: where they are now, and no picture at all.
+        let mut b = pin_brain(false);
+        b.update_pincer(&o, &[0.0; 3], None);
+        assert!(b.pin.threats.is_empty() && !b.pin.pincered);
+    }
+
+    #[test]
+    fn enemies_on_both_sides_are_a_pincer() {
+        let mut b = pin_brain(true);
+        // East and west.
+        let o = obs(&format!("{},{}", mech(3, [60.0, 0.0], [0.0, 0.0], 3.14), mech(4, [-60.0, 5.0], [0.0, 0.0], 0.0)), "");
+        b.update_pincer(&o, &[0.0; 3], o.mechs.first());
+        assert!(b.pin.pincered && b.dbg_pincer.1 > 144.0, "{:?}", b.pin);
+        assert!(b.dbg_pincer.0 && b.dbg_pincer.1 > 150.0);
+        // Three round us without a target.
+        let o3 = obs(&format!("{},{},{}", mech(3, [60.0, 0.0], [0.0, 0.0], 3.14), mech(4, [-30.0, 50.0], [0.0, 0.0], 0.0), mech(5, [-30.0, -50.0], [0.0, 0.0], 0.0)), "");
+        b.update_pincer(&o3, &[0.0; 3], None);
+        assert!(b.pin.pincered && b.dbg_pincer.1 > 180.0);
+        // Both to the east: not.
+        let o = obs(&format!("{},{}", mech(3, [60.0, 0.0], [0.0, 0.0], 3.14), mech(4, [60.0, 30.0], [0.0, 0.0], 3.14)), "");
+        b.update_pincer(&o, &[0.0; 3], o.mechs.first());
+        assert!(!b.pin.pincered, "{:?}", b.pin);
+        // Too far away to count.
+        let o = obs(&format!("{},{}", mech(3, [60.0, 0.0], [0.0, 0.0], 3.14), mech(4, [-200.0, 0.0], [0.0, 0.0], 0.0)), "");
+        b.update_pincer(&o, &[0.0; 3], o.mechs.first());
+        assert!(!b.pin.pincered && b.pin.threats.len() == 1);
+        // A flanker: north-east now, going round to the north-west within two seconds.
+        let o = obs(&format!("{},{}", mech(3, [60.0, 0.0], [0.0, 0.0], 3.14), mech(4, [15.0, 30.0], [-16.0, 0.0], 0.0)), "");
+        b.update_pincer(&o, &[0.0; 3], o.mechs.first());
+        assert!(b.pin.pincered && b.dbg_pincer.1 < 144.0, "{:?}", b.pin);
+        // The same flanker without motion prediction is not one yet.
+        let mut np = with(Params { pred: 0.0, pincer: 1.0, fight_pos: 1.0, ..base() });
+        np.update_pincer(&o, &[0.0; 3], o.mechs.first());
+        assert!(!np.pin.pincered, "{:?}", np.pin);
+    }
+
+    #[test]
+    fn pincered_fight_position_puts_the_enemies_in_front() {
+        // Target to the east, another enemy behind us to the north-west.
+        let others = format!("{},{}", mech(3, [40.0, 0.0], [0.0, 0.0], 3.14), mech(4, [-15.0, 30.0], [0.0, 0.0], -1.1));
+        let o = obs(&others, "");
+        let worst_off = |q: [f32; 2]| predict::off(yaw_to(&q, &[-15.0, 30.0]), yaw_to(&q, &[40.0, 0.0]));
+        let mut b = pin_brain(true);
+        b.update_pincer(&o, &[0.0; 3], o.mechs.first());
+        assert!(b.pin.pincered);
+        let mv = b.fight_pos_move(&o, &o.mechs[0], 40.0, true);
+        assert!(mv[0].hypot(mv[1]) > 0.9, "{:?}", mv);
+        let q = [mv[0] * 24.0, mv[1] * 24.0];
+        assert!(worst_off(q) < worst_off([0.0, 0.0]) - 0.3, "{:?} {} {}", mv, worst_off(q), worst_off([0.0, 0.0]));
+        // The far point is kept for a moment.
+        assert!(b.pin_goal.is_some());
+        // Off: no far points and no such pull.
+        let mut b = pin_brain(false);
+        b.update_pincer(&o, &[0.0; 3], o.mechs.first());
+        b.fight_pos_move(&o, &o.mechs[0], 40.0, true);
+        assert!(b.pin_goal.is_none());
+    }
+
+    #[test]
+    fn with_the_new_switches_off_the_picture_is_left_empty() {
+        let others = format!("{},{}", mech(3, [40.0, 0.0], [0.0, 0.0], 3.14), mech(4, [-15.0, 30.0], [0.0, 0.0], -1.1));
+        let o = obs(&others, "");
+        let mut on = with(Params { fight_pos: 1.0, ..Params::default() });
+        let mut off = with(Params { fight_pos: 1.0, pred: 0.0, pincer: 0.0, ..Params::default() });
+        let mut plain = with(Params { fight_pos: 1.0, pred: 0.0, pincer: 0.0, ..Params::default() });
+        plain.pin = pincer::PinPicture::default();
+        on.decide(&o, [0.0; 3]);
+        off.decide(&o, [0.0; 3]);
+        plain.decide(&o, [0.0; 3]);
+        assert!(on.pin.threats.len() == 2 && off.pin.threats.is_empty());
+        assert_eq!(off.dbg_mode, plain.dbg_mode);
+        // The map uses of the practice picture are off by default.
+        let d = Params::default();
+        assert_eq!((d.map_preaim, d.map_expose, d.map_crowd, d.map_reinf), (0.0, 0.0, 0.0, 0.0));
     }
 }

@@ -141,9 +141,9 @@ fn load() -> Option<(Arc<World>, Nav)> {
 /// The practice scene's actions, as the build without the free-for-all side makes them.
 const PRACTICE_HASH: u64 = 0xbdede9d60a44ac46;
 
-/// Defaults with the practice uses of the enemy picture off.
+/// Defaults with the practice uses of the enemy picture, enemy motion and the pincer terms off.
 fn no_practice_map() -> Params {
-    Params { map_preaim: 0.0, map_expose: 0.0, map_crowd: 0.0, map_reinf: 0.0, ..Params::default() }
+    Params { map_preaim: 0.0, map_expose: 0.0, map_crowd: 0.0, map_reinf: 0.0, pred: 0.0, pincer: 0.0, ..Params::default() }
 }
 
 #[test]
@@ -158,7 +158,8 @@ fn practice_scene_is_played_as_before() {
 #[test]
 fn practice_scene_with_the_enemy_picture_in_use() {
     let Some((world, nav)) = load() else { return };
-    let (h, b) = practice_scene(world, nav, Params::default());
+    let p = Params { map_preaim: 1.0, map_expose: 15.0, map_crowd: 40.0, map_reinf: 15.0, ..Params::default() };
+    let (h, b) = practice_scene(world, nav, p);
     eprintln!("practice scene hash with the picture in use {h:#018x}");
     assert!(!b.ffa_latched(), "detector latched in a practice scene: {}", b.dbg_mode);
 }
