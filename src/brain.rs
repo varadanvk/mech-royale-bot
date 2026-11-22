@@ -1,6 +1,7 @@
 //! Decision logic: one `act` per observation.
 use crate::nav::Nav;
 use crate::proto::{Action, Actor, Hello, Obs, Weapon};
+use crate::sight::{Foe, Pick, SightTable, Zone};
 use crate::world::{PrismKind, World};
 use std::collections::{BTreeMap, VecDeque};
 use std::f32::consts::{PI, TAU};
@@ -302,6 +303,13 @@ pub struct Params {
     /// `counter_range`; leave the others alone (0 = off).
     pub counter: f32,
     pub counter_range: f32,
+    /// When pressed (as for `ring`: from `wall_t`, or while `spot_crowd` or more enemies are close or hurting us),
+    /// fight from sheltered ground (0 = off). 1: hold the most sheltered spot nearby that is inside the safe
+    /// area and not past the enemies, facing its open side; move on to the next when the zone closes in, two or
+    /// more enemies keep a line on us, or we lose health fast without a kill coming. 2: as 1, but first look for
+    /// a position nearby where exactly one known enemy has a line to us and the others do not.
+    pub spot: f32,
+    pub spot_crowd: f32,
 }
 
 impl Default for Params {
@@ -435,6 +443,8 @@ impl Default for Params {
             ring: 0.0,
             counter: 0.0,
             counter_range: 60.0,
+            spot: 0.0,
+            spot_crowd: 3.0,
         }
     }
 }
@@ -572,6 +582,8 @@ impl Params {
         p.ring = g("ring", p.ring);
         p.counter = g("counter", p.counter);
         p.counter_range = g("counter_range", p.counter_range);
+        p.spot = g("spot", p.spot);
+        p.spot_crowd = g("spot_crowd", p.spot_crowd);
         p
     }
 
@@ -628,6 +640,8 @@ struct Known {
     /// When we first saw its current laser charge (None if not charging).
     charge_since: Option<f32>,
     aim_yaw: f32,
+    /// Health fraction when last seen.
+    hp_frac: f32,
 }
 
 /// An action as sent, as far as motion and aim are concerned.
@@ -792,6 +806,21 @@ pub struct Brain {
     ring_until: f32,
     /// Enemies that showed they are after us (aimed at us, hurt us or came close): id -> last time.
     hunters: BTreeMap<u32, f32>,
+    /// Lines of sight over the map and the sheltered spots (built when `spot` is on).
+    pub sight: Option<Arc<SightTable>>,
+    /// Sheltered-ground mode stays on until this time.
+    spot_until: f32,
+    /// Sheltered spot being held or walked to.
+    spot_pick: Option<Pick>,
+    /// Spots left behind: index -> until when they are not chosen again.
+    spot_ban: BTreeMap<usize, f32>,
+    /// Since when two or more enemies have had a line to us.
+    spot_seen_since: Option<f32>,
+    /// Position where only one enemy has a line to us, and when it was last chosen.
+    iso_pick: Option<Pick>,
+    iso_t: f32,
+    /// Our health over the last few seconds: (time, hp).
+    hp_hist: VecDeque<(f32, f32)>,
 }
 
 impl Brain {
@@ -814,6 +843,10 @@ impl Brain {
     pub fn with_params(hello: &Hello, world: Option<Arc<World>>, nav: Option<Nav>, params: Params) -> Brain {
         let cfg = &hello.config;
         let f = |a: &str, b: &str, d: f32| cfg.get(a).and_then(|v| v.get(b)).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d);
+        let sight = match (&world, &nav) {
+            (Some(w), Some(n)) if params.spot > 0.0 => Some(Arc::new(SightTable::build(w, n))),
+            _ => None,
+        };
         Brain {
             world,
             nav,
@@ -883,6 +916,14 @@ impl Brain {
             ring_dir: 1.0,
             ring_until: -1.0,
             hunters: BTreeMap::new(),
+            sight,
+            spot_until: -1.0,
+            spot_pick: None,
+            spot_ban: BTreeMap::new(),
+            spot_seen_since: None,
+            iso_pick: None,
+            iso_t: -1.0,
+            hp_hist: VecDeque::new(),
         }
     }
 
@@ -1615,6 +1656,7 @@ impl Brain {
                     prev_vel,
                     charge_since: if m.charging { Some(prev_charge.unwrap_or(o.t)) } else { None },
                     aim_yaw: m.aim[0],
+                    hp_frac: if m.max_hp > 0.0 { m.hp / m.max_hp } else { 1.0 },
                 },
             );
         }
@@ -1701,6 +1743,26 @@ impl Brain {
             }
         }
         let ring_on = p.ring > 0.0 && o.t < self.ring_until;
+        // Sheltered-ground mode: same trigger as the loop, with its own crowd size.
+        if p.spot > 0.0 {
+            let mut pressing: Vec<u32> = self.known.iter().filter(|(_, k)| o.t - k.seen_t < 4.0 && d2(&k.pos, &pos) < 150.0).map(|(id, _)| *id).collect();
+            pressing.extend(self.attackers.iter().filter(|(_, t)| o.t - **t < 3.0).map(|(id, _)| *id));
+            pressing.sort_unstable();
+            pressing.dedup();
+            if late || pressing.len() as f32 >= p.spot_crowd {
+                self.spot_until = o.t + 5.0;
+            }
+            self.hp_hist.push_back((o.t, me.hp));
+            while self.hp_hist.front().map_or(false, |e| o.t - e.0 > 3.0) {
+                self.hp_hist.pop_front();
+            }
+        }
+        let spot_on = p.spot > 0.0 && o.t < self.spot_until && self.sight.is_some() && !ring_on;
+        if p.spot > 0.0 && !spot_on {
+            // Choose afresh next time.
+            self.spot_pick = None;
+            self.iso_pick = None;
+        }
         // Counter-punching: before the late game only enemies that came for us are targets.
         let counter = p.counter > 0.0 && !late && !ring_on;
         if counter {
@@ -1723,7 +1785,7 @@ impl Brain {
             // Its torso (and so its next shot) is pointed at us.
             let aimer = if p.focus_aimer > 0.0 && wrap(m.aim[0] - yaw_to(&m.pos, &pos)).abs() < 0.2 { p.focus_aimer } else { 0.0 };
             // Looping: whoever has a line on us now comes first.
-            let unseen = if ring_on && !self.clear(muzzle, [m.pos[0], m.pos[1], m.pos[2] + 4.5]) { 150.0 } else { 0.0 };
+            let unseen = if (ring_on || spot_on) && !self.clear(muzzle, [m.pos[0], m.pos[1], m.pos[2] + 4.5]) { 150.0 } else { 0.0 };
             d + hpf * p.focus_hp - if attacker { 40.0 } else { 0.0 } - loot - aimer + unseen
         };
         let best = cands
@@ -2139,6 +2201,13 @@ impl Brain {
                     self.scan(&mut a);
                 }
             }
+        } else if spot_on {
+            // Fight from sheltered ground; boost only to get out of the sight of two or more.
+            let killing = target.map_or(false, |t| engaged && t.max_hp > 0.0 && t.hp / t.max_hp < 0.35);
+            let (m, b, l) = self.spot_move(o, &pos, &mut a, shoot_at.is_some(), &threats, killing);
+            mv = m;
+            boost = b;
+            label = l;
         } else if let Some(g) = arm_goal.filter(|_| !(p.stand_first > 0.0 && stand_from.is_some())) {
             label = "arm";
             mv = self.go(&pos, [g[0], g[1]]);
@@ -2510,7 +2579,7 @@ impl Brain {
             }
         }
         // Outside a fight, still weave across the line of the nearest shooter.
-        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "ring" || label == "fight" || label == "rush" || label == "climb" || (label == "hold" && p.hold_fight <= 0.0) || label == "drone" || label == "reload" || label == "stand" || label == "peek" || label == "hide" || label == "repeek") {
+        if let (Some(src), false) = (shooter, ducked || label == "zone" || label == "ring" || label == "spot" || label == "iso" || label == "fight" || label == "rush" || label == "climb" || (label == "hold" && p.hold_fight <= 0.0) || label == "drone" || label == "reload" || label == "stand" || label == "peek" || label == "hide" || label == "repeek") {
             if o.t >= self.strafe_until {
                 self.next_strafe(o.t);
             }
@@ -2861,6 +2930,101 @@ impl Brain {
             self.ring_dir = -self.ring_dir;
         }
         self.idle_move(o, pos)
+    }
+
+    /// Sheltered-ground movement: where to go, whether to boost, and the label ("iso" for a position that only
+    /// one enemy can see, "spot" for a sheltered spot). Sets the aim when nothing is being shot at.
+    fn spot_move(&mut self, o: &Obs, pos: &[f32; 3], a: &mut Action, aiming: bool, threats: &[[f32; 3]], killing: bool) -> ([f32; 2], bool, &'static str) {
+        let (Some(st), Some(nav)) = (self.sight.clone(), self.nav.clone()) else {
+            return (self.idle_move(o, pos), false, "spot");
+        };
+        let me = &o.me;
+        let p = self.params.clone();
+        let here = [pos[0], pos[1]];
+        let walk = me.stat("walk_speed", 11.7);
+        // Enemies seen in the last 6 s, carried along their last velocity for up to 2 s.
+        let foes: Vec<Foe> = self
+            .known
+            .values()
+            .filter(|k| o.t - k.seen_t < 6.0 && d2(&k.pos, pos) < 260.0)
+            .map(|k| {
+                let dt = (o.t - k.seen_t).min(2.0);
+                Foe { pos: [k.pos[0] + k.vel[0] * dt, k.pos[1] + k.vel[1] * dt], hp: k.hp_frac }
+            })
+            .collect();
+        // Enemies with a line to us right now.
+        let chest = [pos[0], pos[1], pos[2] + 5.0];
+        let seeing = self.known.values().filter(|k| o.t - k.seen_t < 1.0 && d2(&k.pos, pos) < 200.0 && self.clear([k.pos[0], k.pos[1], k.pos[2] + 8.0], chest)).count();
+        if seeing >= 2 {
+            self.spot_seen_since.get_or_insert(o.t);
+        } else {
+            self.spot_seen_since = None;
+        }
+        let z = &o.zone;
+        let zone = Zone { center: z.center, radius: z.radius, next_center: z.next_center, next_radius: z.next_radius, soon: o.t >= z.shrink_start - 15.0 };
+        self.spot_ban.retain(|_, t| o.t < *t);
+
+        // Level 2: a position only one enemy can see, re-chosen every half second (keeping the last one unless
+        // another is clearly better).
+        if p.spot >= 2.0 {
+            if o.t - self.iso_t >= 0.5 {
+                self.iso_t = o.t;
+                let keep = self.iso_pick.map(|q| q.pos);
+                self.iso_pick = st.pick_isolating(&nav, here, &foes, &zone, walk, keep);
+            }
+            if let Some(q) = self.iso_pick.filter(|q| zone.holds(q.pos, 4.0)) {
+                let d = d2(&q.pos, pos);
+                let mv = if d > 3.0 { self.go(pos, q.pos) } else { self.jitter(o, pos, q.pos) };
+                if !aiming {
+                    if let Some(f) = q.foe {
+                        a.aim = [yaw_to(pos, &f), 0.0];
+                    }
+                }
+                return (mv, d > 3.0 && seeing >= 2 && me.energy > 10.0, "iso");
+            }
+        }
+
+        // Level 1: hold a sheltered spot; move on when the zone closes in, two or more enemies keep a line on us
+        // for 1.5 s, or our health drops fast with no kill coming.
+        let lost = self.hp_hist.front().map_or(0.0, |e| e.1 - me.hp);
+        let at = self.spot_pick.map_or(false, |q| d2(&q.pos, pos) < 5.0);
+        let pinned = at && self.spot_seen_since.map_or(false, |t0| o.t - t0 > 1.5);
+        let bleeding = lost > me.max_hp * 0.2 && !killing;
+        let stale = self.spot_pick.map_or(true, |q| !zone.holds(q.pos, 4.0));
+        if stale || pinned || bleeding {
+            let mut next = None;
+            if let Some(i) = self.spot_pick.and_then(|q| q.spot) {
+                if !stale {
+                    self.spot_ban.insert(i, o.t + 15.0);
+                    // The partner spot first, if it is inside the safe area and fewer enemies can see it.
+                    if let Some(j) = st.spots[i].fallback.filter(|j| !self.spot_ban.contains_key(j)) {
+                        let f = &st.spots[j];
+                        if zone.holds(f.pos, 8.0) && st.seen_by(f.pos, &foes) < seeing.max(1) {
+                            next = Some(Pick { pos: f.pos, yaw: f.lane_yaw, spot: Some(j), foe: None, score: 0.0 });
+                        }
+                    }
+                }
+            }
+            if next.is_none() {
+                let banned: Vec<usize> = self.spot_ban.keys().copied().collect();
+                next = st.pick_spot(&nav, here, &foes, &zone, &banned, walk);
+            }
+            self.spot_pick = next;
+            self.spot_seen_since = None;
+            self.hp_hist.clear();
+        }
+        let Some(q) = self.spot_pick else {
+            return (self.idle_move(o, pos), false, "spot");
+        };
+        let d = d2(&q.pos, pos);
+        let mv = if d > 3.0 { self.go(pos, q.pos) } else { self.jitter(o, pos, q.pos) };
+        if !aiming {
+            match threats.first() {
+                Some(th) if d > 3.0 => a.aim = [yaw_to(pos, th), 0.0],
+                _ => a.aim = [q.yaw, 0.0],
+            }
+        }
+        (mv, d > 3.0 && seeing >= 2 && me.energy > 10.0, "spot")
     }
 
     /// Aim the gun at a crate and fire once lined up, if the line to it is clear. Returns whether it was.
