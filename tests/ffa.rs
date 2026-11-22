@@ -169,6 +169,7 @@ fn practice_scene_is_played_as_before() {
         reload_laser: 1.0,
         dodge_tight: 0.0,
         lead_delay: 0.0,
+        weave_seen: 0.0,
         ..no_practice_map()
     };
     let (h, _) = practice_scene(world, nav, p);
