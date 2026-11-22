@@ -1003,7 +1003,7 @@ impl Brain {
             world,
             nav,
             params,
-            rng: (hello.seed ^ 0x9e3779b97f4a7c19) | 1,
+            rng: (hello.seed ^ 0x6a09e667f3bcc909) | 1,
             pickup_radius: f("loot", "pickup_radius", 4.0),
             npc_size: [f("npc", "radius", 1.8), f("npc", "height", 3.5)],
             npc_aggro: f("npc", "aggro_range", 45.0),
