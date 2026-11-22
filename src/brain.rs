@@ -398,6 +398,11 @@ pub struct Params {
     pub cb_known: f32,
     pub cb_corner: f32,
     pub cb_turn: f32,
+    /// In a live fight (a target in view while engaged, or hurt by a mech in the last 6 s), keep fighting
+    /// instead of breaking off, backing away or hiding to heal; a break-off to hidden ground within
+    /// `stay_cover` m still goes ahead (practice matches only; 0 = off).
+    pub stay_fight: f32,
+    pub stay_cover: f32,
 }
 
 impl Default for Params {
@@ -578,6 +583,8 @@ impl Default for Params {
             cb_known: 1.0,
             cb_corner: 1.0,
             cb_turn: 1.0,
+            stay_fight: 1.0,
+            stay_cover: 15.0,
         }
     }
 }
@@ -762,6 +769,8 @@ impl Params {
         p.cb_known = g("cb_known", p.cb_known);
         p.cb_corner = g("cb_corner", p.cb_corner);
         p.cb_turn = g("cb_turn", p.cb_turn);
+        p.stay_fight = g("stay_fight", p.stay_fight);
+        p.stay_cover = g("stay_cover", p.stay_cover);
         p
     }
 
@@ -2349,6 +2358,12 @@ impl Brain {
         if hp_frac >= p.heal_hi || p.heal_lo <= 0.0 {
             self.healing = false;
         }
+        // Stay in a live fight rather than break off (`stay_fight`).
+        let stay = p.stay_fight > 0.0 && !ffa_on && target.is_some() && (engaged || recently_hurt_by_mech);
+        if stay {
+            self.fleeing = false;
+            self.healing = false;
+        }
 
         // A laser charging and pointed at us: keep moving across its line until it fires.
         // Several charging at once: track the nearest (ties broken by id).
@@ -2561,6 +2576,11 @@ impl Brain {
                 cb_cornered = p.cb_corner > 0.0 && cr_goal.is_none();
                 cb_all = all;
             }
+        }
+        if stay && (cr_goal.is_some() || cb_cornered) && cr_goal.map_or(true, |g| d2(&g, &pos) > p.stay_cover) {
+            cr_goal = None;
+            cb_cornered = false;
+            self.cr_until = -1.0;
         }
         let mut boost = false;
         let mut mv: [f32; 2];
