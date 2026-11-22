@@ -482,7 +482,7 @@ impl Default for Params {
             dodge: 0.0,
             dodge_hold: 0.35,
             dodge_energy: 20.0,
-            crowd_retreat: 0.0,
+            crowd_retreat: 1.0,
             cr_radius: 160.0,
             cr_burst: 1.5,
             cr_steps: 50.0,
