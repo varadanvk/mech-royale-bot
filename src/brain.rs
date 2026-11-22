@@ -399,6 +399,17 @@ pub struct Params {
     pub map_keep_spread: f32,
     pub map_hold_r: f32,
     pub map_coast_grow: f32,
+    /// The enemy picture in a practice match (each 0 = off; never once a free-for-all is settled). `map_preaim`:
+    /// with no enemy in view, face the surest believed enemy out of sight within 150 m. `map_expose`: a fight
+    /// position loses this much for each believed enemy out of sight (confidence 0.4 or more, within 170 m) with
+    /// a line to it. `map_crowd`: a loot goal or post costs this much for each sure believed enemy within 60 m of
+    /// the way there, once two or more are (never the target, nor an enemy within 60 m hurting us).
+    /// `map_reinf`: a candidate target scores this much worse for each other sure believed enemy within 80 m of
+    /// it (at most three).
+    pub map_preaim: f32,
+    pub map_expose: f32,
+    pub map_crowd: f32,
+    pub map_reinf: f32,
 }
 
 impl Default for Params {
@@ -582,6 +593,10 @@ impl Default for Params {
             map_keep_spread: 1.0,
             map_hold_r: 1.0,
             map_coast_grow: 1.0,
+            map_preaim: 1.0,
+            map_expose: 15.0,
+            map_crowd: 40.0,
+            map_reinf: 15.0,
         }
     }
 }
@@ -784,6 +799,10 @@ impl Params {
         p.map_keep_spread = g("map_keep_spread", p.map_keep_spread);
         p.map_hold_r = g("map_hold_r", p.map_hold_r);
         p.map_coast_grow = g("map_coast_grow", p.map_coast_grow);
+        p.map_preaim = g("map_preaim", p.map_preaim);
+        p.map_expose = g("map_expose", p.map_expose);
+        p.map_crowd = g("map_crowd", p.map_crowd);
+        p.map_reinf = g("map_reinf", p.map_reinf);
         p
     }
 
@@ -1792,7 +1811,7 @@ impl Brain {
                     continue;
                 }
                 let zz = self.ground(c[0], c[1], me.pos[2]);
-                let s = self.enclosure(c, zz) as f32 * 10.0 - d2(&c, &me.pos) * 0.15;
+                let s = self.enclosure(c, zz) as f32 * 10.0 - d2(&c, &me.pos) * 0.15 - self.crowd_cost(o.t, &me.pos, c);
                 if s > best.1 {
                     best = (c, s);
                 }
@@ -2103,7 +2122,7 @@ impl Brain {
             let aimer = if p.focus_aimer > 0.0 && wrap(m.aim[0] - yaw_to(&m.pos, &pos)).abs() < 0.2 { p.focus_aimer } else { 0.0 };
             // Looping: whoever has a line on us now comes first.
             let unseen = if (ring_on || spot_on) && !self.clear(muzzle, [m.pos[0], m.pos[1], m.pos[2] + 4.5]) { 150.0 } else { 0.0 };
-            d + hpf * p.focus_hp - if attacker { 40.0 } else { 0.0 } - loot - aimer + unseen
+            d + hpf * p.focus_hp - if attacker { 40.0 } else { 0.0 } - loot - aimer + unseen + self.reinforcements(m)
         };
         let best = cands
             .iter()
@@ -3505,10 +3524,10 @@ impl Brain {
         let on_ground = |w: &Brain, q: &[f32; 3]| (q[2] - w.ground(q[0], q[1], q[2])).abs() < 3.0;
         let in_zone = |q: &[f32; 3]| d2(q, &z.center) < z.radius - 10.0 && (o.t < z.shrink_start - 20.0 || d2(q, &z.next_center) < z.next_radius);
         let mut goal: Option<([f32; 2], f32)> = None;
-        let consider = |g: &mut Option<([f32; 2], f32)>, q: &[f32; 3], value: f32, reach: f32, ok_ground: bool| {
+        let consider = |b: &Brain, g: &mut Option<([f32; 2], f32)>, q: &[f32; 3], value: f32, reach: f32, ok_ground: bool| {
             let d = d2(q, pos);
             if d < reach && ok_ground && in_zone(q) {
-                let s = value - d;
+                let s = value - d - b.crowd_cost(o.t, pos, [q[0], q[1]]);
                 if g.map_or(true, |x| s > x.1) {
                     *g = Some(([q[0], q[1]], s));
                 }
@@ -3525,12 +3544,12 @@ impl Brain {
             let r = weapon_rank(kind, &p);
             if r > 0 && !held.contains(&kind.as_str()) && (empty_slot || r > worst) {
                 let v = if empty_slot && early { 120.0 + 30.0 * r as f32 } else { 60.0 + 30.0 * r as f32 };
-                consider(&mut goal, q, v, if reach > 0.0 { reach.max(140.0) } else { 0.0 }, on_ground(self, q));
+                consider(self, &mut goal, q, v, if reach > 0.0 { reach.max(140.0) } else { 0.0 }, on_ground(self, q));
             }
         }
         let cubes: Vec<[f32; 3]> = self.cubes_mem.values().copied().collect();
         for q in &cubes {
-            consider(&mut goal, q, 100.0, reach, on_ground(self, q));
+            consider(self, &mut goal, q, 100.0, reach, on_ground(self, q));
         }
         // Supply drop: full heal and cubes, if nobody we know of is near it.
         for dr in &o.drops {
@@ -3538,7 +3557,7 @@ impl Brain {
             let contested = threats.iter().any(|t| d2(t, &dr.pos) < p.drop_enemy_clear);
             let arrive = d / me.stat("walk_speed", 11.7);
             if d < p.drop_range && !contested && arrive + 4.0 > dr.lands_in - 3.0 && in_zone(&dr.pos) {
-                let v = 150.0 + (1.0 - hp_frac) * 100.0;
+                let v = 150.0 + (1.0 - hp_frac) * 100.0 - self.crowd_cost(o.t, pos, [dr.pos[0], dr.pos[1]]);
                 if goal.map_or(true, |g| v - d * 0.5 > g.1) {
                     goal = Some(([dr.pos[0], dr.pos[1]], v - d * 0.5));
                 }
@@ -3555,12 +3574,12 @@ impl Brain {
         if let Some(c) = crate_target {
             let shot = self.aim_crate(o, a, pos, c);
             if !shot || d2(c, pos) > 90.0 {
-                consider(&mut goal, c, 70.0, reach, true);
+                consider(self, &mut goal, c, 70.0, reach, true);
             }
             if shot {
                 aimed = true;
                 if d2(c, pos) > 35.0 {
-                    consider(&mut goal, c, 70.0, reach, true);
+                    consider(self, &mut goal, c, 70.0, reach, true);
                 }
             }
         }
@@ -3577,8 +3596,10 @@ impl Brain {
             None => self.idle_move(o, pos),
         };
         let fresh = self.threat.filter(|(_, t)| p.threat_face > 0.0 && o.t - t < 2.0).map(|(q, _)| q);
+        // With `map_preaim` and no enemy in view, the surest believed enemy nearby comes before the last known ones.
+        let pre = if fresh.is_none() { self.preaim(pos).map(|q| [q[0], q[1], pos[2]]) } else { None };
         if !aimed {
-            if let Some(th) = fresh.as_ref().or(threats.first()) {
+            if let Some(th) = fresh.as_ref().or(pre.as_ref()).or(threats.first()) {
                 a.aim = [yaw_to(pos, th), 0.0];
             } else {
                 self.scan(a);
@@ -3943,5 +3964,103 @@ mod tests {
                 assert!(pos(s) < pos(d), "{s} after {d}");
             }
         }
+    }
+
+    fn belief(id: Option<u32>, pos: [f32; 2], conf: f32, listed: bool) -> Belief {
+        Belief { id, pos, r: 10.0, conf, listed, ..Belief::default() }
+    }
+
+    #[test]
+    fn with_no_enemy_in_view_we_face_the_surest_believed_one_nearby() {
+        let o = obs("", "");
+        let picture = vec![belief(Some(7), [0.0, 100.0], 0.8, false), belief(None, [100.0, 0.0], 0.3, false), belief(Some(9), [-180.0, 0.0], 0.9, false)];
+        let mut b = with(base());
+        b.beliefs = picture.clone();
+        let a = b.decide(&o, [0.0; 3]);
+        assert!((a.aim[0] - std::f32::consts::FRAC_PI_2).abs() < 0.05, "aim {:?}", a.aim);
+        // Off: the usual sweep.
+        let mut b = with(Params { map_preaim: 0.0, ..base() });
+        b.beliefs = picture.clone();
+        let a = b.decide(&o, [0.0; 3]);
+        assert!((a.aim[0] - std::f32::consts::FRAC_PI_2).abs() > 0.5, "aim {:?}", a.aim);
+        // Only out-of-sight ones within 150 m, and only with none in view.
+        let mut far = with(base());
+        far.beliefs = vec![belief(Some(9), [-180.0, 0.0], 0.9, false)];
+        assert_eq!(far.preaim(&[0.0; 3]), None);
+        let mut seen = with(base());
+        seen.beliefs = vec![belief(Some(7), [0.0, 100.0], 0.8, false), belief(Some(3), [50.0, 0.0], 1.0, true)];
+        assert_eq!(seen.preaim(&[0.0; 3]), None);
+    }
+
+    #[test]
+    fn fight_positions_seen_by_believed_enemies_score_lower() {
+        let mut b = with(base());
+        b.beliefs = vec![
+            belief(Some(7), [0.0, 100.0], 0.6, false),
+            belief(None, [100.0, 0.0], 0.3, false),
+            belief(Some(3), [-50.0, 0.0], 0.9, false),
+            belief(Some(4), [0.0, -60.0], 1.0, true),
+            belief(Some(5), [0.0, 200.0], 0.9, false),
+            belief(Some(6), [80.0, 80.0], 0.9, false),
+        ];
+        // 7 counts; 6 is already counted; 3 is the target; too unsure, listed or too far do not.
+        assert_eq!(b.hidden_watch_cost([0.0, 0.0], 0.0, 3, &[6]), 15.0);
+        assert_eq!(b.hidden_watch_cost([0.0, 0.0], 0.0, 3, &[]), 30.0);
+        b.params.map_expose = 0.0;
+        assert_eq!(b.hidden_watch_cost([0.0, 0.0], 0.0, 3, &[]), 0.0);
+    }
+
+    #[test]
+    fn ways_past_two_or_more_believed_enemies_cost_more() {
+        let mut b = with(base());
+        let two = vec![belief(Some(7), [100.0, 30.0], 0.7, false), belief(None, [150.0, -40.0], 0.5, false), belief(Some(8), [100.0, 150.0], 0.9, false)];
+        b.beliefs = two.clone();
+        assert_eq!(b.crowd_cost(5.0, &[0.0; 3], [200.0, 0.0]), 80.0);
+        // One alone is not a crowd.
+        b.beliefs = two[..1].to_vec();
+        assert_eq!(b.crowd_cost(5.0, &[0.0; 3], [200.0, 0.0]), 0.0);
+        // The target never counts.
+        b.beliefs = two.clone();
+        b.focus = Some(7);
+        assert_eq!(b.crowd_cost(5.0, &[0.0; 3], [200.0, 0.0]), 0.0);
+        // Nor an enemy close by that is hurting us.
+        b.focus = None;
+        b.beliefs = vec![belief(Some(7), [30.0, 0.0], 0.9, true), belief(None, [150.0, -40.0], 0.5, false)];
+        b.attackers.insert(7, 4.0);
+        assert_eq!(b.crowd_cost(5.0, &[0.0; 3], [200.0, 0.0]), 0.0);
+        b.attackers.clear();
+        assert_eq!(b.crowd_cost(5.0, &[0.0; 3], [200.0, 0.0]), 80.0);
+        b.params.map_crowd = 0.0;
+        assert_eq!(b.crowd_cost(5.0, &[0.0; 3], [200.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn of_two_like_targets_the_one_with_fewer_enemies_near_it_comes_first() {
+        let two = r#"{"id": 3, "kind": "mech", "pos": [60, 0, 0], "aim": [3.1416, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]},
+                     {"id": 5, "kind": "mech", "pos": [0, 62, 0], "aim": [-1.5708, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        let o = obs(two, "");
+        let picture = vec![
+            belief(Some(3), [60.0, 0.0], 1.0, true),
+            belief(Some(5), [0.0, 62.0], 1.0, true),
+            belief(None, [110.0, 10.0], 0.7, false),
+            belief(Some(8), [100.0, -30.0], 0.6, false),
+        ];
+        let mut b = with(base());
+        b.decide(&o, [0.0; 3]);
+        assert_eq!(b.focus, Some(3));
+        let mut b = with(base());
+        b.beliefs = picture.clone();
+        b.decide(&o, [0.0; 3]);
+        assert_eq!(b.focus, Some(5));
+        let mut b = with(Params { map_reinf: 0.0, ..base() });
+        b.beliefs = picture.clone();
+        b.decide(&o, [0.0; 3]);
+        assert_eq!(b.focus, Some(3));
+        // The same in the engage-filter score.
+        let mut b = with(Params::default());
+        let plain = b.engage_score(&o, &o.mechs[0]);
+        b.beliefs = picture;
+        assert_eq!(b.engage_score(&o, &o.mechs[0]) - plain, 30.0);
+        assert_eq!(b.reinforcements(&o.mechs[1]), 0.0);
     }
 }

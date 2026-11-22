@@ -95,7 +95,7 @@ impl Brain {
                 s -= 15.0;
             }
         }
-        s
+        s + self.reinforcements(m)
     }
 
     /// Whether a mech standing at `c` (ground height `z`) is hidden from every eye at head and mid-body height.
@@ -196,7 +196,8 @@ impl Brain {
 
     /// Move toward the best of: staying put, or one of 16 points 6 m away. Score: closeness to the preferred
     /// distance, little movement, a line to the target while a weapon is ready, few other enemies within
-    /// 170 m with a line to it, and distance kept from lightning and mortar holders. When staying put wins, strafe
+    /// 170 m with a line to it (with `map_expose`: also believed enemies out of sight), and distance kept from
+    /// lightning and mortar holders. When staying put wins, strafe
     /// slowly across the target, reversing every 3 to 5 s (with `ext_fpos`: every `fp_flip_lo`..`fp_flip_hi` s).
     pub(super) fn fight_pos_move(&mut self, o: &Obs, t: &Actor, pref: f32, ready: bool) -> [f32; 2] {
         let pos = o.me.pos;
@@ -211,10 +212,13 @@ impl Brain {
         // Other enemies whose line to a point counts against it: those in sight, and with `ext_fpos` also those
         // seen in the last 4 s.
         let mut watchers: Vec<[f32; 3]> = others.iter().map(|m| m.pos).collect();
+        // Enemies counted above, left out of the believed ones (`map_expose`).
+        let mut counted: Vec<u32> = others.iter().map(|m| m.id).collect();
         if p.ext_fpos > 0.0 {
             for (id, k) in self.known.iter() {
                 if *id != t.id && o.t - k.seen_t < 4.0 && o.t - k.seen_t > 0.05 && d2(&k.pos, &pos) < 176.0 && !others.iter().any(|m| m.id == *id) {
                     watchers.push(k.pos);
+                    counted.push(*id);
                 }
             }
         }
@@ -247,6 +251,7 @@ impl Brain {
                     s -= 30.0;
                 }
             }
+            s -= b.hidden_watch_cost(q, qz, t.id, &counted);
             for m in others.iter().copied().chain(std::iter::once(t)) {
                 let k = keep_of(m);
                 let d = d2(&m.pos, &q);
@@ -478,5 +483,100 @@ impl Brain {
                 others.iter().any(|e| self.clear(*e, [c[0], c[1], cz + 5.0]))
             }) && self.straight(&pos, q)
         })
+    }
+}
+
+/// Confidence from which a believed enemy counts in a practice match.
+const SURE: f32 = 0.4;
+
+/// Distance from `q` to the segment `a`..`b`.
+fn seg_dist(q: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let l2 = ab[0] * ab[0] + ab[1] * ab[1];
+    let f = if l2 > 0.0 { (((q[0] - a[0]) * ab[0] + (q[1] - a[1]) * ab[1]) / l2).clamp(0.0, 1.0) } else { 0.0 };
+    (q[0] - a[0] - ab[0] * f).hypot(q[1] - a[1] - ab[1] * f)
+}
+
+/// The enemy picture in a practice match (see `Params::map_preaim`).
+impl Brain {
+    /// The enemy picture is kept and no free-for-all is settled.
+    fn map_practice(&self) -> bool {
+        self.params.ffa_detect > 0.0 && !self.ffa_on()
+    }
+
+    /// With no enemy in view, where to face: the surest believed enemy out of sight within 150 m (nearer first
+    /// on a tie), with `map_preaim`.
+    pub(super) fn preaim(&self, pos: &[f32; 3]) -> Option<[f32; 2]> {
+        if self.params.map_preaim <= 0.0 || !self.map_practice() || self.beliefs.iter().any(|b| b.listed && d2(&b.pos, pos) < 200.0) {
+            return None;
+        }
+        self.beliefs
+            .iter()
+            .filter(|b| !b.listed && b.conf >= SURE && d2(&b.pos, pos) <= 150.0)
+            .max_by(|x, y| (x.conf - d2(&x.pos, pos) * 1e-4).partial_cmp(&(y.conf - d2(&y.pos, pos) * 1e-4)).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|b| b.pos)
+    }
+
+    /// What a fight position at `q` (ground height `qz`) loses to believed enemies out of sight with a line to it
+    /// (with `map_expose`): those sure enough, within 170 m of it, other than the target and those already
+    /// counted (`skip`).
+    pub(super) fn hidden_watch_cost(&self, q: [f32; 2], qz: f32, target: u32, skip: &[u32]) -> f32 {
+        let w = self.params.map_expose;
+        if w <= 0.0 || !self.map_practice() {
+            return 0.0;
+        }
+        let mut s = 0.0;
+        for b in self.beliefs.iter().filter(|b| !b.listed && b.conf >= SURE && b.id.map_or(true, |id| id != target && !skip.contains(&id))) {
+            if d2(&b.pos, &q) >= 170.0 {
+                continue;
+            }
+            let sees = match self.sight.as_ref() {
+                Some(st) if st.cell_at(q[0], q[1]).is_some() => st.visible(q, b.pos),
+                _ => {
+                    let bz = self.ground(b.pos[0], b.pos[1], qz);
+                    self.clear([b.pos[0], b.pos[1], bz + 8.0], [q[0], q[1], qz + 5.0])
+                }
+            };
+            if sees {
+                s += w;
+            }
+        }
+        s
+    }
+
+    /// What walking from `from` to `to` costs for the sure believed enemies within 60 m of the way, once two or
+    /// more are (with `map_crowd`). Never counted: the current target, and an enemy within 60 m of us that hurt
+    /// us in the last 3 s.
+    pub(super) fn crowd_cost(&self, now: f32, from: &[f32; 3], to: [f32; 2]) -> f32 {
+        let w = self.params.map_crowd;
+        if w <= 0.0 || !self.map_practice() {
+            return 0.0;
+        }
+        let here = [from[0], from[1]];
+        let n = self
+            .beliefs
+            .iter()
+            .filter(|b| b.conf >= SURE && seg_dist(b.pos, here, to) < 60.0)
+            .filter(|b| match b.id {
+                Some(id) => self.focus != Some(id) && !(d2(&b.pos, from) < 60.0 && self.attackers.get(&id).map_or(false, |t| now - t < 3.0)),
+                None => true,
+            })
+            .count();
+        if n >= 2 {
+            w * n as f32
+        } else {
+            0.0
+        }
+    }
+
+    /// How much worse a candidate target scores for the other sure believed enemies within 80 m of it (at most
+    /// three), with `map_reinf`.
+    pub(super) fn reinforcements(&self, m: &Actor) -> f32 {
+        let w = self.params.map_reinf;
+        if w <= 0.0 || !self.map_practice() {
+            return 0.0;
+        }
+        let n = self.beliefs.iter().filter(|b| b.conf >= SURE && b.id != Some(m.id) && d2(&b.pos, &m.pos) < 80.0).count();
+        w * n.min(3) as f32
     }
 }

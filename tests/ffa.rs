@@ -18,9 +18,9 @@ fn fnv(h: &mut u64, bytes: &[u8]) {
 /// A practice-like scene: four mechs circling us and closing in, all aimed at us, shooting at us (bullets,
 /// beams and charges at us, hits on us); our hits taking hit points off them; a drone wearing one of them down;
 /// one of them killed by us. Nothing a free-for-all would show. Returns the hash of every action and the brain.
-fn practice_scene(world: Arc<World>, nav: Nav) -> (u64, Brain) {
+fn practice_scene(world: Arc<World>, nav: Nav, params: Params) -> (u64, Brain) {
     let hello: Hello = serde_json::from_str(r#"{"type":"hello","slot":0,"seed":77,"map":{"dir":""},"config":{}}"#).unwrap();
-    let mut b = Brain::with_params(&hello, Some(world), Some(nav.clone()), Params::default());
+    let mut b = Brain::with_params(&hello, Some(world), Some(nav.clone()), params);
     let c = nav.nearest_walkable(41.3, -72.8).unwrap();
     let mut me = nav.center(c);
     let mut aim = [0.0f32, 0.0];
@@ -141,13 +141,26 @@ fn load() -> Option<(Arc<World>, Nav)> {
 /// The practice scene's actions, as the build without the free-for-all side makes them.
 const PRACTICE_HASH: u64 = 0xbdede9d60a44ac46;
 
+/// Defaults with the practice uses of the enemy picture off.
+fn no_practice_map() -> Params {
+    Params { map_preaim: 0.0, map_expose: 0.0, map_crowd: 0.0, map_reinf: 0.0, ..Params::default() }
+}
+
 #[test]
 fn practice_scene_is_played_as_before() {
     let Some((world, nav)) = load() else { return };
-    let (h, b) = practice_scene(world, nav);
+    let (h, b) = practice_scene(world, nav, no_practice_map());
     eprintln!("practice scene hash {h:#018x}");
     assert!(!b.ffa_latched(), "detector latched in a practice scene: {}", b.dbg_mode);
     assert_eq!(h, PRACTICE_HASH, "actions differ from the build without the free-for-all side");
+}
+
+#[test]
+fn practice_scene_with_the_enemy_picture_in_use() {
+    let Some((world, nav)) = load() else { return };
+    let (h, b) = practice_scene(world, nav, Params::default());
+    eprintln!("practice scene hash with the picture in use {h:#018x}");
+    assert!(!b.ffa_latched(), "detector latched in a practice scene: {}", b.dbg_mode);
 }
 
 fn obs(tick: u64, mechs: &str, beams: &str, events: &str) -> Obs {
