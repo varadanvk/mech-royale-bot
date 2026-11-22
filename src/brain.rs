@@ -413,8 +413,8 @@ impl Default for Params {
             focus_stick: 50.0,
             farm_until: 0.0,
             farm_reach: 160.0,
-            heal_lo: 0.0,
-            heal_hi: 0.7,
+            heal_lo: 0.5,
+            heal_hi: 0.85,
             expose_weight: 1.0,
             cube_grab: 45.0,
             reload_hide: 16.0,
@@ -508,7 +508,7 @@ impl Default for Params {
             arm_crates: 0.0,
             rush_guard: 0.0,
             ring: 0.0,
-            counter: 0.0,
+            counter: 1.0,
             counter_range: 60.0,
             spot: 0.0,
             spot_crowd: 3.0,
@@ -3830,10 +3830,10 @@ mod tests {
     fn engage_filter_leaves_distant_mechs_alone() {
         let away = r#"{"id": 3, "kind": "mech", "pos": [100, 0, 0], "aim": [0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
         let weak = r#"{"id": 3, "kind": "mech", "pos": [100, 0, 0], "aim": [0, 0], "hp": 400, "max_hp": 1400, "weapons": ["gun"]}"#;
-        let mut b = with(Params { engage_filter: 1.0, ..base() });
+        let mut b = with(Params { engage_filter: 1.0, counter: 0.0, ..base() });
         b.decide(&obs(away, ""), [0.0; 3]);
         assert_eq!(b.focus, None);
-        let mut b = with(Params { engage_filter: 1.0, ..base() });
+        let mut b = with(Params { engage_filter: 1.0, counter: 0.0, ..base() });
         b.decide(&obs(weak, ""), [0.0; 3]);
         assert_eq!(b.focus, Some(3));
     }
