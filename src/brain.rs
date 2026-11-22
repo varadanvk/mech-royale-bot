@@ -360,7 +360,7 @@ impl Default for Params {
             arm_hp: 0.35,
             arm_rank: 25.0,
             arm_better: 60.0,
-            upg_dmg: 1.0,
+            upg_dmg: 0.0,
             arc_save: 0.0,
             laser_range: 0.0,
             drop_gun: 0.0,
