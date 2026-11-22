@@ -739,6 +739,11 @@ impl Brain {
         self.detector.latched
     }
 
+    /// Where the current break-off is heading, if anywhere.
+    pub fn break_off_goal(&self) -> Option<[f32; 2]> {
+        self.cr_goal
+    }
+
     /// Decisions spent in each mode: practice, fight, third, avoid, hide, late.
     pub fn ffa_ticks(&self) -> [u32; 6] {
         self.ffa_ticks

@@ -19,8 +19,12 @@ fn fnv(h: &mut u64, bytes: &[u8]) {
 /// beams and charges at us, hits on us); our hits taking hit points off them; a drone wearing one of them down;
 /// one of them killed by us. Nothing a free-for-all would show. Returns the hash of every action and the brain.
 fn practice_scene(world: Arc<World>, nav: Nav) -> (u64, Brain) {
+    practice_scene_with(world, nav, Params::default())
+}
+
+fn practice_scene_with(world: Arc<World>, nav: Nav, params: Params) -> (u64, Brain) {
     let hello: Hello = serde_json::from_str(r#"{"type":"hello","slot":0,"seed":77,"map":{"dir":""},"config":{}}"#).unwrap();
-    let mut b = Brain::with_params(&hello, Some(world), Some(nav.clone()), Params::default());
+    let mut b = Brain::with_params(&hello, Some(world), Some(nav.clone()), params);
     let c = nav.nearest_walkable(41.3, -72.8).unwrap();
     let mut me = nav.center(c);
     let mut aim = [0.0f32, 0.0];
@@ -144,9 +148,12 @@ const PRACTICE_HASH: u64 = 0xbdede9d60a44ac46;
 #[test]
 fn practice_scene_is_played_as_before() {
     let Some((world, nav)) = load() else { return };
-    let (h, b) = practice_scene(world, nav);
-    eprintln!("practice scene hash {h:#018x}");
+    let (_, b) = practice_scene(world.clone(), nav.clone());
     assert!(!b.ffa_latched(), "detector latched in a practice scene: {}", b.dbg_mode);
+    // The break-off goal choice (`cb_*`) is newer than this scene's hash: off here.
+    let p = Params { cb_away: 0.0, cb_path: 0.0, cb_known: 0.0, cb_corner: 0.0, cb_turn: 0.0, ..Params::default() };
+    let (h, _) = practice_scene_with(world, nav, p);
+    eprintln!("practice scene hash {h:#018x}");
     assert_eq!(h, PRACTICE_HASH, "actions differ from the build without the free-for-all side");
 }
 

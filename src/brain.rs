@@ -384,6 +384,17 @@ pub struct Params {
     pub ffa_third_r: f32,
     pub ffa_late_r: f32,
     pub ffa_quiet: f32,
+    /// Break-off goal choice (each 0 = off). `cb_away`: the goal must be farther than we are from the enemies'
+    /// centre and from the nearest enemy, and not in a direction within 60 degrees of an enemy within 80 m
+    /// (other directions toward enemies cost more). `cb_path`: the way there (straight line and the searched
+    /// cells) keeps 25 m from every enemy we know of, seen, remembered or believed. `cb_known`: hide from up to
+    /// six enemies, remembered ones included. `cb_corner`: with no such goal, stay and fight without boosting
+    /// toward an enemy. `cb_turn`: a new burst does not turn back toward the enemies.
+    pub cb_away: f32,
+    pub cb_path: f32,
+    pub cb_known: f32,
+    pub cb_corner: f32,
+    pub cb_turn: f32,
 }
 
 impl Default for Params {
@@ -558,6 +569,11 @@ impl Default for Params {
             ffa_third_r: 220.0,
             ffa_late_r: 140.0,
             ffa_quiet: 4.6,
+            cb_away: 1.0,
+            cb_path: 1.0,
+            cb_known: 1.0,
+            cb_corner: 1.0,
+            cb_turn: 1.0,
         }
     }
 }
@@ -736,6 +752,11 @@ impl Params {
         p.ffa_third_r = g("ffa_third_r", p.ffa_third_r);
         p.ffa_late_r = g("ffa_late_r", p.ffa_late_r);
         p.ffa_quiet = g("ffa_quiet", p.ffa_quiet);
+        p.cb_away = g("cb_away", p.cb_away);
+        p.cb_path = g("cb_path", p.cb_path);
+        p.cb_known = g("cb_known", p.cb_known);
+        p.cb_corner = g("cb_corner", p.cb_corner);
+        p.cb_turn = g("cb_turn", p.cb_turn);
         p
     }
 
@@ -2463,6 +2484,9 @@ impl Brain {
             && (p.ext_finish <= 0.0 || (hp_frac > 0.42 && near_enemies <= 2));
         // Outnumbered or losing: break off in bursts to the nearest hidden cell (`crowd_retreat`).
         let mut cr_goal: Option<[f32; 2]> = None;
+        // Breaking off was called for but there is nowhere to go (`cb_corner`), and every enemy we know of.
+        let mut cb_cornered = false;
+        let mut cb_all: Vec<[f32; 2]> = Vec::new();
         if p.crowd_retreat > 0.0 {
             let near = enemies.iter().filter(|m| d2(&m.pos, &pos) < p.cr_radius).count();
             let tf = target.map_or(1.0, |t| if t.max_hp > 0.0 { t.hp / t.max_hp } else { 1.0 });
@@ -2475,16 +2499,52 @@ impl Brain {
             if veto {
                 self.cr_until = -1.0;
             } else if o.t < self.cr_until || trigger {
-                let at_exposed = self.cr_goal.map_or(false, |g| {
-                    d2(&g, &pos) < 2.5 && self.hidden_from(g, pos[2], &threats[..threats.len().min(4)]) < threats.len().min(4)
-                });
-                if o.t >= self.cr_until || at_exposed {
+                let cb_on = p.cb_away > 0.0 || p.cb_path > 0.0 || p.cb_known > 0.0 || p.cb_corner > 0.0 || p.cb_turn > 0.0;
+                let foes = if cb_on { self.cb_foes(o, &threats) } else { Vec::new() };
+                let all: Vec<[f32; 2]> = foes.iter().map(|f| [f[0], f[1]]).collect();
+                let eyes: Vec<[f32; 3]> = if p.cb_known > 0.0 {
+                    foes.iter().filter(|f| d2(*f, &pos) < 260.0).take(6).copied().collect()
+                } else {
+                    threats[..threats.len().min(4)].to_vec()
+                };
+                let at_exposed = self.cr_goal.map_or(false, |g| d2(&g, &pos) < 2.5 && self.hidden_from(g, pos[2], &eyes) < eyes.len());
+                // The way to the goal now runs past an enemy: choose again.
+                let here2 = [pos[0], pos[1]];
+                let cut_off = p.cb_path > 0.0 && self.cr_goal.map_or(false, |g| d2(&g, &pos) > 2.5 && !Self::cb_line_clear(here2, g, &all));
+                if o.t >= self.cr_until || at_exposed || cut_off {
                     if o.t >= self.cr_until {
                         self.cr_until = o.t + p.cr_burst;
                     }
-                    self.cr_goal = self.retreat_cell(o, &threats);
+                    let prev = self.cr_goal;
+                    let mut g = self.retreat_cell(o, &eyes, if p.cb_away > 0.0 || p.cb_path > 0.0 { &all } else { &[] });
+                    if p.cb_turn > 0.0 {
+                        // A new goal back the way we came and toward the enemies: keep the old one while it is
+                        // still away from them and clear, else stay and fight.
+                        if let (Some(ng), Some(pg)) = (g, prev) {
+                            let dn = d2(&ng, &pos);
+                            let dp = d2(&pg, &pos);
+                            if dn > 3.0 && dp > 3.0 {
+                                let un = norm2(ng[0] - pos[0], ng[1] - pos[1]);
+                                let up = norm2(pg[0] - pos[0], pg[1] - pos[1]);
+                                let near: Vec<&[f32; 2]> = all.iter().filter(|f| d2(*f, &pos) < 200.0).collect();
+                                let toward = !near.is_empty() && {
+                                    let n = near.len() as f32;
+                                    let c = [near.iter().map(|f| f[0]).sum::<f32>() / n, near.iter().map(|f| f[1]).sum::<f32>() / n];
+                                    let uc = norm2(c[0] - pos[0], c[1] - pos[1]);
+                                    un[0] * uc[0] + un[1] * uc[1] > 0.0
+                                };
+                                if un[0] * up[0] + un[1] * up[1] < -0.3 && toward {
+                                    let keep = Self::cb_away_cost(here2, pg, &all).is_some() && Self::cb_line_clear(here2, pg, &all);
+                                    g = if keep { Some(pg) } else { None };
+                                }
+                            }
+                        }
+                    }
+                    self.cr_goal = g;
                 }
                 cr_goal = self.cr_goal;
+                cb_cornered = p.cb_corner > 0.0 && cr_goal.is_none();
+                cb_all = all;
             }
         }
         let mut boost = false;
@@ -3046,6 +3106,19 @@ impl Brain {
             for (i, w) in me.weapons.iter().enumerate().take(2) {
                 if w.as_ref().map_or(false, |w| w.kind == "laser") {
                     a.fire[i] = false;
+                }
+            }
+        }
+        // Cornered (`cb_corner`): fight where we are, never boosting toward an enemy close by.
+        if cb_cornered && boost && label != "zone" && o.t >= self.unstick_until {
+            let l = a.mv[0].hypot(a.mv[1]);
+            if l > 1e-3 {
+                let u = [a.mv[0] / l, a.mv[1] / l];
+                if cb_all.iter().any(|f| d2(f, &pos) < 80.0 && {
+                    let t = norm2(f[0] - pos[0], f[1] - pos[1]);
+                    u[0] * t[0] + u[1] * t[1] > 0.5
+                }) {
+                    boost = false;
                 }
             }
         }
