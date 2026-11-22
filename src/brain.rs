@@ -400,7 +400,8 @@ pub struct Params {
     pub cb_turn: f32,
     /// In a live fight (a target in view while engaged, or hurt by a mech in the last 6 s), keep fighting
     /// instead of breaking off, backing away or hiding to heal; a break-off to hidden ground within
-    /// `stay_cover` m still goes ahead (practice matches only; 0 = off).
+    /// `stay_cover` m still goes ahead (practice matches only; 0 = off). 2 = also never break off outside a
+    /// live fight.
     pub stay_fight: f32,
     pub stay_cover: f32,
 }
@@ -583,8 +584,8 @@ impl Default for Params {
             cb_known: 1.0,
             cb_corner: 1.0,
             cb_turn: 1.0,
-            stay_fight: 1.0,
-            stay_cover: 15.0,
+            stay_fight: 2.0,
+            stay_cover: 0.0,
         }
     }
 }
@@ -2577,7 +2578,8 @@ impl Brain {
                 cb_all = all;
             }
         }
-        if stay && (cr_goal.is_some() || cb_cornered) && cr_goal.map_or(true, |g| d2(&g, &pos) > p.stay_cover) {
+        let stay_all = p.stay_fight >= 2.0 && !ffa_on;
+        if (stay || stay_all) && (cr_goal.is_some() || cb_cornered) && (stay_all || cr_goal.map_or(true, |g| d2(&g, &pos) > p.stay_cover)) {
             cr_goal = None;
             cb_cornered = false;
             self.cr_until = -1.0;
