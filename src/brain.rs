@@ -462,14 +462,14 @@ impl Default for Params {
             ring: 0.0,
             counter: 0.0,
             counter_range: 60.0,
-            spot: 0.0,
+            spot: 2.0,
             spot_crowd: 3.0,
             ring_mem: 4.0,
             ghost: 0.0,
             ghost_s: 6.0,
             ghost_r: 120.0,
             los_fire: 0.0,
-            contacts: 0.0,
+            contacts: 1.0,
         }
     }
 }
