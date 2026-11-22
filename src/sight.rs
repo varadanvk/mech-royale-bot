@@ -63,12 +63,26 @@ impl Zone {
     }
 }
 
-/// A known enemy for choosing a position: where it is and its health fraction.
+/// A known enemy for choosing a position: where it is (somewhere within `r` of `pos`), its health fraction, how
+/// sure we are it is there at all, and whether it is located well enough to be the one we fight.
 #[derive(Clone, Copy, Debug)]
 pub struct Foe {
     pub pos: [f32; 2],
     pub hp: f32,
+    pub r: f32,
+    pub conf: f32,
+    pub sure: bool,
 }
+
+impl Foe {
+    /// An enemy whose position we know.
+    pub fn at(pos: [f32; 2], hp: f32) -> Foe {
+        Foe { pos, hp, r: 0.0, conf: 1.0, sure: true }
+    }
+}
+
+/// Expected watchers beyond the one we fight that a position may have before it no longer counts as isolating.
+const ISO_SLACK: f32 = 0.6;
 
 /// A place chosen to go to.
 #[derive(Clone, Copy, Debug)]
@@ -254,6 +268,32 @@ impl SightTable {
         foes.iter().filter(|f| self.visible(at, f.pos)).count()
     }
 
+    /// Chance that `f` has a line to `at`: its confidence times the share of its possible positions (the centre
+    /// and six points round it) that have one. A located enemy gives 0 or 1.
+    pub fn watch(&self, at: [f32; 2], f: &Foe) -> f32 {
+        if f.conf <= 0.0 {
+            return 0.0;
+        }
+        if f.r < GRID * 0.5 {
+            return if self.visible(at, f.pos) { f.conf } else { 0.0 };
+        }
+        if dist(at, f.pos) > RANGE + f.r {
+            return 0.0;
+        }
+        let rr = f.r * 0.7;
+        let mut n = self.visible(at, f.pos) as u32;
+        for k in 0..6 {
+            let a = k as f32 * TAU / 6.0;
+            n += self.visible(at, [f.pos[0] + a.cos() * rr, f.pos[1] + a.sin() * rr]) as u32;
+        }
+        f.conf * n as f32 / 7.0
+    }
+
+    /// Expected number of `foes` with a line to `at`.
+    pub fn expected(&self, at: [f32; 2], foes: &[Foe]) -> f32 {
+        foes.iter().map(|f| self.watch(at, f)).sum()
+    }
+
     /// Level 1: the best sheltered spot to hold. Inside the safe area, a short walk away, not past the enemies,
     /// few of them with a line to it. Falls back to the least exposed cells nearby when no spot qualifies.
     pub fn pick_spot(&self, nav: &Nav, me: [f32; 2], foes: &[Foe], zone: &Zone, banned: &[usize], walk: f32) -> Option<Pick> {
@@ -267,9 +307,20 @@ impl SightTable {
             }
             let dm = dist(me, p);
             // An enemy nearer the place than we are, in front of it: we would be running into them.
-            let past = foes.iter().filter(|f| dist(f.pos, p) < 150.0 && dist(f.pos, p) < dm * 0.8).count();
-            let seen = self.seen_by(p, foes);
-            Some(base * 200.0 + travel / walk * 2.0 + seen as f32 * 12.0 + past as f32 * 40.0)
+            let past: f32 = foes.iter().filter(|f| dist(f.pos, p) < 150.0 && dist(f.pos, p) < dm * 0.8).map(|f| f.conf).sum();
+            let seen = self.expected(p, foes);
+            // Enemies we only roughly know of: keep away from the side they are on.
+            let to = [p[0] - me[0], p[1] - me[1]];
+            let lean: f32 = foes
+                .iter()
+                .filter(|f| !f.sure && dm > 1.0)
+                .map(|f| {
+                    let e = [f.pos[0] - me[0], f.pos[1] - me[1]];
+                    let c = (to[0] * e[0] + to[1] * e[1]) / (dm * e[0].hypot(e[1]).max(1.0));
+                    f.conf * c.max(0.0)
+                })
+                .sum();
+            Some(base * 200.0 + travel / walk * 2.0 + seen * 12.0 + past * 40.0 + lean * 15.0)
         };
         let mut best: Option<Pick> = None;
         for (i, s) in self.spots.iter().enumerate() {
@@ -304,7 +355,8 @@ impl SightTable {
     }
 
     /// Level 2: a position within reach where exactly one of `foes` has a line to us (the weaker and nearer the
-    /// better) and the rest do not, weighing the walk there, exposure on the way, how sheltered it is and how
+    /// better) and the rest do not (for roughly known enemies: fewest expected beyond one, and the one must be a
+    /// located enemy), weighing the walk there, exposure on the way, how sheltered it is and how
     /// far the nearest spot to fall back to is. `keep` is the position chosen before: it stays unless another is
     /// clearly better.
     pub fn pick_isolating(&self, nav: &Nav, me: [f32; 2], foes: &[Foe], zone: &Zone, walk: f32, keep: Option<[f32; 2]>) -> Option<Pick> {
@@ -318,16 +370,26 @@ impl SightTable {
             if !self.reach[c] || !zone.holds(p, 6.0) {
                 return None;
             }
-            let mut seer = None;
+            let (mut seer, mut top, mut total) = (None, 0.0f32, 0.0f32);
             for (k, f) in foes.iter().enumerate() {
-                if self.visible(p, f.pos) {
-                    if seer.is_some() {
-                        return None;
-                    }
+                let w = self.watch(p, f);
+                if w <= 0.0 {
+                    continue;
+                }
+                total += w;
+                if total - w.max(top) > ISO_SLACK {
+                    return None;
+                }
+                if f.sure && w >= 0.5 && w > top {
+                    top = w;
                     seer = Some(k);
                 }
             }
             let k = seer?;
+            let others = total - top;
+            if others > ISO_SLACK {
+                return None;
+            }
             let travel = nav.path_len(p[0], p[1])?;
             if travel > 140.0 {
                 return None;
@@ -335,13 +397,13 @@ impl SightTable {
             let mut route = 0.0;
             for f in [0.33f32, 0.67] {
                 let q = [me[0] + (p[0] - me[0]) * f, me[1] + (p[1] - me[1]) * f];
-                let n = self.seen_by(q, foes) as f32;
+                let n = self.expected(q, foes);
                 route += n * 0.3 + (n - 1.0).max(0.0);
             }
             let foe = foes[k];
             let df = dist(foe.pos, p);
             let bonus = (1.0 - foe.hp.clamp(0.0, 1.0)) * 6.0 + if df < 80.0 { 2.0 } else { 0.0 };
-            let score = travel / walk + route * 1.5 + self.exposure[c] * 10.0 + self.spot_d[c].min(150.0) / 30.0 - bonus;
+            let score = travel / walk + route * 1.5 + self.exposure[c] * 10.0 + self.spot_d[c].min(150.0) / 30.0 - bonus + others * 8.0;
             Some(Pick { pos: p, yaw: (foe.pos[1] - p[1]).atan2(foe.pos[0] - p[0]), spot: None, foe: Some(foe.pos), score })
         };
         let mut best: Option<Pick> = None;
