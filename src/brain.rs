@@ -443,7 +443,7 @@ impl Default for Params {
             ring: 0.0,
             counter: 0.0,
             counter_range: 60.0,
-            spot: 0.0,
+            spot: 2.0,
             spot_crowd: 3.0,
         }
     }
