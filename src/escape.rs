@@ -1,5 +1,6 @@
 //! Enemy profiles, escaping a crowd and dueling a lone enemy (each behind its own parameter).
 use super::{d2, norm2, wrap, yaw_to, Brain};
+use crate::contacts::{Belief, WS_CHARGING};
 use crate::proto::Obs;
 use crate::sight::{Foe, Zone};
 use std::f32::consts::PI;
@@ -20,9 +21,25 @@ impl Brain {
             let b = self.beliefs[i];
             let d = d2(&b.pos, &here);
             let mut hunting = b.hunter;
+            let by_path = self.params.inf_hunt > 0.0;
             if let Some(k) = b.id.and_then(|id| self.contacts.tracks.get(&id)) {
+                // Its path over the last few seconds: most of it (at least 6 m over 2 s or more) spent closing
+                // on where we were at each step.
+                if by_path {
+                    let near_me = |t: f32| self.me_hist.iter().min_by(|x, y| (x.0 - t).abs().partial_cmp(&(y.0 - t).abs()).unwrap_or(std::cmp::Ordering::Equal)).map_or(here, |h| h.1);
+                    let (mut path, mut closing) = (0.0f32, 0.0f32);
+                    for w in k.hist.iter().collect::<Vec<_>>().windows(2) {
+                        let me0 = near_me(w[0].0);
+                        path += d2(&w[0].1, &w[1].1);
+                        closing += d2(&w[0].1, &me0) - d2(&w[1].1, &me0);
+                    }
+                    let span = k.hist.back().map_or(0.0, |l| l.0) - k.hist.front().map_or(0.0, |f| f.0);
+                    if span >= 2.0 - 1e-3 && path >= 6.0 && closing >= 0.6 * path {
+                        hunting = true;
+                    }
+                }
                 // Closer to us than 3 to 5 s ago by at least 8 m (counting how we moved meanwhile).
-                if let Some(&(t0, e0)) = k.hist.iter().find(|h| o.t - h.0 >= 3.0 - 1e-3) {
+                if let Some(&(t0, e0)) = k.hist.iter().find(|h| !by_path && o.t - h.0 >= 3.0 - 1e-3) {
                     let me0 = self.me_hist.iter().min_by(|x, y| (x.0 - t0).abs().partial_cmp(&(y.0 - t0).abs()).unwrap_or(std::cmp::Ordering::Equal)).map_or(here, |h| h.1);
                     if d2(&e0, &me0) - d >= 8.0 {
                         hunting = true;
@@ -76,7 +93,16 @@ impl Brain {
             let me_id = self.duel;
             let at = self.duel_at.unwrap_or(at);
             let crowd = self.beliefs.iter().any(|b| (me_id.is_none() || b.id != me_id) && d2(&b.pos, &at) > 25.0 && b.conf >= 0.5 && d2(&b.pos, &here) < p.duel_r - 20.0);
-            let keep = cur.map_or(false, |b| d2(&b.pos, &here) < p.duel_r + 40.0)
+            // Help on its way: another enemy could be shooting at us before this one is dead, and it is not
+            // nearly dead.
+            let help = p.duel_eta > 0.0
+                && cur.map_or(false, |b| {
+                    let rem = self.duel_ttk(o, &b, pos);
+                    let nearly = rem < 2.0 || b.est_hp < 0.25 * b.max_hp.max(1.0);
+                    !nearly && self.beliefs.iter().any(|c| c.conf >= 0.3 && (me_id.is_none() || c.id != me_id) && d2(&c.pos, &at) > 25.0 && c.eta < rem)
+                });
+            let keep = !help
+                && cur.map_or(false, |b| d2(&b.pos, &here) < p.duel_r + 40.0)
                 && hp_frac >= 0.45
                 && !crowd
                 && !late
@@ -86,16 +112,46 @@ impl Brain {
             if !keep {
                 self.duel = None;
                 self.duel_at = None;
+                if help {
+                    self.duel_abort_n += 1;
+                    if self.trace_modes {
+                        eprintln!("MODE duel_abort t {:.1} hp {:.0}", o.t, o.me.hp);
+                    }
+                }
             }
         }
         if self.duel_at.is_none() && hp_frac >= p.duel_hp && !late && !self.esc_on {
             // Named enemies, or unnamed ones heard often enough to be sure of.
+            // With `inf_hp` weighed on the estimate plus half its uncertainty; with `inf_weapon` an enemy whose
+            // weapons are down may have a little more, and one charging its laser is left for now.
+            let hp_of = |b: &Belief| b.est_hp + if p.inf_hp > 0.0 { 0.5 * b.hp_sd } else { 0.0 };
+            let ratio = |b: &Belief| p.duel_ratio * if p.inf_weapon > 0.0 && b.open_s > 0.3 { 1.15 } else { 1.0 };
+            let hunters: Vec<[f32; 2]> = self.beliefs.iter().filter(|c| c.hunting && c.conf >= 0.3).map(|c| c.pos).collect();
+            let score = |b: &Belief| {
+                let mut s = d2(&b.pos, &here) + 0.1 * b.est_hp;
+                if p.inf_danger > 0.0 {
+                    s += 150.0 * b.danger;
+                }
+                if p.inf_hunt > 0.0 {
+                    let friends = hunters.iter().any(|h| d2(h, &b.pos) > 1.0 && d2(h, &b.pos) < 150.0);
+                    s += if b.hunting && friends { 100.0 } else if !b.hunting && !friends { -40.0 } else { 0.0 };
+                }
+                s
+            };
             let best = self
                 .beliefs
                 .iter()
-                .filter(|b| b.alone && b.conf >= if b.id.is_some() { 0.5 } else { 0.6 } && d2(&b.pos, &here) < p.duel_r && (b.est_hp <= my_hp * p.duel_ratio || b.cornered))
+                .filter(|b| b.alone && b.conf >= if b.id.is_some() { 0.5 } else { 0.6 } && d2(&b.pos, &here) < p.duel_r && (hp_of(b) <= my_hp * ratio(b) || b.cornered))
                 .filter(|b| !self.beliefs.iter().any(|c| c != *b && c.conf >= 0.3 && d2(&c.pos, &here) < p.duel_r))
-                .min_by(|x, y| (d2(&x.pos, &here) + 0.1 * x.est_hp).partial_cmp(&(d2(&y.pos, &here) + 0.1 * y.est_hp)).unwrap_or(std::cmp::Ordering::Equal))
+                .filter(|b| p.inf_danger <= 0.0 || b.danger < p.duel_danger || hp_of(b) <= my_hp * 0.5)
+                .filter(|b| p.inf_weapon <= 0.0 || b.wstate != WS_CHARGING)
+                .filter(|b| {
+                    p.duel_eta <= 0.0 || {
+                        let eta = self.beliefs.iter().filter(|c| c != b && c.conf >= 0.3).map(|c| c.eta).fold(f32::INFINITY, f32::min);
+                        self.duel_ttk(o, b, pos) + p.duel_eta_margin < eta
+                    }
+                })
+                .min_by(|x, y| score(x).partial_cmp(&score(y)).unwrap_or(std::cmp::Ordering::Equal))
                 .copied();
             if let Some(b) = best {
                 self.duel = b.id;

@@ -404,6 +404,33 @@ pub struct Params {
     pub duel_glance: f32,
     /// A duel is started on an enemy with up to this many times our hit points.
     pub duel_ratio: f32,
+    /// Hit points of each enemy estimated from its last listed value, the damage we dealt it since and the
+    /// regeneration it gets back out of a fight, with an uncertainty that grows while it is unseen; a duel is
+    /// weighed on the estimate plus half the uncertainty (needs `infer`; 0 = off).
+    pub inf_hp: f32,
+    /// Danger of each enemy from how it fights us (needs `infer`; 0 = off): no duel is started on one rated
+    /// `duel_danger` or more unless it has at most half our hit points, and less dangerous ones are preferred.
+    pub inf_danger: f32,
+    pub duel_danger: f32,
+    /// Help on its way (needs `infer`; 0 = off): a duel starts only if we should kill the enemy at least
+    /// `duel_eta_margin` s before any other believed enemy could be shooting at us (its distance less its reach,
+    /// at most `duel_eta_reach`, covered at `duel_eta_speed`, taking twice as long for one not coming for us), and
+    /// is broken off when one could arrive before the enemy is dead, unless it nearly is. Our damage per second
+    /// counts our weapons' rates, reloads and cubes, times `duel_acc` for the shots that miss.
+    pub duel_eta: f32,
+    pub duel_eta_margin: f32,
+    pub duel_eta_speed: f32,
+    pub duel_eta_reach: f32,
+    pub duel_acc: f32,
+    /// Enemy weapon state (needs `infer`; 0 = off): from shots heard and seen, reload sounds, beams and charges.
+    /// A duel is not started on an enemy charging its laser, more readily started on one with its weapons
+    /// down, closed on at a run while they are down, and our move never steps into the line of a charging laser
+    /// while dueling.
+    pub inf_weapon: f32,
+    /// Coming for us judged from the enemy's path over the last few seconds against where we were (needs
+    /// `infer`; 0 = off); a duel prefers an enemy not coming for us and avoids one with another coming for us
+    /// near it.
+    pub inf_hunt: f32,
 }
 
 impl Default for Params {
@@ -587,6 +614,16 @@ impl Default for Params {
             duel_hp: 0.6,
             duel_glance: 2.5,
             duel_ratio: 1.25,
+            inf_hp: 1.0,
+            inf_danger: 1.0,
+            duel_danger: 0.7,
+            duel_eta: 1.0,
+            duel_eta_margin: 1.0,
+            duel_eta_speed: 10.0,
+            duel_eta_reach: 150.0,
+            duel_acc: 0.55,
+            inf_weapon: 1.0,
+            inf_hunt: 1.0,
         }
     }
 }
@@ -774,6 +811,16 @@ impl Params {
         p.duel_hp = g("duel_hp", p.duel_hp);
         p.duel_glance = g("duel_glance", p.duel_glance);
         p.duel_ratio = g("duel_ratio", p.duel_ratio);
+        p.inf_hp = g("inf_hp", p.inf_hp);
+        p.inf_danger = g("inf_danger", p.inf_danger);
+        p.duel_danger = g("duel_danger", p.duel_danger);
+        p.duel_eta = g("duel_eta", p.duel_eta);
+        p.duel_eta_margin = g("duel_eta_margin", p.duel_eta_margin);
+        p.duel_eta_speed = g("duel_eta_speed", p.duel_eta_speed);
+        p.duel_eta_reach = g("duel_eta_reach", p.duel_eta_reach);
+        p.duel_acc = g("duel_acc", p.duel_acc);
+        p.inf_weapon = g("inf_weapon", p.inf_weapon);
+        p.inf_hunt = g("inf_hunt", p.inf_hunt);
         p
     }
 
@@ -1063,7 +1110,20 @@ pub struct Brain {
     /// How many escapes and duels were started (for a viewer); printed as they start with `TMODES` set.
     pub esc_n: u32,
     pub duel_n: u32,
+    /// Duels broken off because another enemy could arrive before the one dueled is dead.
+    pub duel_abort_n: u32,
     trace_modes: bool,
+    /// How each enemy fights and the state of its weapons, by id.
+    foes: BTreeMap<u32, foes::FoeStat>,
+    /// Weapon numbers for reading enemy weapon state: gun magazine and reload, laser cooldown; damage per cube
+    /// and the cube cap, for our own damage.
+    foe_gun: [f32; 2],
+    foe_laser_cd: f32,
+    dmg_cube: [f32; 2],
+    /// For a viewer only, never read by decisions: per believed enemy (as many as `dbg_contacts` lists, at most
+    /// 16): id (-1 unnamed), estimated hit points, their uncertainty, danger, seconds until it could shoot at us,
+    /// weapon state, coming for us (0/1), seconds its weapons stay down.
+    pub dbg_enemies: Vec<[f32; 8]>,
 }
 
 impl Brain {
@@ -1086,12 +1146,14 @@ impl Brain {
     pub fn with_params(hello: &Hello, world: Option<Arc<World>>, nav: Option<Nav>, params: Params) -> Brain {
         let cfg = &hello.config;
         let f = |a: &str, b: &str, d: f32| cfg.get(a).and_then(|v| v.get(b)).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d);
+        let f2 = |a: &str, b: &str, c: &str, d: f32| cfg.get(a).and_then(|v| v.get(b)).and_then(|v| v.get(c)).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d);
         let sight = match (&world, &nav) {
             (Some(w), Some(n)) if params.spot > 0.0 || params.crowd_retreat > 0.0 || params.fight_pos > 0.0 || params.late_hold > 0.0 || params.fight_cubes > 0.0 => {
                 Some(Arc::new(SightTable::build(w, n)))
             }
             _ => None,
         };
+        let hp_model = params.contacts > 0.0 && params.infer > 0.0 && params.inf_hp > 0.0;
         Brain {
             world,
             nav,
@@ -1166,7 +1228,12 @@ impl Brain {
             spot_pick: None,
             spot_ban: BTreeMap::new(),
             spot_seen_since: None,
-            contacts: Contacts::default(),
+            contacts: Contacts {
+                hp_model,
+                regen_delay: f("mech", "regen_delay", 5.0),
+                regen_per_s: f("mech", "regen_per_s", 45.0),
+                ..Contacts::default()
+            },
             beliefs: Vec::new(),
             dbg_contacts: Vec::new(),
             iso_pick: None,
@@ -1199,6 +1266,12 @@ impl Brain {
             glance_next: -1.0,
             esc_n: 0,
             duel_n: 0,
+            duel_abort_n: 0,
+            foes: BTreeMap::new(),
+            foe_gun: [f2("weapons", "gun", "mag", 12.0), f2("weapons", "gun", "reload", 2.4)],
+            foe_laser_cd: f2("weapons", "laser", "cooldown", 1.65),
+            dmg_cube: [f("cubes", "damage_per_cube", 0.04), f("cubes", "stat_cap", 10.0)],
+            dbg_enemies: Vec::new(),
             trace_modes: std::env::var("TMODES").is_ok(),
         }
     }
@@ -1563,7 +1636,7 @@ impl Brain {
         self.contacts.begin();
         for e in o.events.iter().filter(|e| e.kind == "hit") {
             if let Some(id) = e.target.filter(|t| *t < 100) {
-                self.contacts.note_dealt(id, e.amount);
+                self.contacts.note_dealt(o.t, id, e.amount);
             }
         }
         for m in o.mechs.iter().filter(|m| m.kind == "mech") {
@@ -1576,7 +1649,7 @@ impl Brain {
             let hpf = if m.max_hp > 0.0 { m.hp / m.max_hp } else { 1.0 };
             self.contacts.see(o.t, m.id, m.pos, m.vel, &m.weapons, hpf, hunter);
             if m.max_hp > 0.0 {
-                self.contacts.note_hp(m.id, m.hp);
+                self.contacts.note_hp(o.t, m.id, m.hp, m.max_hp);
             }
         }
         for e in &o.events {
@@ -2094,6 +2167,7 @@ impl Brain {
         let infer = p.contacts > 0.0 && p.infer > 0.0;
         if infer {
             self.profile(o, &pos);
+            self.judge(o, &pos);
         }
 
         // --- upgrades
@@ -2700,6 +2774,13 @@ impl Brain {
             if shoot_at.is_none() {
                 a.aim = [yaw_to(&pos, &g), 0.0];
             }
+            // Its weapons are down for a while yet: close the distance at a run.
+            if p.inf_weapon > 0.0 && me.energy > 30.0 && d2(&g, &pos) > 40.0 {
+                let open = self.beliefs.iter().filter(|b| b.conf >= 0.2).min_by(|x, y| d2(&x.pos, &g).partial_cmp(&d2(&y.pos, &g)).unwrap_or(std::cmp::Ordering::Equal)).map_or(0.0, |b| b.open_s);
+                if open > 0.5 {
+                    boost = true;
+                }
+            }
         } else if let Some(g) = arm_goal.filter(|_| !(p.stand_first > 0.0 && stand_from.is_some())) {
             label = "arm";
             mv = self.go(&pos, [g[0], g[1]]);
@@ -3105,6 +3186,27 @@ impl Brain {
             }
             if o.t < self.glance_until && !charging {
                 a.aim = [self.glance_yaw, 0.0];
+            }
+            // Never step into the line of a laser being charged: drop the part of the move toward it, or back
+            // off it when nothing is left.
+            if p.inf_weapon > 0.0 {
+                let spd = if boost { me.stat("boost_speed", 19.5) } else { walk_speed };
+                for m in enemies.iter().filter(|m| m.charging && d2(&m.pos, &pos) < 300.0) {
+                    let dir = [m.aim[0].cos(), m.aim[0].sin()];
+                    let off = |q: [f32; 2]| -> (f32, f32) {
+                        let e = [q[0] - m.pos[0], q[1] - m.pos[1]];
+                        (e[0] * dir[0] + e[1] * dir[1], e[0] * dir[1] - e[1] * dir[0])
+                    };
+                    let (al, now) = off([pos[0], pos[1]]);
+                    let (_, next) = off([pos[0] + mv[0] * spd * 0.6, pos[1] + mv[1] * spd * 0.6]);
+                    if al > 0.0 && now.abs() >= 6.0 && next.abs() < 6.0 {
+                        // Unit normal from us toward the line.
+                        let n = if now > 0.0 { [-dir[1], dir[0]] } else { [dir[1], -dir[0]] };
+                        let k = mv[0] * n[0] + mv[1] * n[1];
+                        let left = [mv[0] - k * n[0], mv[1] - k * n[1]];
+                        mv = if left[0].hypot(left[1]) > 0.2 { left } else { [-n[0], -n[1]] };
+                    }
+                }
             }
         }
         // A held laser charge keeps its aim whatever the mode did with the torso.
@@ -3716,6 +3818,8 @@ impl Brain {
 mod tactics;
 #[path = "escape.rs"]
 mod escape;
+#[path = "foes.rs"]
+mod foes;
 
 #[cfg(test)]
 mod tests {

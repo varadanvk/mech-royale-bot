@@ -124,6 +124,15 @@ pub struct Track {
     pub fired: u8,
     /// Estimated position every `HIST_DT` seconds over the last `HIST_S`, oldest first.
     pub hist: VecDeque<(f32, [f32; 2])>,
+    /// Most hit points it can have (as listed), when its hit points were last listed, and the last time we know
+    /// it took or dealt damage (its own regeneration waits on that).
+    pub max_hp: f32,
+    pub hp_t: f32,
+    pub fight_t: f32,
+    /// Regeneration rate seen while it was listed (hit points per second; 0 = none seen yet), and the hit points
+    /// it was last listed with, and when.
+    pub regen_seen: f32,
+    prev_hp: Option<(f32, f32)>,
 }
 
 impl Track {
@@ -178,12 +187,33 @@ pub struct Belief {
     pub alone: bool,
     pub behind: bool,
     pub cornered: bool,
+    /// Uncertainty of `est_hp` (one standard deviation) and the most hit points it can have.
+    pub hp_sd: f32,
+    pub max_hp: f32,
+    /// Filled in by the brain (`judge`): 0..1, how dangerous it has shown itself (0.5 until it shows anything);
+    /// seconds until it could be shooting at us; its weapon state (`WS_*`) and for how many more seconds none of
+    /// its weapons that reach far is ready.
+    pub danger: f32,
+    pub eta: f32,
+    pub wstate: u8,
+    pub open_s: f32,
 }
+
+/// Weapon states in `Belief::wstate`.
+pub const WS_READY: u8 = 0;
+pub const WS_RELOAD: u8 = 1;
+pub const WS_COOLDOWN: u8 = 2;
+pub const WS_CHARGING: u8 = 3;
 
 #[derive(Clone, Debug, Default)]
 pub struct Contacts {
     pub tracks: BTreeMap<u32, Track>,
     pub contacts: Vec<Contact>,
+    /// Hit point model (`Brain` sets it): use `hp_estimate` for `Belief::est_hp`, and the game's regeneration
+    /// rules (seconds without a fight before it starts, hit points per second).
+    pub hp_model: bool,
+    pub regen_delay: f32,
+    pub regen_per_s: f32,
 }
 
 impl Contacts {
@@ -216,6 +246,11 @@ impl Contacts {
             dealt: 0.0,
             fired: W_NONE,
             hist: VecDeque::new(),
+            max_hp: UNKNOWN_HP,
+            hp_t: f32::NEG_INFINITY,
+            fight_t: f32::NEG_INFINITY,
+            regen_seen: 0.0,
+            prev_hp: None,
         });
         k.pos = pos;
         k.vel = vel;
@@ -315,6 +350,7 @@ impl Contacts {
             if weapon_code(weapon) != W_NONE {
                 k.fired = weapon_code(weapon);
             }
+            k.fight_t = t;
         }
         match self.tracks.get_mut(&id) {
             Some(k) if k.listed => k.hunter_t = t,
@@ -352,6 +388,11 @@ impl Contacts {
                         dealt: 0.0,
                         fired: weapon_code(weapon),
                         hist: VecDeque::new(),
+                        max_hp: UNKNOWN_HP,
+                        hp_t: f32::NEG_INFINITY,
+                        fight_t: t,
+                        regen_seen: 0.0,
+                        prev_hp: None,
                     },
                 );
             }
@@ -424,18 +465,56 @@ impl Contacts {
     }
 
     /// Hit points of a listed enemy (when the game gives them): what we deal it from now on counts from here.
-    pub fn note_hp(&mut self, id: u32, hp: f32) {
+    /// A rise while it was out of any fight we know of tells how fast it regenerates; a fall we did not cause
+    /// means it was in a fight.
+    pub fn note_hp(&mut self, t: f32, id: u32, hp: f32, max_hp: f32) {
         if let Some(k) = self.tracks.get_mut(&id) {
+            if let Some((t0, h0)) = k.prev_hp {
+                let dt = t - t0;
+                if hp < h0 - k.dealt - 0.5 {
+                    k.fight_t = t;
+                } else if hp > h0 + 0.5 && dt > 0.05 && dt <= 1.0 && k.fight_t < t0 && hp < max_hp && max_hp <= k.max_hp + 0.5 {
+                    let rate = ((hp - h0) / dt).min(200.0);
+                    k.regen_seen = if k.regen_seen > 0.0 { 0.7 * k.regen_seen + 0.3 * rate } else { rate };
+                }
+            }
+            k.prev_hp = Some((t, hp));
             k.hp_abs = hp;
             k.dealt = 0.0;
+            k.hp_t = t;
+            if max_hp > 0.0 {
+                k.max_hp = max_hp;
+            }
         }
     }
 
     /// We hit enemy `id` for `amount`.
-    pub fn note_dealt(&mut self, id: u32, amount: f32) {
+    pub fn note_dealt(&mut self, t: f32, id: u32, amount: f32) {
         if let Some(k) = self.tracks.get_mut(&id) {
             k.dealt += amount.max(0.0);
+            k.fight_t = t;
         }
+    }
+
+    /// Estimated hit points of a track now and their uncertainty (one standard deviation). The last listed
+    /// value, less what we dealt it since, plus what it has regenerated since (from `regen_delay` after the last
+    /// fight we know of, at the rate seen or the configured one), capped at its maximum. Never listed with hit
+    /// points: the assumed full health, uncertain by a third of it. Unseen: less sure the longer it is unseen.
+    pub fn hp_estimate(&self, k: &Track, t: f32) -> (f32, f32) {
+        let base = (k.hp_abs - k.dealt).max(1.0);
+        let max = k.max_hp.max(base);
+        let rate = if k.regen_seen > 0.0 { k.regen_seen.max(self.regen_per_s) } else { self.regen_per_s };
+        let from = if k.hp_t.is_finite() { k.hp_t.max(k.fight_t + self.regen_delay) } else { k.fight_t + self.regen_delay };
+        let gained = if from.is_finite() { rate * (t - from).max(0.0) } else { 0.0 };
+        let est = (base + gained).min(max);
+        let sd = if !k.hp_t.is_finite() {
+            max * 0.35
+        } else if k.listed && k.hp_t >= t - 1e-3 {
+            0.0
+        } else {
+            (0.25 * (est - base) + 6.0 * (t - k.hp_t).max(0.0)).min(max * 0.5)
+        };
+        (est, sd)
     }
 
     /// Every enemy we believe in: tracks, then anonymous contacts.
@@ -444,6 +523,7 @@ impl Contacts {
             .tracks
             .iter()
             .map(|(id, k)| {
+                let (hp_est, hp_sd) = self.hp_estimate(k, t);
                 let conf = if k.listed { 1.0 } else { (1.0 - (t - k.info_t) / FADE_S).max(0.0) * if k.lost { 0.5 } else { 1.0 } };
                 Belief {
                     id: Some(*id),
@@ -454,7 +534,9 @@ impl Contacts {
                     hp: k.hp,
                     hunter: t - k.hunter_t < 10.0,
                     listed: k.listed,
-                    est_hp: (k.hp_abs - k.dealt).max(1.0),
+                    est_hp: if self.hp_model { hp_est } else { (k.hp_abs - k.dealt).max(1.0) },
+                    hp_sd,
+                    max_hp: k.max_hp,
                     weapon: if k.fired != W_NONE { k.fired } else { k.weapons.iter().map(|w| weapon_code(w)).max().unwrap_or(W_NONE) },
                     ..Belief::default()
                 }
@@ -470,6 +552,8 @@ impl Contacts {
             hunter: c.hunter,
             listed: false,
             est_hp: UNKNOWN_HP,
+            hp_sd: UNKNOWN_HP * 0.35,
+            max_hp: UNKNOWN_HP,
             ..Belief::default()
         }));
         v
@@ -601,6 +685,44 @@ mod tests {
         assert!((c.tracks[&7].est[0] + 30.0).abs() < 0.1);
         c.remove(7);
         assert!(!c.tracks.contains_key(&7));
+    }
+
+    #[test]
+    fn estimated_hit_points_follow_our_damage_and_regeneration() {
+        let mut c = Contacts { hp_model: true, regen_delay: 5.0, regen_per_s: 45.0, ..Contacts::default() };
+        c.begin();
+        c.see(10.0, 3, [100.0, 0.0, 0.0], [0.0; 3], &guns(), 1000.0 / 1400.0, false);
+        c.note_hp(10.0, 3, 1000.0, 1400.0);
+        c.settle(10.0, [0.0, 0.0], &|_| false);
+        let b = c.beliefs(10.0)[0];
+        assert_eq!(b.est_hp, 1000.0);
+        assert_eq!(b.hp_sd, 0.0);
+        // Out of view, we hit it for 300: down by exactly that, a little less sure.
+        c.begin();
+        c.note_dealt(11.0, 3, 200.0);
+        c.note_dealt(11.5, 3, 100.0);
+        c.settle(11.5, [0.0, 0.0], &|_| false);
+        let b = c.beliefs(12.0)[0];
+        assert!((b.est_hp - 700.0).abs() < 0.01, "{}", b.est_hp);
+        assert!(b.hp_sd > 0.0 && b.hp_sd < 50.0, "{}", b.hp_sd);
+        // Five seconds after our last hit it starts to regenerate: 2 s later 90 more, and less sure still.
+        let b2 = c.beliefs(18.5)[0];
+        assert!((b2.est_hp - 790.0).abs() < 0.01, "{}", b2.est_hp);
+        assert!(b2.hp_sd > b.hp_sd);
+        // Never above its maximum.
+        assert!((c.beliefs(39.0)[0].est_hp - 1400.0).abs() < 0.01);
+        // A faster regeneration seen while listed is used from then on.
+        c.begin();
+        c.see(40.0, 3, [100.0, 0.0, 0.0], [0.0; 3], &guns(), 0.5, false);
+        c.note_hp(40.0, 3, 700.0, 1400.0);
+        c.begin();
+        c.see(40.5, 3, [100.0, 0.0, 0.0], [0.0; 3], &guns(), 0.5, false);
+        c.note_hp(40.5, 3, 740.0, 1400.0);
+        assert!((c.tracks[&3].regen_seen - 80.0).abs() < 0.01);
+        // Without the model: the old estimate (last listed, less our damage, no regeneration).
+        c.hp_model = false;
+        c.note_dealt(41.0, 3, 40.0);
+        assert!((c.beliefs(60.0)[0].est_hp - 700.0).abs() < 0.01);
     }
 
     #[test]
