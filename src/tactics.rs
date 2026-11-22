@@ -3,7 +3,7 @@
 //! the match, choosing whom to engage, and grabbing cubes mid-fight.
 use super::{d2, norm2, wrap, yaw_to, Brain};
 use crate::proto::{Actor, Obs};
-use std::f32::consts::TAU;
+use std::f32::consts::{FRAC_PI_2, TAU};
 
 /// Weapon and step sounds worth turning toward.
 const LOUD: &[&str] = &["gun", "laser", "laser_charge", "lightning", "mortar", "step", "boost"];
@@ -30,7 +30,77 @@ fn aimed_at(m: &Actor, at: &[f32; 3]) -> bool {
     wrap(m.aim[0] - yaw_to(&m.pos, at)).abs() < (4.0 / d).atan() + 0.05
 }
 
+/// How long an enemy took to turn its torso to us once hit from behind (`flank`).
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct TurnWatch {
+    /// Since when it has been facing away from us after a hit from behind.
+    since: Option<f32>,
+    /// When it was last watched.
+    seen: f32,
+    /// Average seconds taken to turn to us.
+    secs: Option<f32>,
+}
+
+/// How far round behind `facing`, as seen from `c`, the point `q` is (0 = straight ahead, PI = right behind).
+pub(super) fn behind(c: &[f32], facing: f32, q: &[f32]) -> f32 {
+    wrap(yaw_to(c, q) - facing).abs()
+}
+
 impl Brain {
+    /// Time how long the target takes to bring its torso round to us after we hit it from behind.
+    pub(super) fn watch_turn(&mut self, o: &Obs, t: &Actor) {
+        let off = behind(&t.pos, t.aim[0], &o.me.pos);
+        let hit = self.hit_t.get(&t.id).map_or(false, |h| o.t - h < 0.3);
+        let w = self.turns.entry(t.id).or_default();
+        if o.t - w.seen > 0.5 {
+            w.since = None;
+        }
+        w.seen = o.t;
+        if off > FRAC_PI_2 {
+            if hit && w.since.is_none() {
+                w.since = Some(o.t);
+            }
+        } else if off < 0.35 {
+            if let Some(s) = w.since.take() {
+                let d = o.t - s;
+                w.secs = Some(w.secs.map_or(d, |v| 0.5 * v + 0.5 * d));
+            }
+        }
+    }
+
+    /// The target's facing when we should work round to its back: practice matches only, the target facing
+    /// more than 90 degrees away from us, and not known to turn quickly (`flank`).
+    pub(super) fn flank_facing(&self, o: &Obs, t: &Actor) -> Option<f32> {
+        let p = &self.params;
+        if p.flank <= 0.0 || self.ffa_on() || t.kind != "mech" || behind(&t.pos, t.aim[0], &o.me.pos) <= FRAC_PI_2 {
+            return None;
+        }
+        let w = self.turns.get(&t.id);
+        let slow = w.and_then(|w| w.secs).map_or(true, |s| s >= p.flank_slow) || w.and_then(|w| w.since).map_or(false, |s| o.t - s >= p.flank_slow);
+        slow.then_some(t.aim[0])
+    }
+
+    /// The sideways sign (step `[-to[1] * s, to[0] * s]`, `to` toward the target) that takes us further round
+    /// behind a target with this facing.
+    pub(super) fn flank_sign(&self, o: &Obs, t: &Actor, facing: f32) -> f32 {
+        let pos = o.me.pos;
+        let to = norm2(t.pos[0] - pos[0], t.pos[1] - pos[1]);
+        let step = |s: f32| [pos[0] - to[1] * s * 5.0, pos[1] + to[0] * s * 5.0];
+        if behind(&t.pos, facing, &step(1.0)) >= behind(&t.pos, facing, &step(-1.0)) {
+            1.0
+        } else {
+            -1.0
+        }
+    }
+
+    /// Point the strafe round toward the target's back for this step (`flank`).
+    pub(super) fn flank_strafe(&mut self, o: &Obs, t: &Actor) {
+        if let Some(f) = self.flank_facing(o, t) {
+            self.strafe = self.flank_sign(o, t, f);
+            self.strafe_until = o.t + self.params.strafe_min;
+        }
+    }
+
     /// Remember whom we hit, where hits came from, and where the last loud sound came from.
     pub(super) fn track_contacts(&mut self, o: &Obs) {
         for e in &o.events {
@@ -340,6 +410,8 @@ impl Brain {
         let z = &o.zone;
         // With two or more enemies about (`pincer`): keep them all in front, a wall behind, out of the open.
         let pin = self.pin_on();
+        // A target facing away and slow to turn: points further round behind it score higher (`flank`).
+        let flank = self.flank_facing(o, t);
         let ex_here = if pin { self.exposure_at([pos[0], pos[1]]) } else { None };
         let score = |b: &Brain, q: [f32; 2], moved: f32| -> f32 {
             let qz = b.ground(q[0], q[1], pos[2]);
@@ -370,6 +442,9 @@ impl Brain {
             let out = d2(&q, &z.center) - (z.radius - 10.0);
             if out > 0.0 {
                 s -= out * 5.0;
+            }
+            if let Some(f) = flank {
+                s += 25.0 * p.flank * behind(&t.pos, f, &q);
             }
             if pin {
                 let ps = b.pin_score(o, [pos[0], pos[1]], q, t.pos, ex_here);
@@ -426,7 +501,10 @@ impl Brain {
         }
         // Staying put wins: slow strafe across the line to the target.
         let (lo, span) = if self.params.ext_fpos > 0.0 { (self.params.fp_flip_lo, (self.params.fp_flip_hi - self.params.fp_flip_lo).max(0.0)) } else { (3.0, 2.0) };
-        if o.t >= self.fp_until {
+        if let Some(f) = flank {
+            self.fp_side = self.flank_sign(o, t, f);
+            self.fp_until = o.t + lo;
+        } else if o.t >= self.fp_until {
             self.fp_side = -self.fp_side;
             self.fp_until = o.t + lo + span * self.rnd();
         }

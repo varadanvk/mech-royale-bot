@@ -499,6 +499,13 @@ pub struct Params {
     pub stay_fight: f32,
     /// See stay_fight.
     pub stay_cover: f32,
+    /// Work round to the back of a target that faces more than 90 degrees away from us and is slow to turn:
+    /// the fight position and strafe lean toward its rear arc while the weapons keep working (weight; practice
+    /// matches only; 0 = off).
+    pub flank: f32,
+    /// A target counts as slow to turn when, once hit from behind, it has taken at least this many seconds to
+    /// bring its torso round to us (averaged over the times seen; not yet seen = slow).
+    pub flank_slow: f32,
 }
 
 impl Default for Params {
@@ -728,6 +735,8 @@ impl Default for Params {
             ffa_plain: 1.0,
             stay_fight: 2.0,
             stay_cover: 0.0,
+            flank: 1.0,
+            flank_slow: 1.8,
         }
     }
 }
@@ -976,6 +985,8 @@ impl Params {
         p.ffa_plain = g("ffa_plain", p.ffa_plain);
         p.stay_fight = g("stay_fight", p.stay_fight);
         p.stay_cover = g("stay_cover", p.stay_cover);
+        p.flank = g("flank", p.flank);
+        p.flank_slow = g("flank_slow", p.flank_slow);
         p
     }
 
@@ -1291,6 +1302,8 @@ pub struct Brain {
     /// Fight-position strafe: direction sign and when it next reverses.
     fp_side: f32,
     fp_until: f32,
+    /// How quickly each enemy turns to face us once hit from behind (`flank`).
+    turns: BTreeMap<u32, tactics::TurnWatch>,
     /// When the current target was last locked in.
     focus_t: f32,
     /// Late-game home spot and when it was chosen.
@@ -1454,6 +1467,7 @@ impl Brain {
             cr_goal: None,
             fp_side: 1.0,
             fp_until: -1.0,
+            turns: BTreeMap::new(),
             focus_t: -1.0,
             home: None,
             hit_t: BTreeMap::new(),
@@ -2456,6 +2470,9 @@ impl Brain {
             self.focus_t = o.t;
         }
         self.focus = new_focus;
+        if let Some(t) = target.filter(|_| p.flank > 0.0) {
+            self.watch_turn(o, t);
+        }
         if let Some(t) = target {
             self.threat = Some((t.pos, o.t));
         }
@@ -3058,6 +3075,7 @@ impl Brain {
             mv = if dist > p.rush_range + 10.0 && !self.straight(&pos, &t.pos) {
                 self.go(&pos, [t.pos[0], t.pos[1]])
             } else {
+                self.flank_strafe(o, t);
                 self.strafe_dir(o, &pos, to, radial * 2.0, false)
             };
             boost = dist > arc_r - 6.0 && me.energy > p.rush_boost;
@@ -3297,6 +3315,7 @@ impl Brain {
                 });
                 self.fight_pos_move(o, t, pref, ready)
             } else {
+                self.flank_strafe(o, t);
                 self.strafe_dir(o, &pos, to, radial, false)
             };
             let reloading = me.weapons.iter().flatten().any(|w| w.kind == "gun" && (w.reload > 0.4 || w.ammo <= 0.0));
@@ -4102,6 +4121,7 @@ impl Drop for Brain {
 mod tests {
     use super::*;
     use crate::predict;
+    use tactics::behind;
 
     /// Defaults with the optional tactics off: the checks below are about the behaviour underneath them.
     fn base() -> Params {
@@ -4220,6 +4240,62 @@ mod tests {
 
     fn with(params: Params) -> Brain {
         Brain::with_params(&Hello::default(), None, None, params)
+    }
+
+    fn facing(yaw: f32) -> Obs {
+        let m = format!(r#"{{"id": 3, "kind": "mech", "pos": [40, 0, 0], "aim": [{yaw}, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}}"#);
+        obs(&m, "")
+    }
+
+    #[test]
+    fn strafe_works_round_behind_a_target_facing_away() {
+        for (yaw, side) in [(0.6f32, -1.0f32), (-0.6, 1.0)] {
+            let o = facing(yaw);
+            let t = o.mechs[0].clone();
+            // Plain strafe and the fight-position move both carry us further round its back.
+            let mut b = with(Params { fight_pos: 1.0, ..base() });
+            b.flank_strafe(&o, &t);
+            assert_eq!(b.strafe, side, "strafe sign for facing {yaw}");
+            let mv = b.fight_pos_move(&o, &t, 40.0, true);
+            assert!(mv[1] * side > 0.0, "fight move {mv:?} for facing {yaw}");
+            let after = [mv[0] * 5.0, mv[1] * 5.0];
+            assert!(behind(&t.pos, yaw, &after) > behind(&t.pos, yaw, &o.me.pos), "move keeps us behind");
+        }
+        // Facing us, or switched off: no lean.
+        let o = facing(3.0);
+        assert!(with(base()).flank_facing(&o, &o.mechs[0]).is_none());
+        let o = facing(0.6);
+        assert!(with(Params { flank: 0.0, ..base() }).flank_facing(&o, &o.mechs[0]).is_none());
+    }
+
+    #[test]
+    fn a_target_quick_to_turn_is_not_flanked() {
+        let mut b = with(base());
+        let mut o = facing(0.6);
+        let t = o.mechs[0].clone();
+        b.hit_t.insert(3, o.t);
+        b.watch_turn(&o, &t);
+        assert!(b.flank_facing(&o, &t).is_some());
+        // It turns to us half a second after the hit.
+        o.t += 0.5;
+        o.mechs[0].aim = [3.1, 0.0];
+        b.watch_turn(&o, &o.mechs[0].clone());
+        o.t += 0.5;
+        o.mechs[0].aim = [0.6, 0.0];
+        assert!(b.flank_facing(&o, &o.mechs[0].clone()).is_none());
+        // One that takes three seconds stays a flanking target.
+        let mut b = with(base());
+        let mut o = facing(0.6);
+        b.hit_t.insert(3, o.t);
+        b.watch_turn(&o, &o.mechs[0].clone());
+        for _ in 0..30 {
+            o.t += 0.1;
+            b.watch_turn(&o, &o.mechs[0].clone());
+        }
+        o.mechs[0].aim = [3.1, 0.0];
+        b.watch_turn(&o, &o.mechs[0].clone());
+        o.mechs[0].aim = [0.6, 0.0];
+        assert!(b.flank_facing(&o, &o.mechs[0].clone()).is_some());
     }
 
     #[test]
