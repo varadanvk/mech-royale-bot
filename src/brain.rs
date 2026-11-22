@@ -277,6 +277,10 @@ pub struct Params {
     /// Late in the match, a live fight (a target in sight while engaged or recently hurt by a mech) is fought
     /// with normal movement instead of holding a spot, and holding weaves across the nearest shooter.
     pub hold_fight: f32,
+    /// Hurt by a mech in the last 3 s: no looting or crate shooting, and face the unseen attacker.
+    pub threat_face: f32,
+    /// Against a target holding lightning within 60 m, back away (boosting) while kiting or holding.
+    pub ltg_space: f32,
 }
 
 impl Default for Params {
@@ -400,6 +404,8 @@ impl Default for Params {
             close_boost: 30.0,
             drone_fight: 0.0,
             hold_fight: 1.0,
+            threat_face: 1.0,
+            ltg_space: 1.0,
         }
     }
 }
@@ -527,6 +533,8 @@ impl Params {
         p.close_boost = g("close_boost", p.close_boost);
         p.drone_fight = g("drone_fight", p.drone_fight);
         p.hold_fight = g("hold_fight", p.hold_fight);
+        p.threat_face = g("threat_face", p.threat_face);
+        p.ltg_space = g("ltg_space", p.ltg_space);
         p
     }
 
@@ -2096,6 +2104,11 @@ impl Brain {
                     mv = [0.0, 0.0];
                 }
                 boost = me.energy > 60.0 && dh > 25.0;
+                if let Some(t) = target.filter(|t| p.ltg_space > 0.0 && t.weapons.iter().any(|w| w == "lightning") && d2(&t.pos, &pos) < 60.0) {
+                    let to = norm2(t.pos[0] - pos[0], t.pos[1] - pos[1]);
+                    mv = self.strafe_dir(o, &pos, to, -1.0, false);
+                    boost = me.energy > 10.0;
+                }
             }
             if shoot_at.is_none() {
                 if let Some(th) = threats.first() {
@@ -2108,7 +2121,8 @@ impl Brain {
             // Back away from the nearest enemy while weaving and shooting.
             label = if self.fleeing { "kite" } else { "kitec" };
             let to = norm2(t.pos[0] - pos[0], t.pos[1] - pos[1]);
-            let radial = if laser_on.is_some() { -0.2 } else { -p.kite };
+            let ltg = p.ltg_space > 0.0 && t.weapons.iter().any(|w| w == "lightning") && d2(&t.pos, &pos) < 60.0;
+            let radial = if ltg { -1.0 } else if laser_on.is_some() { -0.2 } else { -p.kite };
             mv = self.strafe_dir(o, &pos, to, radial, false);
             if p.kite_away > 0.0 && laser_on.is_none() {
                 let dir = self.away_dir(o, &pos, 3.0, None);
@@ -2116,7 +2130,7 @@ impl Brain {
                 let cand = norm2(dir[0] + perp[0] * p.stand_weave, dir[1] + perp[1] * p.stand_weave);
                 mv = if self.walkable(pos[0] + cand[0] * 5.0, pos[1] + cand[1] * 5.0) { cand } else { dir };
             }
-            boost = me.energy > p.retreat_boost_energy;
+            boost = me.energy > p.retreat_boost_energy || (ltg && me.energy > 10.0);
         } else if (self.fleeing || crowded) && threat_live {
             label = if self.fleeing { "heal" } else { "crowd" };
             if self.cover.map_or(true, |(_, until)| o.t > until) {
@@ -2666,9 +2680,11 @@ impl Brain {
             }
         }
         let crates: Vec<[f32; 3]> = self.crates_mem.values().copied().filter(|q| on_ground(self, q) && in_zone(q)).collect();
+        // Under fire from a mech we cannot see: no detours or crate shooting, face where it hit us from.
+        let hurt = p.threat_face > 0.0 && o.t - self.last_mech_hurt_t <= 3.0;
         let crate_target = crates
             .iter()
-            .filter(|c| d3(c, pos) < reach && hp_frac > p.farm_hp && !self.healing)
+            .filter(|c| d3(c, pos) < reach && hp_frac > p.farm_hp && !self.healing && !hurt)
             .min_by(|x, y| d3(x, pos).partial_cmp(&d3(y, pos)).unwrap_or(std::cmp::Ordering::Equal));
         let mut aimed = false;
         if let Some(c) = crate_target {
@@ -2695,7 +2711,7 @@ impl Brain {
             }
         }
         let g = match goal {
-            Some((g, _)) if !must_rotate => Some(g),
+            Some((g, _)) if !must_rotate && !hurt => Some(g),
             _ if must_rotate || out_next > 0.0 => Some(zone_goal),
             _ => None,
         };
@@ -2706,8 +2722,9 @@ impl Brain {
             }
             None => self.idle_move(o, pos),
         };
+        let fresh = self.threat.filter(|(_, t)| p.threat_face > 0.0 && o.t - t < 2.0).map(|(q, _)| q);
         if !aimed {
-            if let Some(th) = threats.first() {
+            if let Some(th) = fresh.as_ref().or(threats.first()) {
                 a.aim = [yaw_to(pos, th), 0.0];
             } else {
                 self.scan(a);
@@ -2772,6 +2789,36 @@ mod tests {
         let mut b = Brain::with_params(&Hello::default(), None, None, Params { hold_fight: 0.0, ..Params::default() });
         b.decide(&o, [0.0; 3]);
         assert_eq!(b.label, "hold");
+    }
+
+    #[test]
+    fn unseen_attacker_is_faced_instead_of_looting() {
+        let hit = r#"{"type": "damaged", "amount": 40, "weapon": "gun", "by": 5, "bearing": 1.5708}"#;
+        let mut o = obs("", hit);
+        o.mechs.clear();
+        o.cubes = vec![crate::proto::Item { id: 5000, pos: [20.0, -30.0, 0.0], ..Default::default() }];
+        let mut b = brain();
+        let a = b.decide(&o, [0.0; 3]);
+        assert!(b.label != "loot", "looting while under fire");
+        assert!((a.aim[0] - 1.5708).abs() < 0.05, "aim {:?}", a.aim);
+        let mut b = Brain::with_params(&Hello::default(), None, None, Params { threat_face: 0.0, ..Params::default() });
+        b.decide(&o, [0.0; 3]);
+        assert_eq!(b.label, "loot");
+    }
+
+    #[test]
+    fn lightning_holder_is_kept_at_a_distance_while_holding() {
+        let arc = r#"{"id": 3, "kind": "mech", "pos": [40, 0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun", "lightning"]}"#;
+        let mut o = obs(arc, "");
+        o.t = 200.0;
+        let params = Params { hold_fight: 0.0, ..Params::default() };
+        let mut b = Brain::with_params(&Hello::default(), None, None, params.clone());
+        let a = b.decide(&o, [0.0; 3]);
+        assert_eq!(b.label, "hold");
+        assert!(a.mv[0] < -0.5 && a.boost, "mv {:?}", a.mv);
+        let mut b = Brain::with_params(&Hello::default(), None, None, Params { ltg_space: 0.0, ..params });
+        let a = b.decide(&o, [0.0; 3]);
+        assert!(a.mv[0] > -0.5, "mv {:?}", a.mv);
     }
 
     #[test]
