@@ -499,6 +499,13 @@ pub struct Params {
     pub stay_fight: f32,
     /// See stay_fight.
     pub stay_cover: f32,
+    /// Outside a free-for-all, these replace `arm_reach`, `hunt`,
+    /// `counter_range` and the idle wait before looking for the next fight (`pr_tune` 0 = off).
+    pub pr_tune: f32,
+    pub pr_arm_reach: f32,
+    pub pr_hunt: f32,
+    pub pr_counter_range: f32,
+    pub pr_seek_wait: f32,
 }
 
 impl Default for Params {
@@ -687,7 +694,7 @@ impl Default for Params {
             map_preaim: 0.0,
             map_expose: 0.0,
             map_crowd: 0.0,
-            map_reinf: 0.0,
+            map_reinf: 15.0,
             pred: 1.0,
             pred_s: 2.0,
             pred_hunt: 0.25,
@@ -728,6 +735,11 @@ impl Default for Params {
             ffa_plain: 1.0,
             stay_fight: 2.0,
             stay_cover: 0.0,
+            pr_tune: 1.0,
+            pr_arm_reach: 110.0,
+            pr_hunt: 150.0,
+            pr_counter_range: 90.0,
+            pr_seek_wait: 6.0,
         }
     }
 }
@@ -976,6 +988,11 @@ impl Params {
         p.ffa_plain = g("ffa_plain", p.ffa_plain);
         p.stay_fight = g("stay_fight", p.stay_fight);
         p.stay_cover = g("stay_cover", p.stay_cover);
+        p.pr_tune = g("pr_tune", p.pr_tune);
+        p.pr_arm_reach = g("pr_arm_reach", p.pr_arm_reach);
+        p.pr_hunt = g("pr_hunt", p.pr_hunt);
+        p.pr_counter_range = g("pr_counter_range", p.pr_counter_range);
+        p.pr_seek_wait = g("pr_seek_wait", p.pr_seek_wait);
         p
     }
 
@@ -2243,7 +2260,16 @@ impl Brain {
     fn decide(&mut self, o: &Obs, raw: [f32; 3]) -> Action {
         let me = o.me.clone();
         let pos = me.pos;
-        let p = self.params.clone();
+        let mut p = self.params.clone();
+        // Practice settings: shorter detours for weapons, going after the last enemy seen, a wider counter-punch
+        // radius and a longer pause before looking for the next fight.
+        let mut seek_wait = 3.0;
+        if p.pr_tune > 0.0 && !self.ffa_on() {
+            p.arm_reach = p.pr_arm_reach;
+            p.hunt = p.pr_hunt;
+            p.counter_range = p.pr_counter_range;
+            seek_wait = p.pr_seek_wait;
+        }
         let mut a = Action { tick: o.tick, aim: me.aim, ..Default::default() };
         let hp_frac = me.hp / me.max_hp.max(1.0);
         let walk_speed = me.stat("walk_speed", 11.7);
@@ -3378,7 +3404,7 @@ impl Brain {
             if p.seek_idle > 0.0 && !ffa_on && enemies.is_empty() {
                 if label == "idle" {
                     let since = *self.idle_since.get_or_insert(o.t);
-                    let go_now = self.seeking || (o.t - since >= 3.0 && hp_frac >= 0.7);
+                    let go_now = self.seeking || (o.t - since >= seek_wait && hp_frac >= 0.7);
                     if go_now && !self.healing && !must_rotate {
                         // Nearest enemy we believe in, else the nearest remembered one.
                         let near = |a: &[f32; 2], b: &[f32; 2]| d2(a, &pos).partial_cmp(&d2(b, &pos)).unwrap_or(std::cmp::Ordering::Equal);
@@ -4635,9 +4661,9 @@ mod tests {
         plain.decide(&o, [0.0; 3]);
         assert!(on.pin.threats.len() == 2 && off.pin.threats.is_empty());
         assert_eq!(off.dbg_mode, plain.dbg_mode);
-        // The map uses of the practice picture are off by default.
+        // The map uses of the practice picture are off by default, except the target choice (`map_reinf`).
         let d = Params::default();
-        assert_eq!((d.map_preaim, d.map_expose, d.map_crowd, d.map_reinf), (0.0, 0.0, 0.0, 0.0));
+        assert_eq!((d.map_preaim, d.map_expose, d.map_crowd, d.map_reinf), (0.0, 0.0, 0.0, 15.0));
     }
 
     #[test]
@@ -4704,7 +4730,7 @@ mod tests {
     fn idle_goes_after_the_nearest_known_enemy() {
         let away = r#"{"id": 3, "kind": "mech", "pos": [100, 0, 0], "aim": [0, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
         for (on, want) in [(1.0, true), (0.0, false)] {
-            let mut b = with(Params { seek_idle: on, ..base() });
+            let mut b = with(Params { seek_idle: on, pr_tune: 0.0, ..base() });
             let mut o = obs(away, "");
             b.decide(&o, [0.0; 3]);
             o.mechs.clear();
