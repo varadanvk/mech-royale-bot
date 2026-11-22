@@ -3386,7 +3386,7 @@ impl Brain {
             if p.seek_idle > 0.0 && !ffa_on && enemies.is_empty() {
                 if label == "idle" {
                     let since = *self.idle_since.get_or_insert(o.t);
-                    let go_now = self.seeking || (o.t - since >= 3.0 && hp_frac >= 0.7);
+                    let go_now = (self.seeking || o.t - since >= 3.0) && hp_frac >= 0.7;
                     if go_now && !self.healing && !must_rotate {
                         // Nearest enemy we believe in, else the nearest remembered one.
                         let near = |a: &[f32; 2], b: &[f32; 2]| d2(a, &pos).partial_cmp(&d2(b, &pos)).unwrap_or(std::cmp::Ordering::Equal);

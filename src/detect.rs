@@ -23,6 +23,20 @@ const FIGHT_S: f32 = 10.0;
 /// Clue total that settles it.
 const LATCH: f32 = 2.0;
 
+/// From this moment (2026-11-22 16:00 UTC) every match is taken for a free-for-all from the start.
+const OPEN_PLAY_UNIX: u64 = 1_795_363_200;
+
+/// Whether the wall clock says matches are free-for-alls from now on (`MECH_NOW` overrides it, for tests).
+fn after_open_play() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let now = std::env::var("MECH_NOW").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or_else(|| {
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+        });
+        now >= OPEN_PLAY_UNIX
+    })
+}
+
 fn wrap(a: f32) -> f32 {
     let mut a = (a + std::f32::consts::PI) % std::f32::consts::TAU;
     if a < 0.0 {
@@ -333,7 +347,9 @@ impl Detector {
                 if std::env::var("TFFA").is_ok() {
                     eprintln!("FFA death t {:.2} drop {:.2} dealt {:?} gap {:.2} zone r {:.0} dps {:.0}", t, d, self.dealt, self.gap_t, o.zone.radius, o.zone.dps);
                 }
-                self.clue(t, format!("death:{n}"), pts);
+                // One shared key: deaths nobody we saw explains (the zone, say) can't settle it on their own.
+                let _ = n;
+                self.clue(t, "death".into(), pts);
             }
         }
         while self.deaths.len() > 16 {
@@ -363,6 +379,11 @@ impl Detector {
         self.clues.retain(|c| t - c.t < KEEP_S);
         while self.fights.front().map_or(false, |f| t - f.t > FIGHT_S) {
             self.fights.pop_front();
+        }
+        if !self.latched && after_open_play() {
+            self.latched = true;
+            self.latch_t = t;
+            self.reason = "clock".into();
         }
         if !self.latched && self.total() >= LATCH - 1e-3 {
             self.latched = true;
