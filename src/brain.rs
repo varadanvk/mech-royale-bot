@@ -486,7 +486,7 @@ impl Default for Params {
             cr_radius: 160.0,
             cr_burst: 1.5,
             cr_steps: 50.0,
-            fight_pos: 0.0,
+            fight_pos: 1.0,
             pref_gun: 85.0,
             pref_laser: 115.0,
             keep_ltg: 64.0,
