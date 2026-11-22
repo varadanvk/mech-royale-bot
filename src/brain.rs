@@ -464,10 +464,26 @@ pub struct Params {
     pub arm_yield: f32,
     /// Gun lead learned per enemy (0 = off): every look at an enemy is checked later as a shot led by none, a third, two thirds or all of its speed, and the lead that would have hit most often lately is used once it is clearly ahead of the usual one.
     pub lead_adapt: f32,
+    /// Break off only to hidden ground within this distance; with none that near, stay and fight (0 = any distance).
+    pub cr_max_d: f32,
+    /// Break-off health fractions: below cr_hp1 while losing to the target, below cr_hp2 with two enemies near, below cr_hp3 with three or more.
+    pub cr_hp1: f32,
+    /// See cr_hp1.
+    pub cr_hp2: f32,
+    /// See cr_hp1.
+    pub cr_hp3: f32,
+    /// Break off from a lone enemy we are losing to (0 = only when two or more are near).
+    pub cr_solo: f32,
+    /// Keep starting laser charges while breaking off (0 = only within 6 m of the hidden ground).
+    pub cr_laser: f32,
+    /// Stop breaking off once no enemy in view is aimed at us and nothing has hit us for this many seconds (0 = off).
+    pub cr_unaimed: f32,
     /// Outside a free-for-all: after a kill, or after 3 s idle at 70% health or more, with no enemy in view, walk toward the nearest enemy we know of until one is in view (0 = off).
     pub seek_idle: f32,
     /// Share of an enemy's speed across our line of sight that its predicted motion keeps (its speed toward or away from us is kept whole): a side-to-side dodge reverses within the second, so less than 1 guesses closer two seconds out.
     pub pred_tan: f32,
+    /// Having broken off to ground that turns out to be in an enemy's view, sidestep across its line while shooting back instead of standing still (0 = stand).
+    pub cr_strafe: f32,
 }
 
 impl Default for Params {
@@ -682,8 +698,16 @@ impl Default for Params {
             seek_t: 0.0,
             arm_yield: 0.0,
             lead_adapt: 1.0,
+            cr_max_d: 15.0,
+            cr_hp1: 0.35,
+            cr_hp2: 0.55,
+            cr_hp3: 0.8,
+            cr_solo: 1.0,
+            cr_laser: 1.0,
+            cr_unaimed: 0.0,
             seek_idle: 1.0,
             pred_tan: 1.0,
+            cr_strafe: 1.0,
         }
     }
 }
@@ -917,8 +941,16 @@ impl Params {
         p.seek_t = g("seek_t", p.seek_t);
         p.arm_yield = g("arm_yield", p.arm_yield);
         p.lead_adapt = g("lead_adapt", p.lead_adapt);
+        p.cr_max_d = g("cr_max_d", p.cr_max_d);
+        p.cr_hp1 = g("cr_hp1", p.cr_hp1);
+        p.cr_hp2 = g("cr_hp2", p.cr_hp2);
+        p.cr_hp3 = g("cr_hp3", p.cr_hp3);
+        p.cr_solo = g("cr_solo", p.cr_solo);
+        p.cr_laser = g("cr_laser", p.cr_laser);
+        p.cr_unaimed = g("cr_unaimed", p.cr_unaimed);
         p.seek_idle = g("seek_idle", p.seek_idle);
         p.pred_tan = g("pred_tan", p.pred_tan);
+        p.cr_strafe = g("cr_strafe", p.cr_strafe);
         p
     }
 
@@ -2751,11 +2783,16 @@ impl Brain {
             let tf = target.map_or(1.0, |t| if t.max_hp > 0.0 { t.hp / t.max_hp } else { 1.0 });
             let t_hp = target.map_or(0.0, |t| if t.max_hp > 0.0 { t.hp } else { 1400.0 });
             let losing = if p.ext_lose > 0.0 { tf > hp_frac + p.lose_margin } else { t_hp > me.hp };
-            let trigger = (near >= 2 && hp_frac < 0.55) || (near >= 3 && hp_frac < 0.8) || (hp_frac < 0.35 && target.is_some() && losing);
+            let trigger = (near >= 2 && hp_frac < p.cr_hp2)
+                || (near >= 3 && hp_frac < p.cr_hp3)
+                || (hp_frac < p.cr_hp1 && target.is_some() && losing && (p.cr_solo > 0.0 || near >= 2));
             // About to win: a target close by that is nearly dead or much weaker than us.
             let winning = p.ext_lose > 0.0 && target.map_or(false, |t| d2(&t.pos, &pos) < 120.0 && (t_hp < 200.0 || t_hp < 0.5 * me.hp));
             let veto = late || finishing || winning || close_kill || (target.is_some() && tf < 0.25 && (p.ext_lose <= 0.0 || hp_frac > 0.2) && near <= 2) || threats.is_empty();
-            if veto {
+            let unaimed = p.cr_unaimed > 0.0
+                && o.t - self.last_mech_hurt_t > p.cr_unaimed
+                && !enemies.iter().any(|m| wrap(m.aim[0] - yaw_to(&m.pos, &pos)).abs() < 0.3);
+            if veto || unaimed {
                 self.cr_until = -1.0;
             } else if o.t < self.cr_until || trigger {
                 let cb_on = p.cb_away > 0.0 || p.cb_path > 0.0 || p.cb_known > 0.0 || p.cb_corner > 0.0 || p.cb_turn > 0.0;
@@ -2776,6 +2813,9 @@ impl Brain {
                     }
                     let prev = self.cr_goal;
                     let mut g = self.retreat_cell(o, &eyes, if p.cb_away > 0.0 || p.cb_path > 0.0 { &all } else { &[] });
+                    if p.cr_max_d > 0.0 && g.map_or(false, |g| d2(&g, &pos) > p.cr_max_d) {
+                        g = None;
+                    }
                     if p.cb_turn > 0.0 {
                         // A new goal back the way we came and toward the enemies: keep the old one while it is
                         // still away from them and clear, else stay and fight.
@@ -2837,9 +2877,26 @@ impl Brain {
             // Break off to hidden ground; stand still once there.
             label = "cbreak";
             let dg = d2(&pos, &g);
-            mv = if dg < 2.0 { [0.0, 0.0] } else { self.go(&pos, g) };
+            let seen_by = shoot_at.filter(|t| p.cr_strafe > 0.0 && t.kind == "mech");
+            mv = if dg >= 2.0 {
+                self.go(&pos, g)
+            } else if let Some(t) = seen_by {
+                if o.t >= self.fp_until {
+                    self.fp_side = -self.fp_side;
+                    self.fp_until = o.t + 0.4 + 0.5 * self.rnd();
+                }
+                let to = norm2(t.pos[0] - pos[0], t.pos[1] - pos[1]);
+                let side = [-to[1] * self.fp_side, to[0] * self.fp_side];
+                if self.walkable(pos[0] + side[0] * 4.0, pos[1] + side[1] * 4.0) {
+                    side
+                } else {
+                    [-side[0], -side[1]]
+                }
+            } else {
+                [0.0, 0.0]
+            };
             boost = me.energy > p.retreat_boost_energy && dg > 5.0;
-            if dg > 6.0 {
+            if dg > 6.0 && p.cr_laser <= 0.0 {
                 for (i, w) in me.weapons.iter().enumerate().take(2) {
                     if w.as_ref().map_or(false, |w| w.kind == "laser" && w.charge <= 0.0) {
                         a.fire[i] = false;
@@ -4589,5 +4646,23 @@ mod tests {
         assert!((v[0] + 6.0).abs() < 1e-3 && (v[1] - 4.0).abs() < 1e-3, "{:?}", v);
         let b = with(base());
         assert_eq!(b.pred_vel(&o.mechs[0], [0.0, 0.0]), [-6.0, 8.0]);
+    }
+
+    #[test]
+    fn broken_off_but_still_in_view_we_sidestep_instead_of_standing() {
+        let foe = r#"{"id": 3, "kind": "mech", "pos": [40, 0, 0], "aim": [3.14, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]},
+                     {"id": 4, "kind": "mech", "pos": [50, 20, 0], "aim": [3.5, 0], "hp": 1400, "max_hp": 1400, "weapons": ["gun"]}"#;
+        for (on, moving) in [(1.0, true), (0.0, false)] {
+            let mut b = with(Params { crowd_retreat: 1.0, cr_strafe: on, ..base() });
+            let mut o = obs(foe, "");
+            o.me.hp = 500.0;
+            b.cr_until = 100.0;
+            b.cr_goal = Some([0.0, 0.0]);
+            let a = b.decide(&o, [0.0; 3]);
+            if b.label == "cbreak" && b.cr_goal.map_or(false, |g| g[0].hypot(g[1]) < 2.0) {
+                assert_eq!(a.mv[0].hypot(a.mv[1]) > 0.5, moving, "{:?}", a.mv);
+                assert!(a.mv[0].abs() < 0.3, "{:?}", a.mv);
+            }
+        }
     }
 }

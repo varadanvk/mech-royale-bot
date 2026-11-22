@@ -19,7 +19,7 @@ fn load() -> Option<(Arc<World>, Nav)> {
 /// The defaults with break-off to hidden ground at any distance and the later additions off: the scenes
 /// below are about where a break-off goes.
 fn earlier() -> Params {
-    Params { seek_idle: 0.0, lead_adapt: 0.0, dodge_after: 9.0, reload_laser: 1.0, ..Params::default() }
+    Params { cr_max_d: 0.0, cr_laser: 0.0, cr_strafe: 0.0, seek_idle: 0.0, lead_adapt: 0.0, dodge_after: 9.0, reload_laser: 1.0, ..Params::default() }
 }
 
 fn off() -> Params {
@@ -227,4 +227,18 @@ fn scan() {
             }
         }
     }
+}
+
+#[test]
+fn break_off_only_to_hidden_ground_close_by() {
+    let Some((world, nav)) = load() else { return };
+    let me = [280.17, 68.85];
+    let (far, _) = crowd_scene_at(world.clone(), nav.clone(), earlier(), [0.0, 0.0]);
+    let far = far.expect("a goal exists here");
+    assert!(d2(far, me) > 15.0, "the scene no longer has its hidden ground far off ({far:?})");
+    // The same scene with the limit: no goal that far, we stay and fight.
+    let (near, _) = crowd_scene_at(world.clone(), nav.clone(), Params { cr_max_d: 15.0, ..earlier() }, [0.0, 0.0]);
+    assert!(near.map_or(true, |g| d2(g, me) <= 15.0), "{near:?}");
+    let (wide, _) = crowd_scene_at(world, nav, Params { cr_max_d: 500.0, ..earlier() }, [0.0, 0.0]);
+    assert_eq!(wide, Some(far));
 }
