@@ -499,6 +499,11 @@ pub struct Params {
     pub stay_fight: f32,
     /// See stay_fight.
     pub stay_cover: f32,
+    /// Outside a free-for-all, with no mech in view and not hurt lately: no boosting while idling, looking for
+    /// a fight, looting or fetching weapons (0 = off).
+    pub calm_walk: f32,
+    /// Outside a free-for-all, idle with no mech in view: stand still instead of wandering around the post (0 = off).
+    pub idle_still: f32,
 }
 
 impl Default for Params {
@@ -728,6 +733,8 @@ impl Default for Params {
             ffa_plain: 1.0,
             stay_fight: 2.0,
             stay_cover: 0.0,
+            calm_walk: 1.0,
+            idle_still: 1.0,
         }
     }
 }
@@ -976,6 +983,8 @@ impl Params {
         p.ffa_plain = g("ffa_plain", p.ffa_plain);
         p.stay_fight = g("stay_fight", p.stay_fight);
         p.stay_cover = g("stay_cover", p.stay_cover);
+        p.calm_walk = g("calm_walk", p.calm_walk);
+        p.idle_still = g("idle_still", p.idle_still);
         p
     }
 
@@ -3469,6 +3478,14 @@ impl Brain {
             }
         }
 
+        // Between fights: walk rather than boost, and stand still when idle (`calm_walk`, `idle_still`).
+        let calm_now = !ffa_on && enemies.is_empty() && o.t - self.last_mech_hurt_t > 3.0;
+        if p.calm_walk > 0.0 && calm_now && matches!(label, "idle" | "seek" | "hunt" | "loot" | "arm" | "collect") {
+            boost = false;
+        }
+        if p.idle_still > 0.0 && calm_now && label == "idle" {
+            mv = [0.0, 0.0];
+        }
         // A held laser charge keeps its aim whatever the mode did with the torso.
         if let Some(la) = laser_aim {
             a.aim = la;
