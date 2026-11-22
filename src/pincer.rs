@@ -62,7 +62,7 @@ impl PredTrace {
 
 impl Brain {
     /// Whether enemy `m` (in view) is coming for us: our picture says so, it is aimed at us, or it hurt us lately.
-    fn coming(&self, o: &Obs, m: &Actor, pos: &[f32; 3]) -> bool {
+    pub(super) fn coming(&self, o: &Obs, m: &Actor, pos: &[f32; 3]) -> bool {
         self.beliefs.iter().any(|b| b.id == Some(m.id) && b.hunting)
             || super::wrap(m.aim[0] - yaw_to(&m.pos, pos)).abs() < 0.2
             || self.attackers.get(&m.id).map_or(false, |t| o.t - t < 4.0)

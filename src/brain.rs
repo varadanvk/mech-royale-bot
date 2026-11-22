@@ -9,6 +9,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
 
+/// Aim: enemies farther than this are led along the ground they can walk.
+const PATH_MIN: f32 = 45.0;
+/// Aim: share of the walk toward us in the lead of an enemy coming for us.
+const PATH_HUNT: f32 = 0.35;
+/// Aim: distance short of us where an enemy coming for us stops.
+const PATH_STOP: f32 = 25.0;
+
 fn wrap(a: f32) -> f32 {
     let mut a = (a + PI) % TAU;
     if a < 0.0 {
@@ -381,6 +388,8 @@ pub struct Params {
     pub dodge_look: f32,
     /// With shots in the air that can reach us, choose the fight move by scoring candidate moves against them; the value weighs progress along the wanted move (0 = off).
     pub plan: f32,
+    /// Lead ground enemies along the ground they can walk (0 = straight on).
+    pub aim_path: f32,
     pub dodge_reach: f32,
     /// Tell a free-for-all from a practice match (see `detect`) and keep a picture of every enemy alongside the
     /// usual logic; nothing it learns changes a decision unless `ffa_play` is on and a free-for-all is settled
@@ -671,6 +680,7 @@ impl Default for Params {
             cube_r_low: 40.0,
             dodge_look: 1.2,
             plan: 2.0,
+            aim_path: 1.0,
             dodge_reach: 3.5,
             ffa_detect: 1.0,
             ffa_play: 1.0,
@@ -920,6 +930,7 @@ impl Params {
         p.cube_r_low = g("cube_r_low", p.cube_r_low);
         p.dodge_look = g("dodge_look", p.dodge_look);
         p.plan = g("plan", p.plan);
+        p.aim_path = g("aim_path", p.aim_path);
         p.dodge_reach = g("dodge_reach", p.dodge_reach);
         p.ffa_detect = g("ffa_detect", p.ffa_detect);
         p.ffa_play = g("ffa_play", p.ffa_play);
@@ -1755,6 +1766,25 @@ impl Brain {
         best.map(|b| b.0)
     }
 
+    /// How far a ground enemy's position `h` seconds ahead differs from carrying its velocity straight on: it
+    /// slides along walls instead of walking through them, and one coming for us is partly walked toward us
+    /// around obstacles.
+    fn path_offset(&self, o: &Obs, t: &Actor, h: f32) -> [f32; 2] {
+        if self.params.aim_path <= 0.0 || self.nav.is_none() || h <= 0.05 {
+            return [0.0, 0.0];
+        }
+        let walk = |x: f32, y: f32| self.walkable(x, y);
+        let pos = [t.pos[0], t.pos[1]];
+        if !walk(pos[0], pos[1]) {
+            return [0.0, 0.0];
+        }
+        let vel = [t.vel[0], t.vel[1]];
+        let me = [o.me.pos[0], o.me.pos[1]];
+        let w = if self.coming(o, t, &o.me.pos) { PATH_HUNT } else { 0.0 };
+        let q = crate::predict::predict(pos, vel, me, w, 0.0, PATH_STOP, h, &walk);
+        [q[0] - (pos[0] + vel[0] * h), q[1] - (pos[1] + vel[1] * h)]
+    }
+
     /// Aim solution for one weapon against a target, from our current position.
     fn solve(&self, o: &Obs, w: &Weapon, t: &Actor) -> Shot {
         let me = &o.me;
@@ -1836,11 +1866,16 @@ impl Brain {
                     }
                 };
                 let mut pt = tc;
+                let walks = !airborne && !drone && dist > PATH_MIN;
                 for _ in 0..3 {
                     let tt = ((d3(&muzzle, &pt) - lead_out).max(0.0)) / speed + lat;
                     // The whole of the move until the shot leaves, the lead share of the move during the flight.
                     let (s0, s1) = (shift(delay), shift(delay + tt));
-                    let ahead = [s0[0] + (s1[0] - s0[0]) * lead, s0[1] + (s1[1] - s0[1]) * lead];
+                    let mut ahead = [s0[0] + (s1[0] - s0[0]) * lead, s0[1] + (s1[1] - s0[1]) * lead];
+                    if walks {
+                        let c = self.path_offset(o, t, delay + tt);
+                        ahead = [ahead[0] + c[0] * lead, ahead[1] + c[1] * lead];
+                    }
                     pt = [tc[0] + ahead[0], tc[1] + ahead[1], tc[2] + rise(delay + tt)];
                 }
                 let ok = w.ammo > 0.0 && w.reload <= 0.0 && d3(&muzzle, &pt) < w.stat("range", 230.0) && self.clear(muzzle, pt);
@@ -1875,7 +1910,8 @@ impl Brain {
                     pitch = ((v * v - disc.sqrt()) / (g * d)).atan();
                     ok = true;
                     let tt = d / (v * pitch.cos()).max(1.0);
-                    p = [t.pos[0] + t.vel[0] * tt, t.pos[1] + t.vel[1] * tt, t.pos[2]];
+                    let c = if drone { [0.0, 0.0] } else { self.path_offset(o, t, tt) };
+                    p = [t.pos[0] + t.vel[0] * tt + c[0], t.pos[1] + t.vel[1] * tt + c[1], t.pos[2]];
                 }
                 let d = d2(&p, &tube);
                 let safe = d > w.stat("splash_radius", 7.0) + 8.0;
